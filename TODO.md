@@ -177,6 +177,8 @@
 | c3 | 启动器 `start.bat` | `[x]` | 自检 venv/依赖/模型/CUDA → 缺依赖可一键补装 → 启动并开浏览器；实测 7860 监听正常 |
 | c4 | 作者标签与许可分层 | `[x]` | `NOTICE`（归属链 + 修改清单 + 上游 §4.1a 强制免责声明）、`LICENSE-ADDITIONS.txt`（GPL-3.0）；上游 `LICENSE`/`LICENSE_ZH.txt` 原样保留 |
 | c5 | 清理测试产物并推送 GitHub | `[x]` | 保留 4 份验收报告到 `docs/verification/`；推送 **409 文件 / 39.8 MB**（无模型权重/venv/产物），https://github.com/SrQingChen/IndexTTS-2.5-Pro |
+| c6 | 项目专属 README（展示 UI 与功能集成） | `[x]` | 新 `README.md`（11 Tab 截图 + 能力对照表 + 训练体系 + 验证结果 + 分层许可）；上游 README 原样存档到 `docs/README_UPSTREAM.md` |
+| c7 | `tools/ui_screenshots.py` 自动截图 | `[x]` | 走 Chrome CDP（无新依赖）自动遍历 11 Tab 截图到 `assets/ui/`；**踩坑：Gradio 5 的 Tab 栏在 DOM 里有两份同名按钮**（1px 隐藏副本 + 32px 真实 tab），按文本找 `button` 必点到死元素且不报错 |
 
 **许可分层说明**（为什么不整体换 MIT/Apache）：
 

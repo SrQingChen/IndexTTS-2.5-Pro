@@ -2,602 +2,315 @@
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="assets/indextts_icon_dark.png"/>
-  <img src="assets/indextts_icon_light.png" width="300"/>
+  <img src="assets/indextts_icon_light.png" width="260"/>
 </picture>
 
-**An Industrial-Level Controllable and Efficient Zero-Shot Text-to-Speech System**
+# IndexTTS-2.5 Pro
 
-[简体中文](docs/README_zh.md) | English | [日本語](docs/README_ja.md) | [Español](docs/README_es.md) | [العربية](docs/README_ar.md)
+**在 IndexTTS2 之上搭起来的一整套「可视化控制台 + 自训练体系」**
 
-[![GitHub Stars](https://img.shields.io/github/stars/index-tts/index-tts?style=flat&logo=github)](https://github.com/index-tts/index-tts/stargazers)
-[![arXiv](https://img.shields.io/badge/arXiv-2601.03888-b31b1b?logo=arxiv)](https://arxiv.org/abs/2601.03888)
-[![Discord](https://img.shields.io/badge/Discord-join-5865F2?logo=discord&logoColor=white)](https://discord.gg/uT32E7KDmy)
+从参考音频体检、单条合成、批量生产，到数据集构建、LoRA 自训练、
+DPO 偏好对齐、A/B 自动评测、权重合并部署 —— 全部在一个网页里完成。
+
+[![Author](https://img.shields.io/badge/作者-SrQingChen-blue?logo=github)](https://github.com/SrQingChen)
+[![Repo](https://img.shields.io/badge/GitHub-IndexTTS--2.5--Pro-181717?logo=github)](https://github.com/SrQingChen/IndexTTS-2.5-Pro)
+[![Base](https://img.shields.io/badge/基于-IndexTTS2-orange)](https://github.com/index-tts/index-tts)
+[![Python](https://img.shields.io/badge/Python-3.10%20%7C%203.11-3776AB?logo=python&logoColor=white)](#-快速开始)
+[![License](https://img.shields.io/badge/许可-分层（见下）-yellow)](#-许可)
+
+[界面一览](#-界面) · [新增能力](#-相比上游新增了什么) · [快速开始](#-快速开始) · [训练体系](#-训练体系本项目的核心) · [验证结果](#-验证结果) · [许可](#-许可)
 
 </div>
 
-> [!IMPORTANT]
-> ## IndexTTS-2.5 Pro — an enhanced derivative work
->
-> This repository is a fork of [IndexTTS2](https://github.com/index-tts/index-tts)
-> maintained by **[SrQingChen](https://github.com/SrQingChen)**. The upstream
-> model weights, the inference engine (`indextts/`) and the official `webui.py`
-> are used **unmodified**; everything added here lives in new files.
->
-> **What this fork adds**
-> - 🎛 **A modular 11-tab WebUI console** (`webui_pro.py`) — synthesis, audio
->   lab, batch, presets, dataset, training, alignment, evaluation, models,
->   system monitor and a full parameter manual. Every parameter carries an
->   inline explanation; the official `webui.py` is left byte-identical.
-> - 🎓 **LoRA self-training** for both targets — GPT (T2S · prosody) and
->   CFM (S2M · timbre) — behind a nine-layer generalization safeguard
->   (read-only base snapshot, config validation, drift checkup, early stop,
->   checkpoint vault, base-distillation replay, adapter-strength knob and
->   one-click rollback).
-> - ⚖️ **DPO preference alignment** — builds preference pairs with the current
->   policy, scores them with whisper WER + campplus speaker similarity, then
->   trains on them.
-> - 🏁 **Automatic A/B evaluation and deployment** — same-seed A/B synthesis,
->   WER / speaker-similarity / reward verdicts with per-sample audio for
->   listening, adapter mounting with a live strength knob, and merging LoRA
->   back into standalone `gpt.pth` / `s2mel.pth` checkpoints.
-> - 🗣 **Pinyin pronunciation correction** layered on the upstream phoneme
->   control.
->
-> Verified on an RTX 4060 Laptop (8 GB): the full dataset → feature extraction
-> → GPT/CFM training → DPO alignment → A/B evaluation → merge loop runs
-> end-to-end. See [`docs/verification/`](docs/verification) for the recorded
-> reports and [`TODO.md`](TODO.md) for the itemized checklist.
->
-> ⚠️ Per the upstream agreement (Section 4.1(a)): *any modifications made to
-> the original model in this derivative work are not endorsed, warranted or
-> guaranteed by the original right-holder, and the original right-holder
-> disclaims all liability related to this derivative work.* See [NOTICE](NOTICE)
-> and [License](#-license) below.
+---
+
+## 📌 这是什么
+
+这是 **[IndexTTS2](https://github.com/index-tts/index-tts) 的一个增强分支**，作者
+[SrQingChen](https://github.com/SrQingChen)。
+
+上游提供了业界领先的零样本语音克隆**模型**；本项目**不改模型**，而是围绕它补齐工程侧最缺的两块：
+
+1. **一个真正好用的可视化控制台** —— 上游的 `webui.py` 是单页长表单，参数挤在一起、
+   没有提示、没有工作流。本项目把它拆成 **11 个职责清晰的 Tab**，每个参数都带说明，
+   并补上了参考音频工作台、批量生产、预设管理、模型下载、系统监控和一本**参数手册**。
+2. **一条完整的自训练流水线** —— 上游只有推理。本项目实现了
+   **LoRA 自训练（GPT 语气 + CFM 音色）→ DPO 偏好对齐 → 自动 A/B 评测 → 合并部署**，
+   并配了**九道泛化保护防线**，专门解决「微调完读错字、语气发飘」这类翻车。
+
+> **红线**：官方 `webui.py` **一行未改**，`indextts/` 推理引擎**原样使用**。
+> 本项目的全部改动都是**新增文件**，两个入口可以并存、互不干扰。
+
+### 目录结构一眼看懂
+
+```
+webui.py              ← 官方入口，原样保留
+webui_pro.py          ← 本项目入口（11 Tab 控制台）
+start.bat             ← Windows 一键启动（环境自检 + 补装 + 启动）
+webui_app/            ← 新增：控制台（tabs / services / theme / widgets）
+webui_app/training/   ← 新增：训练体系（数据集 / LoRA / DPO / 评测 / 合并 / 泛化保护）
+tools/                ← 新增：回归探针 + 模型下载器 + 截图工具
+indextts/             ← 上游推理引擎（未改动）
+docs/verification/    ← 真机验收报告
+```
 
 ---
 
-### ⚡ Quick start for this fork
+## 🖼 界面
+
+### 总览
+
+![总览](assets/ui/00_overview.png)
+
+顶栏是实时状态条：GPU、引擎加载状态、显存占用、低显存模式、QwenEmotion 状态 —— 一目了然。
+左侧主区是全部参数，右侧是可折叠的**参数详解**，鼠标悬停还有逐项 tooltip。
+
+### 11 个 Tab
+
+<table>
+<tr>
+<td width="50%"><img src="assets/ui/01_synthesis.png"/><br/><b>🎙 合成</b> — 单条合成全参数：参考音频 / 文本语言 / 情感控制 / GPT 采样 / 分句时长，支持 <code>&lt;字|拼音&gt;</code> 读音标注</td>
+<td width="50%"><img src="assets/ui/02_audio_lab.png"/><br/><b>🔬 音频工作台</b> — 参考音频体检打分、智能切片、降噪归一、音色库管理</td>
+</tr>
+<tr>
+<td><img src="assets/ui/03_batch.png"/><br/><b>📦 批量</b> — 多行文本 / JSONL 驱动，进度实时可见，结果可打包下载</td>
+<td><img src="assets/ui/04_presets.png"/><br/><b>💾 预设</b> — 参数快照管理，与官方 <code>webui.py</code> 互通</td>
+</tr>
+<tr>
+<td><img src="assets/ui/05_dataset.png"/><br/><b>🗂 数据集</b> — 建集 / 导入 / 补文本 / train-val 划分 / 特征离线提取（断点续提）</td>
+<td><img src="assets/ui/06_training.png"/><br/><b>🎓 训练</b> — GPT / CFM / DPO 三目标 LoRA 训练，预检 → 训练 → 保险库 → 记录</td>
+</tr>
+<tr>
+<td><img src="assets/ui/07_alignment.png"/><br/><b>⚖️ 对齐</b> — 用当前模型批量合成候选、奖励打分、构造 DPO 偏好对</td>
+<td><img src="assets/ui/08_eval_deploy.png"/><br/><b>🏁 评测/部署</b> — A/B 对比、adapter 挂载与强度旋钮、合并成独立权重、泛化保护面板</td>
+</tr>
+<tr>
+<td><img src="assets/ui/09_models.png"/><br/><b>📥 模型</b> — 资源审计 + 镜像优先三级回退下载，实时进度、可断点续传</td>
+<td><img src="assets/ui/10_system.png"/><br/><b>🖥 系统</b> — 显存监控、环境体检、事件日志、缓存维护</td>
+</tr>
+<tr>
+<td colspan="2"><img src="assets/ui/11_manual.png"/><br/><b>📖 手册</b> — 架构原理、全部参数逐项说明、场景配方、故障排查。参数说明与控件 tooltip <b>共用同一份注册表</b>，不会两处不一致</td>
+</tr>
+</table>
+
+> 截图由 `tools/ui_screenshots.py` 自动生成（走 Chrome CDP，无需额外依赖），
+> 界面改版后重跑一次即可刷新。
+
+---
+
+## ✨ 相比上游新增了什么
+
+| 能力 | 上游 IndexTTS2 | 本项目 |
+|---|:---:|:---:|
+| 零样本语音克隆 / 情感控制 / 多语言 | ✅ | ✅（原样使用） |
+| 移动端友好的模块化界面 | ❌ 单页长表单 | ✅ **11 Tab 控制台** |
+| 逐参数提示 + 参数手册 | ❌ | ✅ 共用一份参数注册表 |
+| 参考音频体检 / 切片 / 降噪 / 音色库 | ❌ | ✅ **音频工作台** |
+| 批量生产 + JSONL 驱动 | 部分 | ✅ 进度可视 + 打包 |
+| 模型完整性审计 + 镜像下载 | ❌ | ✅ **模型资源页** |
+| **LoRA 自训练（GPT / CFM）** | ❌ | ✅ **完整训练器** |
+| **DPO 偏好对齐** | ❌ | ✅ **偏好对构造 + 训练器** |
+| **训练泛化保护** | ❌ | ✅ **九道防线** |
+| **自动 A/B 评测（WER / 声纹相似 / reward）** | ❌ | ✅ **评测台 + 试听** |
+| **LoRA 合并回独立权重** | ❌ | ✅ **合并 + 可调强度挂载** |
+| 拼音纠音辅助 | 手写标注 | ✅ **候选音列表 + 词表过滤** |
+
+---
+
+## 🎓 训练体系（本项目的核心）
+
+上游只有推理，没有训练。本项目补上了完整四层：
+
+```
+L1  SFT LoRA      GPT(T2S) 学「怎么说」—— 语气、节奏、停顿
+                  CFM(S2M) 学「像谁」  —— 音色、音质、频谱细节
+                       ↓
+L2  DPO 偏好对齐   同一句话合成多个候选 → 打分 → 好的当 chosen、差的当 rejected
+                       ↓
+L3  评测与落地     A/B 自动对比（WER / 声纹相似 / reward）→ 调强度 → 合并部署
+```
+
+### 两个训练目标为什么要分开
+
+| | GPT (T2S) | CFM (S2M) |
+|---|---|---|
+| 决定 | 「怎么说」语气、韵律 | 「像谁」音色、音质 |
+| 参数量 | 813 M | 98 M |
+| 前向 | teacher-forcing 交叉熵 | flow matching（L1 速度场） |
+| 只练它的后果 | 说话像但音质发飘 | 音色对但语气平 |
+
+**想真的像本人，两个都得练。**
+
+### 九道泛化保护防线
+
+微调最怕的不是训不动，而是**训得动却把底座带坏了**（读错字、语气发飘）。为此每一层都设了防线：
+
+| # | 防线 | 做什么 |
+|---|---|---|
+| 1 | 底座只读快照 | 训练前后 SHA-256 / size+mtime 校验，底座被动过一个字节就报警 |
+| 2 | 参数可配置校验 | 60+ 项交叉检查（显存 / 数据量 / 超参匹配度），开工前全部摆出来 |
+| 3 | 注入面收敛 | 从真实模型扫描可用层，而非硬编码；死模块自动排除 |
+| 4 | 权重漂移体检 | `‖ΔW‖/‖W‖` 全局 + 逐层，分五档给建议 |
+| 5 | 早停 | 盯 val 曲线，连续不改善即停 —— 升上去的部分全是过拟合 |
+| 6 | checkpoint 保险库 | 只留 top-K，原子写入，可回滚；**永不写 `checkpoints/`** |
+| 7 | 回放抗遗忘 | 混入底座蒸馏样本，钉住通用能力 |
+| 8 | adapter 强度旋钮 | 推理期 `0~1.5` 连续调节，**不用重训**就能在「像」和「稳」之间折中 |
+| 9 | 一键回滚 | 保险库里的任意档位可激活，未改善的评估不占名额 |
+
+### 训练相关的工程细节
+
+这些是踩过坑之后固化下来的，写在 `TODO.md` 里：
+
+- **离线特征预提取**：w2v-BERT / campplus / codec / mel / mu 全部离线算好缓存，
+  训练时完全不碰这些大模型 —— 8 GB 卡才训得动 813 M 的底座
+- **前向只有一份**（`forward.py`）：绕开了上游三个会让训练**静默失效**的陷阱
+  （漏 `lang_embedding`、bf16 崩溃、`mask_content` 把条件全清零）
+- **val 必须确定性**：固定噪声 + 固定配对，否则 val 曲线的抖动比训练带来的改善还大
+- **续训必须恢复权重**：只恢复优化器状态会让续训从纯底座重来，而且**不报错**
+- **显存预检硬拦**：Windows WDDM 下显存溢出不报 OOM，而是静默降速 20~30 倍
+
+---
+
+## 🚀 快速开始
+
+### Windows 一键启动
 
 ```bat
-:: Windows — checks the environment, reports what is missing, then launches
+:: 双击根目录的 start.bat
 start.bat
 ```
 
-Or manually:
+`start.bat` 会依次自检 **虚拟环境 → Python 依赖 → 模型文件 → CUDA**，
+缺什么就明确告诉你，依赖缺失时可直接用 uv 自动补装，全部就绪后启动并自动打开浏览器。
+支持参数透传：`start.bat --lazy`、`start.bat --port 7861`、`start.bat --host 0.0.0.0`。
+
+### 手动安装
 
 ```bash
-uv sync --extra webui        # first time only; installs base deps + gradio
-uv run webui_pro.py          # the Pro console (11 tabs)
-uv run webui.py              # the upstream single-page UI, unchanged
+# 1) 环境（首次；约 5~8 GB：Python + torch/CUDA + 依赖）
+uv sync --extra webui
+
+# 2) 下载模型（约 7.9 GB，走国内镜像，可断点续传）
+uv run tools/model_fetcher.py --version 2.5 --all
+
+# 3) 启动
+uv run webui_pro.py          # 本项目：11 Tab 控制台
+uv run webui.py              # 上游：单页界面（原样保留）
 ```
 
-> Use `--extra webui` rather than `--all-extras`: the latter also pulls the
-> `deepspeed`, `accel` (flash-attn) and `torch_compile` extras, which need a
-> CUDA toolchain and are optional. The Pro console does not require them.
-> JA/ES text normalization needs `nemo-text-processing` (which depends on
-> `pynini`, no official Windows wheel) — install it manually if you need it;
-> without it the console falls back to the raw text and says so in a warning.
+> **为什么是 `--extra webui` 而不是 `--all-extras`**：后者还会拉
+> `deepspeed` / `flash-attn` / `torch_compile`，需要 CUDA 工具链且本项目并不依赖。
+> `peft`（LoRA 训练）与 `pypinyin`（拼音纠音）已写进基础依赖，`uv sync` 就会带上。
 
-`start.bat` verifies the virtual environment, the Python dependencies
-(`gradio`, `peft`, `pypinyin`, … which the upstream `pyproject.toml` does not
-declare), the model files under `checkpoints/` and CUDA availability — and
-offers to repair what is missing before starting the server.
+### 常用参数
+
+```bash
+uv run webui_pro.py --lazy              # 不预加载模型，秒开界面
+uv run webui_pro.py --host 0.0.0.0      # 局域网访问
+uv run webui_pro.py --port 7861         # 换端口
+uv run webui_pro.py --help              # 全部参数
+```
 
 ---
 
-IndexTTS is a zero-shot text-to-speech system that clones a voice from a single
-reference audio clip. The latest release, **IndexTTS-2.5**, supports Chinese,
-English, Japanese, Spanish and Arabic, with fine-grained emotion control,
-speaking speed control, pronunciation control (Pinyin / CMU phonemes /
-Japanese Kana), and faster inference than IndexTTS-2.
+## ✅ 验证结果
+
+本项目所有功能都有**可复现的回归测试**，不是「跑通了就完事」。
+每个探针自报通过/失败项数，失败时以非 0 退出码结束。
+
+| 测试套件 | 覆盖内容 | 结果 |
+|---|---|---|
+| `tools/guard_test.py` | 泛化保护九道防线 | **194 / 194** |
+| `tools/gpt_train_probe.py` | GPT LoRA 训练器 | **148 / 148** |
+| `tools/cfm_train_probe.py` | CFM LoRA 训练器（含全部陷阱回归钉） | **163 / 163** |
+| `tools/dpo_probe.py` | DPO 训练器（含 ★ln2 不变量） | **70 / 70** |
+| `tools/reward_probe.py` | 奖励打分（whisper + campplus） | **49 / 49** |
+| `tools/eval_probe.py` | A/B 评测台 | **28 / 28** |
+| `tools/merge_probe.py` | 合并 / 挂载（双向数学对账） | **25 / 25** |
+| `tools/stage2_ui_probe.py` | UI + 后台执行器集成 | **20 / 20** |
+| `tools/build_check.py` | 11 Tab 构建校验 | ✅ |
+| `tools/stage2_acceptance.py` | **真机完整闭环**（见下） | **33 / 33** |
+
+### 真机端到端验收
+
+在 **RTX 4060 Laptop 8 GB** 上跑通完整闭环，耗时 4.0 分钟：
+
+```
+引擎合成 28 句建数据集 → 特征提取 → 划分 21/7
+  → GPT LoRA 真训练（峰值 1.87 GB，漂移 0.000423，底座逐字节未变）
+  → CFM LoRA 真训练（漂移 0.00319）
+  → DPO 偏好对真机构造（8 候选 → 1 对成对，margin 不足的 3 对正确丢弃）
+  → A/B 评测（真合成 + whisper 打分 + 试听文件）
+  → 强度旋钮 48 层 @ 0.7 生效
+  → 合并 GPT/CFM 权重，产物校验 missing/unexpected = 0
+```
+
+报告存档在 [`docs/verification/`](docs/verification)：
+
+- [阶段 2 验收报告](docs/verification/stage2_report.md) · [GPT 训练报告](docs/verification/gpt_report.md)
+- [CFM 训练报告](docs/verification/cfm_report.md) · [A/B 评测报告](docs/verification/ab_report.md)
+
+进度与踩坑记录见 [`TODO.md`](TODO.md)。
 
 ---
 
-## 🗂️ Model Zoo
-
-| Model | Demos | Paper | ModelScope | HuggingFace |
-| :--- | :---: | :---: | :---: | :---: |
-| **IndexTTS-2.5** | [![Demo](https://img.shields.io/badge/Demo-Page-orange?logo=github)](https://index-tts.github.io/index-tts2-5.github.io/) [![Studio](https://img.shields.io/badge/Studio-ModelScope-purple?logo=modelscope)](https://modelscope.cn/studios/IndexTeam/IndexTTS-2.5) | [![Paper](https://img.shields.io/badge/Paper-arXiv-red?logo=arxiv)](https://arxiv.org/abs/2601.03888) | [![ModelScope](https://img.shields.io/badge/ModelScope-Model-purple?logo=modelscope)](https://modelscope.cn/models/IndexTeam/IndexTTS-2.5) | [![HuggingFace](https://img.shields.io/badge/HuggingFace-Model-blue?logo=huggingface)](https://huggingface.co/IndexTeam/IndexTTS-2.5) |
-| **IndexTTS-2** | [![Demo](https://img.shields.io/badge/Demo-Page-orange?logo=github)](https://index-tts.github.io/index-tts2.github.io/) | [![Paper](https://img.shields.io/badge/Paper-arXiv-red?logo=arxiv)](https://arxiv.org/abs/2506.21619) | [![ModelScope](https://img.shields.io/badge/ModelScope-Model-purple?logo=modelscope)](https://modelscope.cn/models/IndexTeam/IndexTTS-2) | [![HuggingFace](https://img.shields.io/badge/HuggingFace-Model-blue?logo=huggingface)](https://huggingface.co/IndexTeam/IndexTTS-2) |
-| **IndexTTS-1.5** | [![Demo](https://img.shields.io/badge/Demo-Page-orange?logo=github)](https://index-tts.github.io/) | [![Paper](https://img.shields.io/badge/Paper-arXiv-red?logo=arxiv)](https://arxiv.org/abs/2502.05512) | [![ModelScope](https://img.shields.io/badge/ModelScope-Model-purple?logo=modelscope)](https://modelscope.cn/models/IndexTeam/IndexTTS-1.5) | [![HuggingFace](https://img.shields.io/badge/HuggingFace-Model-blue?logo=huggingface)](https://huggingface.co/IndexTeam/IndexTTS-1.5) |
-| **IndexTTS** | [![Demo](https://img.shields.io/badge/Demo-Page-orange?logo=github)](https://index-tts.github.io/) | [![Paper](https://img.shields.io/badge/Paper-arXiv-red?logo=arxiv)](https://arxiv.org/abs/2502.05512) | [![ModelScope](https://img.shields.io/badge/ModelScope-Model-purple?logo=modelscope)](https://modelscope.cn/models/IndexTeam/Index-TTS) | [![HuggingFace](https://img.shields.io/badge/HuggingFace-Model-blue?logo=huggingface)](https://huggingface.co/IndexTeam/Index-TTS) |
-
-## 📣 News
-
-- `2026/08/10` 🔥 We release **IndexTTS-2.5**
-  - Now supports Chinese, English, Japanese, Spanish and Arabic, with faster inference than IndexTTS-2, while keeping the cross-lingual and timbre-emotion disentanglement capabilities.
-  - Improved controllability of Chinese Pinyin, English CMU phonemes and Japanese Kana.
-  - Speaking speed control via `duration_factor` (0.5x–2.0x duration).
-  - Production deployment supported via [vLLM](https://recipes.vllm.ai/IndexTeam/IndexTTS-2.5).
-- `2025/09/08` 🔥 We release **IndexTTS-2**
-  - The first autoregressive TTS model with precise synthesis duration control, supporting both controllable and uncontrollable modes. <i>This functionality is not yet enabled in this release.</i>
-  - Highly expressive emotional speech synthesis, with emotion control through multiple input modalities.
-- `2025/05/14` 🔥 We release **IndexTTS-1.5**, significantly improving the model's stability and its performance in English.
-- `2025/03/25` 🔥 We release **IndexTTS-1.0** with model weights and inference code.
-- `2025/02/12` 🎉 We submitted our paper to arXiv, and released our demos and test sets.
-
-## 🎬 Demos
-
-<div align="center">
-
-**IndexTTS-2.5: The Future of Voice, Now Generating**
-
-[![IndexTTS2.5 Demo](assets/index2.5_video_cover.png)](https://www.bilibili.com/video/BV1uvMk6ZEdK/)
-
-**IndexTTS-2: The Future of Voice, Now Generating**
-
-[![IndexTTS2 Demo](assets/IndexTTS2-video-pic.png)](https://www.bilibili.com/video/BV136a9zqEk5)
-
-</div>
-
-## 🚀 Getting Started
-
-### 1. Prerequisites
-
-Make sure you have [git](https://git-scm.com/downloads) installed, then download
-this repository:
-
-```bash
-git clone https://github.com/index-tts/index-tts.git && cd index-tts
-```
-
-Example audio files are downloaded on demand from HuggingFace/ModelScope the
-first time the WebUI starts, so Git LFS is no longer required.
-
-### 2. Install Dependencies
-
-We use [uv](https://docs.astral.sh/uv/getting-started/installation/) to manage
-the project's dependency environment. It is **required** for a reliable
-installation:
-
-```bash
-pip install -U uv  # or see the link above for other install methods
-```
-
-```bash
-uv sync --all-extras
-```
-
-This automatically creates a `.venv` project directory and installs the correct
-versions of Python and all required dependencies.
-
-If the download is slow, use a local mirror, e.g. one of these mirrors in China:
-
-```bash
-uv sync --all-extras --default-index "https://mirrors.aliyun.com/pypi/simple"
-
-uv sync --all-extras --default-index "https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple"
-```
-
-> [!TIP]
-> **Available Extra Features:**
->
-> - `--all-extras`: Automatically adds *every* extra feature listed below. You can
->   remove this flag if you want to customize your installation choices.
-> - `--extra webui`: Adds WebUI support (recommended).
-> - `--extra deepspeed`: Adds DeepSpeed support (may speed up inference on some
->   systems).
-
-> [!IMPORTANT]
-> **Windows:** DeepSpeed may be difficult to install. You can skip it by removing
-> the `--all-extras` flag and adding the other feature flags manually.
->
-> **Linux/Windows:** If you see a CUDA error during installation, make sure
-> NVIDIA's [CUDA Toolkit](https://developer.nvidia.com/cuda-toolkit) version
-> **12.8** (or newer) is installed on your system.
-
-### 3. Download Models
-
-Download the required models via [uv tool](https://docs.astral.sh/uv/guides/tools/#installing-tools):
-
-Via `huggingface-cli`:
-
-```bash
-uv tool install "huggingface-hub"
-
-# IndexTTS-2.5
-hf download IndexTeam/IndexTTS-2.5 --local-dir=checkpoints
-
-# IndexTTS-2
-hf download IndexTeam/IndexTTS-2 --local-dir=checkpoints_2
-```
-
-Or via `modelscope`:
-
-```bash
-uv tool install "modelscope"
-
-# IndexTTS-2.5
-modelscope download --model IndexTeam/IndexTTS-2.5 --local_dir checkpoints
-
-# IndexTTS-2
-modelscope download --model IndexTeam/IndexTTS-2 --local_dir checkpoints_2
-```
-
-> [!IMPORTANT]
-> If the commands above aren't available, carefully read the `uv tool` output —
-> it will tell you how to add the tools to your system's PATH.
-
-> [!NOTE]
-> Some small models are downloaded automatically on first run. If your network
-> has slow access to HuggingFace, set a mirror before running the code:
->
-> ```bash
-> export HF_ENDPOINT="https://hf-mirror.com"
-> ```
-
-### 4. Check GPU Acceleration
-
-To diagnose your environment and see which GPUs are detected, use the included
-utility:
-
-```bash
-uv run tools/gpu_check.py
-```
-
-## 💻 Usage
-
-### 🌐 Web Demo
-
-```bash
-# IndexTTS-2.5 (default)
-uv run webui.py
-
-# IndexTTS-2
-uv run webui.py --version 2 --model_dir ./checkpoints_2
-```
-
-Open your browser and visit `http://127.0.0.1:7860` to see the demo.
-
-You can adjust the settings to enable BF16 (IndexTTS-2.5) / FP16 (IndexTTS-2)
-inference (lower VRAM usage), DeepSpeed acceleration, compiled CUDA kernels for
-speed, etc. All available options can be seen via:
-
-```bash
-uv run webui.py -h
-```
-
-> [!IMPORTANT]
-> **FP16/BF16** (half-precision) inference is faster and uses less VRAM, with
-> very small quality loss.
->
-> **DeepSpeed** *may* speed up inference on some systems, but it could also make
-> it slower — it depends on your hardware, drivers and OS. Try both ways.
->
-> All `uv` commands **automatically activate** the correct per-project virtual
-> environment. Do *not* manually activate any environment before running `uv`
-> commands, as that can cause dependency conflicts.
-
-### 🚀 Serving with vLLM
-
-For production deployment, see the [vLLM recipe for IndexTTS](https://recipes.vllm.ai/IndexTeam/IndexTTS-2.5).
-
-### 📝 Python API
-
-To run scripts, use `uv run <file.py>` so the code runs inside the `uv`
-environment. You may also need to add the current directory to `PYTHONPATH`:
-
-```bash
-# IndexTTS2.5
-PYTHONPATH="$PYTHONPATH:." uv run indextts/infer_v2_5.py \
-  --cfg_path checkpoints/config.yaml \
-  --model_dir checkpoints \
-  --text "Hello world" \
-  --lang EN
-```
-
-The default `--prompt_wav` lives in `examples/`, which is populated the first
-time the WebUI starts. To fetch it without the WebUI:
-
-```bash
-uv run python -c "from indextts.utils.examples_downloader import ensure_examples_available; ensure_examples_available()"
-```
-
-For IndexTTS2, use the Python API below — `indextts/infer_v2.py` runs a
-benchmark loop against a hardcoded `checkpoints/` directory, not the
-`checkpoints_2` layout from step 3.
-
-#### 0. Initialize IndexTTS
-
-```python
-# IndexTTS2
-from indextts.infer_v2 import IndexTTS2
-tts = IndexTTS2(cfg_path="checkpoints_2/config.yaml", model_dir="checkpoints_2", use_fp16=False, use_cuda_kernel=False, use_deepspeed=False)
-
-# IndexTTS2.5
-from indextts.infer_v2_5 import IndexTTS2
-tts = IndexTTS2(cfg_path="checkpoints/config.yaml", model_dir="checkpoints", use_bf16=True)
-```
-
-#### 1. Voice cloning with a single reference audio
-
-```python
-text = "Translate for me, what is a surprise!"
-
-# IndexTTS2
-tts.infer(spk_audio_prompt='examples/voice_01.wav', text=text, output_path="gen.wav", verbose=True)
-
-# IndexTTS2.5 (multilingual, with language selection)
-tts.infer(spk_audio_prompt='examples/voice_01.wav', text=text, lang="EN", output_path="gen.wav", verbose=True)
-```
-
-#### 2. Emotion control with a separate emotional reference audio
-
-```python
-text = "酒楼丧尽天良，开始借机竞拍房间，哎，一群蠢货。"
-
-# IndexTTS2
-tts.infer(spk_audio_prompt='examples/voice_07.wav', text=text, output_path="gen.wav", emo_audio_prompt="examples/emo_sad.wav", verbose=True)
-
-# IndexTTS2.5
-tts.infer(spk_audio_prompt='examples/voice_07.wav', text=text, lang="ZH", output_path="gen.wav", emo_audio_prompt="examples/emo_sad.wav", verbose=True)
-```
-
-#### 3. Adjust emotion intensity with `emo_alpha`
-
-When an emotional reference audio is specified, `emo_alpha` adjusts how much it
-affects the output. Valid range: `0.0 - 1.0`, default: `1.0` (100%).
-
-```python
-text = "酒楼丧尽天良，开始借机竞拍房间，哎，一群蠢货。"
-
-# IndexTTS2
-tts.infer(spk_audio_prompt='examples/voice_07.wav', text=text, output_path="gen.wav", emo_audio_prompt="examples/emo_sad.wav", emo_alpha=0.9, verbose=True)
-
-# IndexTTS2.5
-tts.infer(spk_audio_prompt='examples/voice_07.wav', text=text, output_path="gen.wav", lang="ZH", emo_audio_prompt="examples/emo_sad.wav", emo_alpha=0.9, verbose=True)
-```
-
-#### 4. Emotion control with an emotion vector
-
-You can omit the emotional reference audio and instead provide an 8-float list
-specifying the intensity of each emotion, in the order
-`[happy, angry, sad, afraid, disgusted, melancholic, surprised, calm]`.
-Use `use_random` to introduce stochasticity during inference (default: `False`).
-
-> [!NOTE]
-> Enabling random sampling reduces the voice cloning fidelity.
-
-```python
-text = "对不起嘛！我的记性真的不太好，但是和你在一起的事情，我都会努力记住的~"
-
-# IndexTTS2
-tts.infer(spk_audio_prompt='examples/voice_09.wav', text=text, output_path="gen.wav", emo_vector=[0, 0, 0.8, 0, 0, 0, 0, 0], use_random=False, verbose=True)
-
-# IndexTTS2.5
-tts.infer(spk_audio_prompt='examples/voice_09.wav', text=text, lang="ZH", output_path="gen.wav", emo_vector=[0, 0, 0.8, 0, 0, 0, 0, 0], use_random=False, verbose=True)
-```
-
-#### 5. Emotion control from the text itself (`use_emo_text`)
-
-Enable `use_emo_text` to automatically convert your `text` script into emotion
-vectors. An `emo_alpha` around 0.6 (or lower) is recommended for more natural
-speech. Randomness can be introduced with `use_random` (default: `False`).
-
-> [!IMPORTANT]
-> For IndexTTS-2.5, `use_emo_text=True` requires constructing `IndexTTS2` with `use_qwen_emo=True` (e.g. `tts = IndexTTS2(..., use_qwen_emo=True)`), otherwise it raises a `RuntimeError`.
-> (IndexTTS-2 does not require this flag.)
-
-```python
-text = "快躲起来！是他要来了！他要来抓我们了！"
-
-# IndexTTS2
-tts.infer(spk_audio_prompt='examples/voice_12.wav', text=text, output_path="gen.wav", emo_alpha=0.6, use_emo_text=True, use_random=False, verbose=True)
-
-# IndexTTS2.5
-tts.infer(spk_audio_prompt='examples/voice_12.wav', text=text, lang="ZH", output_path="gen.wav", emo_alpha=0.6, use_emo_text=True, use_random=False, verbose=True)
-```
-
-#### 6. Emotion control with an explicit emotion description (`emo_text`)
-
-Provide a specific text emotion description via `emo_text`, which is converted
-into emotion vectors — giving you separate control of the text script and the
-emotion description:
-
-```python
-text = "快躲起来！是他要来了！他要来抓我们了！"
-emo_text = "你吓死我了！你是鬼吗？"
-
-# IndexTTS2
-tts.infer(spk_audio_prompt='examples/voice_12.wav', text=text, output_path="gen.wav", emo_alpha=0.6, use_emo_text=True, emo_text=emo_text, use_random=False, verbose=True)
-
-# IndexTTS2.5
-tts.infer(spk_audio_prompt='examples/voice_12.wav', text=text, lang="ZH", output_path="gen.wav", emo_alpha=0.6, use_emo_text=True, emo_text=emo_text, use_random=False, verbose=True)
-```
-
-#### 7. Speaking speed control (`duration_factor`)
-
-A value greater than `1.0` slows down the speech, a value less than `1.0`
-speeds it up. Default: `1.0` (normal speed). Valid range: `0.5 - 2.0`.
-
-```python
-text = "大家好，欢迎来到IndexTTS的语速控制演示。"
-
-# IndexTTS2.5
-# Slow down (1.2x duration)
-tts.infer(spk_audio_prompt='examples/voice_01.wav', text=text, lang="ZH", output_path="gen_slow.wav", duration_factor=1.2, verbose=True)
-
-# Speed up (0.8x duration)
-tts.infer(spk_audio_prompt='examples/voice_01.wav', text=text, lang="ZH", output_path="gen_fast.wav", duration_factor=0.8, verbose=True)
-```
-
-### 🗣️ Pronunciation Control
-
-**IndexTTS2.5 — Pinyin / CMU phonemes / Japanese Kana:**
-
-IndexTTS2.5 supports these character replacements with better
-instruction-following capability. For the full list of valid entries, see
-`checkpoints/pinyin.vocab` for Pinyin and the
-[CMU dictionary](https://svn.code.sf.net/p/cmusphinx/code/trunk/cmudict/cmudict-0.7b)
-for English phonemes.
-
-```
-他在银<行|XING2>里<行|HANG2>走了半天，发现这笔业务办不<行|HANG2>。
-
-He had a <minute|M IH1 . N AH0 T> to examine the <minute|M AY0 . N UW1 T> details of the contract.
-
-彼は料理が<上手|じょうず>だが、囲碁では<上手|うわて>に負けた。
-```
-
-**IndexTTS2 — Pinyin:**
-
-IndexTTS2 supports mixed modeling of Chinese characters and Pinyin. To activate
-Pinyin control, provide text with specific Pinyin annotations. Note that Pinyin
-control does not work for every possible consonant–vowel combination; only
-valid Chinese Pinyin cases are supported (see `checkpoints/pinyin.vocab`).
-
-```
-之前你做DE5很好，所以这一次也DEI3做DE2很好才XING2，如果这次目标完成得不错的话，我们就直接打DI1去银行取钱。
-```
-
-### 🕰️ IndexTTS-1.5 (Legacy)
-
-You can also use the previous IndexTTS1 model by importing a different module:
-
-```python
-from indextts.infer import IndexTTS
-tts = IndexTTS(model_dir="checkpoints", cfg_path="checkpoints/config.yaml")
-voice = "examples/voice_07.wav"
-text = "大家好，我现在正在bilibili 体验 ai 科技，说实话，来之前我绝对想不到！AI技术已经发展到这样匪夷所思的地步了！比如说，现在正在说话的其实是B站为我现场复刻的数字分身，简直就是平行宇宙的另一个我了。如果大家也想体验更多深入的AIGC功能，可以访问 bilibili studio，相信我，你们也会吃惊的。"
-tts.infer(voice, text, 'gen.wav')
-```
-
-For more details, see [README_INDEXTTS_1_5](archive/README_INDEXTTS_1_5.md),
-or visit the IndexTTS1 repository at [index-tts:v1.5.0](https://github.com/index-tts/index-tts/tree/v1.5.0).
-
-## 📊 Evaluation
-
-**Table 1: Zero-shot TTS on CV3-Eval** (Arabic uses an in-house test set). †Cited from the original paper.
-
-<table>
-<thead>
-<tr>
-<th rowspan="2">Model</th>
-<th rowspan="2">Params</th>
-<th colspan="2">zh</th>
-<th colspan="2">en</th>
-<th colspan="2">es</th>
-<th colspan="2">ja</th>
-<th colspan="2">ar</th>
-<th colspan="2">Avg</th>
-</tr>
-<tr>
-<th>WER↓</th><th>SS↑</th>
-<th>WER↓</th><th>SS↑</th>
-<th>WER↓</th><th>SS↑</th>
-<th>WER↓</th><th>SS↑</th>
-<th>WER↓</th><th>SS↑</th>
-<th>WER↓</th><th>SS↑</th>
-</tr>
-</thead>
-<tbody>
-<tr><td>VoxCPM2</td><td>2B</td><td>3.88</td><td>74.99</td><td>5.13</td><td>71.57</td><td>5.49</td><td>74.67</td><td>6.69</td><td>72.90</td><td>14.94</td><td>65.99</td><td>7.22</td><td>72.02</td></tr>
-<tr><td>OmniVoice</td><td>0.8B</td><td>3.41</td><td>72.99</td><td>3.62</td><td>70.13</td><td>3.52</td><td>74.14</td><td>5.38</td><td>70.49</td><td>17.88</td><td>64.22</td><td>6.76</td><td>70.39</td></tr>
-<tr><td>Moss-TTS 1.5</td><td>8B</td><td>4.02</td><td>72.68</td><td>4.45</td><td>67.46</td><td>3.83</td><td>71.75</td><td>10.97</td><td>68.71</td><td>23.71</td><td>62.21</td><td>9.40</td><td>68.56</td></tr>
-<tr><td>CosyVoice3-0.5B</td><td>0.5B</td><td>3.84</td><td>80.01</td><td>4.88</td><td>74.16</td><td>4.04</td><td>78.85</td><td>-</td><td>76.36</td><td>-</td><td>-</td><td>-</td><td>-</td></tr>
-<tr><td>CosyVoice3-1.5B</td><td>1.5B</td><td>3.91†</td><td>-</td><td>4.99†</td><td>-</td><td>4.47†</td><td>-</td><td>7.57†</td><td>-</td><td>-</td><td>-</td><td>-</td><td>-</td></tr>
-<tr><td>FireRedTTS-2</td><td>1.5B</td><td>8.22</td><td>68.10</td><td>14.92</td><td>56.93</td><td>-</td><td>-</td><td>-</td><td>-</td><td>-</td><td>-</td><td>-</td><td>-</td></tr>
-<tr><td>Fish Audio S2 Pro</td><td>4B</td><td>3.62</td><td>67.79</td><td>3.83</td><td>61.66</td><td>2.93</td><td>67.44</td><td>5.15</td><td>66.15</td><td>14.15</td><td>59.43</td><td>5.94</td><td>64.49</td></tr>
-<tr><td>Qwen3-TTS</td><td>1.7B</td><td>3.27</td><td>73.02</td><td>5.06</td><td>67.17</td><td>2.87</td><td>73.17</td><td>5.89</td><td>70.18</td><td>-</td><td>-</td><td>-</td><td>-</td></tr>
-<tr><td><b>IndexTTS2.5</b></td><td>0.8B</td><td>4.36</td><td>77.10</td><td>5.12</td><td>68.06</td><td>3.75</td><td>76.39</td><td>5.66</td><td>74.62</td><td>14.88</td><td>69.74</td><td>6.75</td><td>73.18</td></tr>
-<tr><td><b>IndexTTS2.5-RL</b></td><td>0.8B</td><td>3.93</td><td>77.92</td><td>3.89</td><td>67.79</td><td>3.33</td><td>76.68</td><td>5.30</td><td>75.41</td><td>13.58</td><td>70.36</td><td>6.00</td><td>73.63</td></tr>
-</tbody>
-</table>
-
-**Table 2: Cross-lingual TTS on CV3-Eval** (Chinese prompt → target language, Arabic uses an in-house test set).
-
-<table>
-<thead>
-<tr>
-<th rowspan="2">Model</th>
-<th rowspan="2">Params</th>
-<th colspan="2">zh→en</th>
-<th colspan="2">zh→es</th>
-<th colspan="2">zh→ja</th>
-<th colspan="2">zh→ar</th>
-<th colspan="2">Avg</th>
-</tr>
-<tr>
-<th>WER↓</th><th>SS↑</th>
-<th>WER↓</th><th>SS↑</th>
-<th>WER↓</th><th>SS↑</th>
-<th>WER↓</th><th>SS↑</th>
-<th>WER↓</th><th>SS↑</th>
-</tr>
-</thead>
-<tbody>
-<tr><td>VoxCPM2</td><td>2B</td><td>4.48</td><td>64.25</td><td>16.38</td><td>64.89</td><td>11.84</td><td>71.54</td><td>11.09</td><td>67.62</td><td>10.95</td><td>67.08</td></tr>
-<tr><td>OmniVoice</td><td>0.8B</td><td>3.74</td><td>64.91</td><td>5.84</td><td>62.08</td><td>9.09</td><td>69.06</td><td>19.80</td><td>65.27</td><td>9.62</td><td>65.33</td></tr>
-<tr><td>Moss-TTS 1.5</td><td>8B</td><td>6.13</td><td>59.23</td><td>4.32</td><td>56.63</td><td>11.52</td><td>65.54</td><td>17.03</td><td>62.93</td><td>9.75</td><td>61.08</td></tr>
-<tr><td>CosyVoice3-0.5B</td><td>0.5B</td><td>3.23</td><td>62.79</td><td>4.58</td><td>64.04</td><td>-</td><td>-</td><td>-</td><td>-</td><td>-</td><td>-</td></tr>
-<tr><td>CosyVoice3-1.5B</td><td>1.5B</td><td>4.32</td><td>-</td><td>-</td><td>-</td><td>13.70</td><td>-</td><td>-</td><td>-</td><td>-</td><td>-</td></tr>
-<tr><td>FireRedTTS-2</td><td>1.5B</td><td>9.34</td><td>53.19</td><td>12.25</td><td>58.31</td><td>19.05</td><td>64.12</td><td>-</td><td>-</td><td>-</td><td>-</td></tr>
-<tr><td>Fish Audio S2 Pro</td><td>4B</td><td>4.14</td><td>55.89</td><td>4.46</td><td>55.57</td><td>10.48</td><td>61.74</td><td>14.49</td><td>59.80</td><td>8.39</td><td>58.25</td></tr>
-<tr><td>Qwen3-TTS</td><td>1.7B</td><td>5.74</td><td>63.04</td><td>5.15</td><td>68.02</td><td>36.09</td><td>65.71</td><td>-</td><td>-</td><td>-</td><td>-</td></tr>
-<tr><td><b>IndexTTS2.5</b></td><td>0.8B</td><td>3.62</td><td>63.83</td><td>5.17</td><td>65.48</td><td>6.57</td><td>74.16</td><td>9.51</td><td>71.02</td><td>6.22</td><td>68.62</td></tr>
-<tr><td><b>IndexTTS2.5-RL</b></td><td>0.8B</td><td>3.55</td><td>67.47</td><td>4.86</td><td>64.47</td><td>6.38</td><td>75.82</td><td>9.89</td><td>73.05</td><td>6.17</td><td>70.20</td></tr>
-</tbody>
-</table>
-
-## ⚡ Inference Speed
-
-RTF (wall-clock time / generated audio duration, lower is faster) on an NVIDIA RTX 4090, `kv_cache=True`.
-
-| Text | 2.0 fp16 | 2.0 fp32 | 2.5 bf16 | 2.5 fp32 |
-|---|---|---|---|---|
-| 7 chars | 0.4004 | 0.3748 | 0.2871 | 0.2547 |
-| 16 chars | 0.3322 | 0.3389 | 0.2155 | 0.1981 |
-| 28 chars | 0.3257 | 0.3480 | 0.2065 | 0.1927 |
-| 80 chars | 0.3229 | 0.3754 | 0.1997 | 0.2060 |
-| 200 chars | 0.3244 | 0.3990 | 0.1997 | 0.2144 |
-| **overall** | **0.3257** | **0.3748** | **0.2065** | **0.2060** |
-
-## 🤝 Community & Contact
-
-- **QQ Groups:** 663272642 (No.4), 1013410623 (No.5)
-- **Discord:** https://discord.gg/uT32E7KDmy
-- **Email:** indexspeech@bilibili.com
-
-You are welcome to join our community! 🌏 欢迎大家来交流讨论！
-
-> [!CAUTION]
-> Thank you for your support of the bilibili IndexTTS project!
-> Please note that the **only official channel** maintained by the core team is: [https://github.com/index-tts/index-tts](https://github.com/index-tts/index-tts).
-> ***Any other websites or services are not official***, and we cannot guarantee their security, accuracy, or timeliness.
-> For the latest updates, please always refer to this official repository.
-
-For commercial usage and cooperation, please contact <u>indexspeech@bilibili.com</u>.
-
-## 📚 Citation
-
-🌟 If you find our work helpful, please leave us a star and cite our papers.
-
-IndexTTS2.5:
-
-```bibtex
-@misc{li2026indextts25technicalreport,
-      title={IndexTTS 2.5 Technical Report},
-      author={Yunpei Li and Xun Zhou and Jinchao Wang and Lu Wang and Yong Wu and Siyi Zhou and Yiquan Zhou and Yining Wang and Yaogen Yang and Zhetao Hu and Shiyao Duan and Jiacheng Xu and Bin Xia and Jingchen Shu},
-      year={2026},
-      eprint={2601.03888},
-      archivePrefix={arXiv},
-      primaryClass={cs.SD},
-      url={https://arxiv.org/abs/2601.03888},
-}
-```
-
-IndexTTS2:
-
-```bibtex
-@article{zhou2025indextts2,
-  title={IndexTTS2: A Breakthrough in Emotionally Expressive and Duration-Controlled Auto-Regressive Zero-Shot Text-to-Speech},
-  author={Siyi Zhou and Yiquan Zhou and Yi He and Xun Zhou and Jinchao Wang and Wei Deng and Jingchen Shu},
-  journal={arXiv preprint arXiv:2506.21619},
-  year={2025}
-}
-```
-
-IndexTTS:
+## ⚠️ 已知限制与环境陷阱
+
+- **8 GB 显存必须错峰**：引擎推理（4.9~5.7 GB）与训练不能并存，
+  训练前必须先卸载引擎 —— 控制台会在你点「开始训练」时主动拦下。
+- **`uv sync` 会就地覆盖 `.venv`**：如果你之前用 `--system-site-packages` 借过系统 torch，
+  直接 `uv sync` 会把 gradio / peft / pypinyin 一起清掉（表现为 `No module named 'gradio'`）。
+  修复：`uv sync --extra webui`。
+- **Windows 显存溢出不报 OOM**：WDDM 下会静默降速 20~30 倍，所以训练前强制做显存预检。
+- **JA / ES 文本归一化**需要 `nemo-text-processing`（依赖 `pynini`，Windows 无官方 wheel）。
+  不装也能用，会在日志里明确提示已跳过归一化。
+- **理论单条音频上限 72.6 s**（1815 语义 token ÷ 25 Hz），参考音频推理时被截到前 15 s。
+
+---
+
+## 📄 许可
+
+**这是一个衍生作品，因此两层许可同时生效。**
+
+| 适用范围 | 许可证 |
+|---|---|
+| **模型权重**与**上游代码**（`indextts/`、`webui.py`） | [bilibili 模型使用许可协议](LICENSE) · [中文](LICENSE_ZH.txt) —— **强制、不可替换**，且约束一切衍生品 |
+| [SrQingChen](https://github.com/SrQingChen) 的**原创新增文件**（见 [NOTICE](NOTICE) §3） | [GNU GPL v3](LICENSE-ADDITIONS.txt) |
+
+简单说：
+
+- **可以自由使用、研究、修改、再分发**，包括做优化和二次开发；
+- **如果你分发修改版**，必须沿用同样的条款：新增部分保持 GPL v3，模型部分遵守
+  bilibili 协议（该协议本身要求你把条款继续传递给**你的**下游用户）；
+- **请保留署名**：保留 [NOTICE](NOTICE) 与版权声明，同时标注原始权利人
+  （bilibili · IndexTTS2）与修改作者（SrQingChen）；你在此基础上继续开发时，
+  请把自己的贡献也加进 `NOTICE`；
+- 两层条款冲突时，**以 bilibili 协议为准**，GPL v3 不延伸至模型。
+
+> 上游协议 §4.1(a) 要求本分发必须声明：*该衍生品对原模型所作的任何改动
+> 与原模型原始权利人无关，原始权利人对该衍生品不背书、不担保、不承担责任。*
+> 完整归属链与修改清单见 [NOTICE](NOTICE)。本节不构成法律意见。
+
+---
+
+## 🙏 致谢与上游
+
+本项目只是**外壳与训练工具**，真正了不起的是上游的模型工作：
+
+- **[IndexTTS2](https://github.com/index-tts/index-tts)** — bilibili IndexTTS Team
+  （模型权重、推理引擎、`webui.py`、原版 README 存档见
+  [`docs/README_UPSTREAM.md`](docs/README_UPSTREAM.md)）
+- [tortoise-tts](https://github.com/neonbjb/tortoise-tts) ·
+  [XTTSv2](https://github.com/coqui-ai/TTS) ·
+  [BigVGAN](https://github.com/NVIDIA/BigVGAN) ·
+  [wenet](https://github.com/wenet-e2e/wenet) ·
+  [icefall](https://github.com/k2-fsa/icefall) ·
+  [maskgct](https://github.com/open-mmlab/Amphion) ·
+  [seed-vc](https://github.com/Plachtaa/seed-vc)
+- 本项目训练体系用到的开源组件：**PEFT**（LoRA）、**OpenAI Whisper**（WER 评测）、
+  **CAMPPlus**（声纹相似度）、**Gradio**（界面）
+
+### 引用上游
 
 ```bibtex
 @article{deng2025indextts,
@@ -610,44 +323,8 @@ IndexTTS:
 }
 ```
 
-## 🙏 Acknowledgements
-
-1. [tortoise-tts](https://github.com/neonbjb/tortoise-tts)
-2. [XTTSv2](https://github.com/coqui-ai/TTS)
-3. [BigVGAN](https://github.com/NVIDIA/BigVGAN)
-4. [wenet](https://github.com/wenet-e2e/wenet/tree/main)
-5. [icefall](https://github.com/k2-fsa/icefall)
-6. [maskgct](https://github.com/open-mmlab/Amphion/tree/main/models/tts/maskgct)
-7. [seed-vc](https://github.com/Plachtaa/seed-vc)
-
-## 📄 License
-
-This project is released under the [bilibili Model Use License Agreement](LICENSE).
-Please also read the [DISCLAIMER](DISCLAIMER) before use.
-
-### Licensing of this fork
-
-This repository is a derivative work, so two layers of terms apply together.
-
-| Applies to | License |
-|---|---|
-| The Model — model weights and the upstream code published by bilibili (including `indextts/` and `webui.py`) | [bilibili Model Use License Agreement](LICENSE) · [中文](LICENSE_ZH.txt) — mandatory, unchanged, and it governs every derivative work |
-| Original additions by [SrQingChen](https://github.com/SrQingChen) (the files listed in [NOTICE](NOTICE) §3: `webui_app/`, `tools/`, `webui_pro.py`, `start.bat`) | [GNU GPL v3](LICENSE-ADDITIONS.txt) |
-
-In short:
-
-- **You are free to use, study, modify and redistribute** this work, including
-  for optimization and further development.
-- **If you distribute a modified version**, it must stay under these same
-  terms: the GPL v3 for the additions, and the bilibili agreement for the
-  Model (which requires passing its terms on to *your* downstream recipients).
-- **Keep the credit.** Preserve [NOTICE](NOTICE) and the copyright notices, and
-  credit both the original right-holder (bilibili, IndexTTS2) and the author of
-  the modifications (SrQingChen). Add your own contribution to `NOTICE` when
-  you build on it.
-- Where the two layers cannot both be satisfied, the bilibili Model Use License
-  Agreement governs the Model and the GPL v3 does not extend to it.
-
-Read [NOTICE](NOTICE) for the full attribution chain, the list of modifications
-and the disclaimer that the upstream agreement requires this distribution to
-carry. It is not legal advice.
+<div align="center">
+<sub>IndexTTS-2.5 Pro · 由 <a href="https://github.com/SrQingChen">SrQingChen</a> 维护 ·
+官方 <code>webui.py</code> 保持不变，本界面为独立实现 ·
+参数行为说明均经源码核实</sub>
+</div>
