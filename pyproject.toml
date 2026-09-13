@@ -105,13 +105,6 @@ torch_compile = [
 test = [
   "pytest>=7.0",
 ]
-# Optional: NeMo text normalization for JA/ES (numbers, dates, currency).
-# Pulls `pynini`, which has no official Windows wheel — install with
-# `uv sync --extra nemo` only if you need JA/ES text normalization.
-# The Pro console degrades gracefully (returns the raw text) when missing.
-nemo = [
-  "nemo-text-processing>=1.0",
-]
 
 [tool.pytest.ini_options]
 markers = [

@@ -80,7 +80,11 @@ echo.
 echo       This project manages its environment with uv.
 echo       From the project root, run:
 echo.
-echo           uv sync --all-extras --default-index "https://mirrors.aliyun.com/pypi/simple"
+echo           uv sync --extra webui --default-index "https://mirrors.aliyun.com/pypi/simple"
+echo.
+echo       --extra webui adds gradio on top of the base dependencies.
+echo       Do NOT use --all-extras: it also pulls deepspeed / flash-attn /
+echo       torch_compile, which need a CUDA toolchain and are optional here.
 echo.
 echo       First run downloads roughly 5-8 GB (Python + torch/CUDA + deps).
 echo       When it finishes, double-click this file again.
@@ -94,7 +98,7 @@ exit /b 1
 :bad_venv
 echo   [X] the venv exists but cannot run: %PY%
 echo       It may be corrupt. Delete the .venv folder, then run:
-echo           uv sync --all-extras
+echo           uv sync --extra webui
 echo.
 pause
 endlocal

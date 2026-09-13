@@ -5,7 +5,7 @@
 > 不要只写「已完成」—— 三个月后没人记得当时是怎么验的。
 >
 > 状态标记：`[x]` 已完成并验收 · `[~]` 进行中 · `[ ]` 未开始
-> 最近更新：阶段 2 全部完成（b1–b9 + z1），2026-09-13 真机验收通过
+> 最近更新：阶段 2 全部完成 + 工程化发布（环境 / 启动器 / 许可 / GitHub），2026-09-13
 
 ---
 
@@ -164,3 +164,42 @@
 - RTX 4060 Laptop 8GB：引擎常驻 4.94~5.70 GB；训练前必须先卸载引擎
 - `copy.deepcopy(CFM)` **会失败**（`weight_norm` 的 hook 存了非叶子张量）→ 需要副本时重新构造
 - PowerShell 不支持 `&&`，用 `;`
+
+
+---
+
+## 阶段 3 · 工程化与发布（已完成）
+
+| ID | 内容 | 状态 | 验收证据 |
+|---|---|---|---|
+| c1 | 修复被 `uv sync` 覆盖的环境，补齐缺失依赖 | `[x]` | uv venv（Python 3.11.13 + torch 2.8.0+cu128）补装 gradio/peft/pypinyin；`build_check` 11 Tab 通过 |
+| c2 | `pyproject.toml` 声明真实依赖 + 作者 | `[x]` | 基础依赖加 `peft>=0.14`、`pypinyin>=0.51`；作者加 SrQingChen；`uv lock` 一致（191 包） |
+| c3 | 启动器 `start.bat` | `[x]` | 自检 venv/依赖/模型/CUDA → 缺依赖可一键补装 → 启动并开浏览器；实测 7860 监听正常 |
+| c4 | 作者标签与许可分层 | `[x]` | `NOTICE`（归属链 + 修改清单 + 上游 §4.1a 强制免责声明）、`LICENSE-ADDITIONS.txt`（GPL-3.0）；上游 `LICENSE`/`LICENSE_ZH.txt` 原样保留 |
+| c5 | 清理测试产物并推送 GitHub | `[x]` | 保留 4 份验收报告到 `docs/verification/`；推送 **409 文件 / 39.8 MB**（无模型权重/venv/产物），https://github.com/SrQingChen/IndexTTS-2.5-Pro |
+
+**许可分层说明**（为什么不整体换 MIT/Apache）：
+
+- 上游 `LICENSE` 是 bilibili 自定义模型许可，§3.4(b) 要求保留原始版权声明与协议副本、
+  §4.1(a) 要求下游声明免责 —— **不可替换**，替换即违约。
+- 因此采用两层：Model 与上游代码 → bilibili 许可（不变）；
+  SrQingChen 的**原创新增文件** → GPL-3.0（copyleft + 保留署名），
+  正好满足「可自由拉取优化，但基于本项目修改需遵循协议并保留贡献」。
+- 两层冲突时以上游协议为准（GPL 不延伸至 Model）。详见 `NOTICE`。
+
+---
+
+## 环境陷阱（新增，务必先看）
+
+- **`uv sync` 会就地覆盖 `.venv`**。本项目原环境是
+  `.venv --system-site-packages`（借系统 Python 3.10 的 torch 2.7.1+cu118）
+  + venv 内装 gradio/peft/pypinyin。直接跑 `uv sync` 会把这三样一起清掉，
+  表现为「启动就报 No module named 'gradio'」。
+  修复：`uv sync --extra webui`（peft/pypinyin 已在基础依赖里）。
+- **不要用 `uv sync --all-extras` 作为默认路径**：它还会拉
+  deepspeed / flash-attn / torch_compile，需要 CUDA 工具链且非必需。
+- **`.bat` 必须是纯 ASCII**。cmd.exe 用**当前代码页**逐行解析批处理文件，
+  UTF-8 中文会被按 GBK 误解并连带破坏后续命令行（实测把 `echo` 行解析成
+  命令、label 被截断）。中文说明写在 README / 本文件里。
+- **批处理里 `%s` 会被当成环境变量吃掉**。避免在 `.bat` 内嵌 Python 字符串里
+  使用 `%`（改用逗号分隔的 print 参数或 `.format()`）。

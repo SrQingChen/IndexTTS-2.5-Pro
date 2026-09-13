@@ -66,10 +66,17 @@ start.bat
 Or manually:
 
 ```bash
-uv sync --all-extras          # first time only
-uv run webui_pro.py           # the Pro console (11 tabs)
-uv run webui.py               # the upstream single-page UI, unchanged
+uv sync --extra webui        # first time only; installs base deps + gradio
+uv run webui_pro.py          # the Pro console (11 tabs)
+uv run webui.py              # the upstream single-page UI, unchanged
 ```
+
+> Use `--extra webui` rather than `--all-extras`: the latter also pulls the
+> `deepspeed`, `accel` (flash-attn) and `torch_compile` extras, which need a
+> CUDA toolchain and are optional. The Pro console does not require them.
+> JA/ES text normalization needs `nemo-text-processing` (which depends on
+> `pynini`, no official Windows wheel) — install it manually if you need it;
+> without it the console falls back to the raw text and says so in a warning.
 
 `start.bat` verifies the virtual environment, the Python dependencies
 (`gradio`, `peft`, `pypinyin`, … which the upstream `pyproject.toml` does not
