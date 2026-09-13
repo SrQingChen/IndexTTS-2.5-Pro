@@ -1,0 +1,123 @@
+IndexTTS-2.5 Pro — NOTICE
+=========================
+
+This repository is an enhanced derivative of the IndexTTS2 model and codebase.
+It is distributed under the terms of the upstream license, which is mandatory
+and remains in force for the Model and all derivative works. This file records
+the attribution chain, the modifications made, and the notices that this
+distribution is required to carry.
+
+--------------------------------------------------------------------------------
+1. Upstream work (the "Model")
+--------------------------------------------------------------------------------
+
+  IndexTTS2 / IndexTTS-2.5
+  Copyright (c) bilibili — original right-holder of the Model
+  Upstream repository: https://github.com/index-tts/index-tts
+  License: "bilibili Model Use License Agreement"
+           See ./LICENSE (English) and ./LICENSE_ZH.txt (Chinese, governing).
+
+  The Model — meaning the model weights and the code published by bilibili at
+  the URL above — remains under that agreement. That agreement cannot be, and
+  has not been, replaced or relaxed by this repository. Sections 3.4(b) and
+  3.4(a) of it require that every copy of the Model or a derivative work retain
+  the original copyright notices together with a copy of the agreement, and
+  that downstream recipients be bound by it. Both requirements are satisfied
+  here by keeping ./LICENSE and ./LICENSE_ZH.txt unmodified.
+
+--------------------------------------------------------------------------------
+2. Required disclaimer (upstream agreement, Section 4.1(a))
+--------------------------------------------------------------------------------
+
+  Any modifications made to the original model in this Derivative Work are NOT
+  endorsed, warranted, or guaranteed by the original right-holder of the
+  original model, and the original right-holder disclaims all liability
+  related to this Derivative Work.
+
+  Chinese (as required by the governing Chinese-language version):
+
+  该衍生品对原模型所作的任何改动与原模型原始权利人无关，原始权利人对该衍生
+  品不背书、不担保、不承担责任。
+
+--------------------------------------------------------------------------------
+3. Modifications in this derivative work
+--------------------------------------------------------------------------------
+
+  Author of the modifications: SrQingChen
+  https://github.com/SrQingChen
+
+  The upstream model weights, the inference engine under ./indextts, and the
+  official ./webui.py entry point are used unmodified. All changes are additive
+  and live in new files:
+
+  * webui_app/               Modular Gradio console ("Pro console"):
+                             synthesis, audio lab, batch, presets, dataset
+                             management, training, alignment, evaluation and
+                             deployment tabs, plus a parameter manual.
+                             ./webui.py is intentionally left byte-identical.
+  * webui_app/services/      Engine lifecycle, VRAM management, batch
+                             inference, voice bank, pronunciation service.
+  * webui_app/training/      LoRA training subsystem:
+                               guard.py        generalization safeguards
+                               dataset.py      dataset & metadata
+                               features.py     offline feature pre-extraction
+                               forward.py      single verified training forward
+                               trainer_base.py shared training pipeline
+                               gpt_lora.py     GPT (T2S) LoRA trainer
+                               cfm_lora.py     CFM (S2M) LoRA trainer
+                               replay.py       base-distillation replay set
+                               runs.py         run records, checkpoint vault
+                               reward.py       WER (whisper) + SS (campplus)
+                               dpo.py          preference pairs & DPO trainer
+                               evaluate.py     automatic A/B evaluation
+                               merge.py        LoRA merge / mount / strength
+                               runner.py       background job runner
+  * tools/                   Verification probes and downloader. Each probe is
+                             a self-contained regression suite; see
+                             docs/verification/ for the recorded results.
+  * webui_pro.py             Entry point of the Pro console.
+
+  Verification evidence (recorded, reproducible):
+    docs/verification/stage2_report.md   end-to-end training loop, real GPU
+    docs/verification/gpt_report.md      GPT LoRA run
+    docs/verification/cfm_report.md      CFM LoRA run
+    docs/verification/ab_report.md       A/B evaluation
+
+--------------------------------------------------------------------------------
+4. Licensing of the modifications
+--------------------------------------------------------------------------------
+
+  The original additions authored by SrQingChen (the new files listed in
+  Section 3) are additionally made available under the GNU General Public
+  License, version 3 — see ./LICENSE-ADDITIONS.txt.
+
+  These two layers apply together. If you use, modify or redistribute anything
+  in this repository you must comply with BOTH of the following:
+
+    (a) the bilibili Model Use License Agreement (./LICENSE, ./LICENSE_ZH.txt),
+        which governs the Model and every derivative work of it — including
+        the obligation to pass these terms on to your own downstream
+        recipients and to retain the original copyright notices; and
+
+    (b) the GNU General Public License v3 for the original additions, which
+        requires that modified versions you distribute remain under the same
+        license and that the original authorship be preserved and credited.
+
+  Where the two cannot both be satisfied, the bilibili Model Use License
+  Agreement governs the Model, and the GPL v3 does not extend to it.
+
+  Credit requirement: if you build on this work, keep this NOTICE file and the
+  copyright notices intact, and credit both the original right-holder
+  (bilibili, IndexTTS2) and the author of these modifications (SrQingChen).
+
+--------------------------------------------------------------------------------
+5. No warranty
+--------------------------------------------------------------------------------
+
+  This derivative work is provided "AS IS", without warranty of any kind,
+  express or implied. The author of the modifications (SrQingChen) makes no
+  warranty regarding it and accepts no liability for its use, in addition to
+  the disclaimers already set out in Section 3 of the upstream agreement.
+
+  This NOTICE is a factual record of attribution and changes. It is not legal
+  advice; consult a qualified professional for licensing questions.
