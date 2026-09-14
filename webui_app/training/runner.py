@@ -50,6 +50,14 @@ class TrainRunner:
         self.phase: str = ""            # preflight / prepare / run / finalize…
         self._log_lines: List[str] = []
         self._log_run: str = ""
+        # 当前任务对引擎的要求（engine 在 load/unload 门口反查它，
+        # 见 TTSEngine._busy_runner_req）。任务结束后保留，没人再读。
+        self._engine_req: str = "none"
+
+    @property
+    def engine_req(self) -> str:
+        """running 时的任务对引擎的要求：loaded / unloaded / none。"""
+        return self._engine_req
 
     # ------------------------------------------------------------------
     # 提交
@@ -58,14 +66,19 @@ class TrainRunner:
                fn: Callable[[Callable[[float, str], None],
                              Callable[[], bool]], Any],
                require_engine: str = "none",
-               engine=None) -> Dict[str, Any]:
+               engine=None,
+               holds_engine: bool = False) -> Dict[str, Any]:
         """启动一个后台任务。
 
         fn(progress_cb, should_stop) -> Any（任意可 JSON 化的结果摘要）。
         require_engine:
             "loaded"  任务需要引擎已加载（合成类：pairs / eval / distill）
             "unloaded" 任务需要引擎已卸载（训练类：显存不够两者共存）
-            "none"     无所谓（merge / extract 走 CPU）
+            "none"     无所谓（merge 走 CPU）
+        holds_engine: 任务自己会（按需）加载并**全程借用**引擎
+            （特征提取就是这种）：等效 require_engine="loaded"，
+            但提交时不要求引擎已经加载。占用期间 engine.unload() 会被拒，
+            防止「状态条说已卸载、GPU 上却留着第二份模型」。
         """
         with self._lock:
             if self.running:
@@ -83,6 +96,7 @@ class TrainRunner:
             self.phase = ""
             self._log_lines = []
             self._log_run = ""
+            self._engine_req = "loaded" if holds_engine else require_engine
             self._stop_flag.clear()
 
         # 引擎前置条件在**提交线程**里检查（同步返回给 UI，不用轮询）

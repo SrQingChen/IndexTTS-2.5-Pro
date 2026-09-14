@@ -26,6 +26,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import threading
 import time
 from dataclasses import asdict, dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Sequence
@@ -33,6 +34,11 @@ from typing import Any, Callable, Dict, List, Optional, Sequence
 from webui_app.config import PROJECT_ROOT
 
 DATASETS_ROOT = os.path.join(PROJECT_ROOT, "datasets")
+
+# meta.jsonl 的读-改-写互斥：UI 线程（写文本/体检重算）与 runner 线程
+# （特征提取结束批量回写）都会整文件 load→modify→save，不加锁时
+# 后写者会拿旧快照覆盖先写者 —— 用户刚补的文本被静默抹掉。
+_META_LOCK = threading.RLock()
 
 AUDIO_SUBDIR = "audio"
 FEATURE_SUBDIR = "features"
@@ -69,6 +75,7 @@ class Utterance:
 
     id: str
     audio: str = ""                 # 相对数据集目录的路径
+    source: str = ""                # 导入时的源文件绝对路径（去重用）
     text: str = ""                  # 训练用文本（人工校对后）
     asr_text: str = ""              # whisper 原始转写，仅作参考
     asr_model: str = ""
@@ -254,18 +261,43 @@ def get(name: str, uid: str) -> Optional[Utterance]:
 
 
 def update(name: str, uid: str, **fields) -> Optional[Utterance]:
-    items = load_meta(name)
-    target = None
-    for u in items:
-        if u.id == uid:
+    with _META_LOCK:
+        items = load_meta(name)
+        target = None
+        for u in items:
+            if u.id == uid:
+                for k, v in fields.items():
+                    if hasattr(u, k):
+                        setattr(u, k, v)
+                target = u
+                break
+        if target is not None:
+            save_meta(name, items)
+        return target
+
+
+def apply_fields(name: str, touched: Dict[str, Dict[str, Any]]) -> int:
+    """一次性把多个样本的字段回写 meta.jsonl（读-改-写，加锁）。
+
+    供特征提取结束时的批量回写与 UI 的批量写文本共用。
+    不用逐条 update()：那个每次都 load+save 整个文件，循环里调是 O(n²)。
+    """
+    if not touched:
+        return 0
+    with _META_LOCK:
+        items = load_meta(name)
+        n = 0
+        for u in items:
+            fields = touched.get(u.id)
+            if not fields:
+                continue
             for k, v in fields.items():
                 if hasattr(u, k):
                     setattr(u, k, v)
-            target = u
-            break
-    if target is not None:
-        save_meta(name, items)
-    return target
+            n += 1
+        if n:
+            save_meta(name, items)
+    return n
 
 
 def remove_utterances(name: str, uids: Sequence[str]) -> int:
@@ -371,13 +403,14 @@ def refresh_all(name: str, require_features: bool = True,
                 ) -> Dict[str, int]:
     """重算全部样本的状态。导入后/提取特征后调用。"""
     d = dir_of(name)
-    items = load_meta(name)
-    n = len(items)
-    for i, u in enumerate(items):
-        evaluate(u, d, require_features)
-        if progress and n:
-            progress((i + 1) / n, f"体检 {i+1}/{n}")
-    save_meta(name, items)
+    with _META_LOCK:
+        items = load_meta(name)
+        n = len(items)
+        for i, u in enumerate(items):
+            evaluate(u, d, require_features)
+            if progress and n:
+                progress((i + 1) / n, f"体检 {i+1}/{n}")
+        save_meta(name, items)
     return stats(name)
 
 
@@ -399,20 +432,34 @@ def import_audio(name: str, paths: Sequence[str], copy: bool = True,
     os.makedirs(audio_dir, exist_ok=True)
 
     items = load_meta(name)
-    existing = {os.path.basename(u.audio) for u in items}
+    # 按源文件去重：同一批文件导两遍不该让样本静默翻倍。
+    # 新 meta 用 source 字段（导入时的源绝对路径）；旧数据里 copy=False
+    # 导入的 audio 本身就是绝对路径，也算进去。
+    seen_sources = {os.path.normcase(os.path.abspath(u.source))
+                    for u in items if getattr(u, "source", "")}
+    seen_sources |= {os.path.normcase(os.path.abspath(u.audio))
+                     for u in items if os.path.isabs(u.audio or "")}
     gen = _next_id(items)
 
     added, skipped, failed = [], [], []
+    staged: List[tuple] = []          # (uid, rel, src_abs)：拷完再统一入册
     paths = [p for p in paths if p]
     for i, src in enumerate(paths):
         if progress and paths:
             progress(i / len(paths), f"导入 {i+1}/{len(paths)}")
         src = str(src).strip()
+        if not src:
+            continue
         if not os.path.isfile(src):
             failed.append(f"{src}: 文件不存在")
             continue
         if not src.lower().endswith(AUDIO_EXTS):
             skipped.append(f"{os.path.basename(src)}: 不是支持的音频格式")
+            continue
+        src_abs = os.path.abspath(src)
+        key = os.path.normcase(src_abs)
+        if key in seen_sources:
+            skipped.append(f"{os.path.basename(src)}: 已导入过（同一源文件）")
             continue
 
         if copy:
@@ -431,15 +478,25 @@ def import_audio(name: str, paths: Sequence[str], copy: bool = True,
             rel = os.path.join(AUDIO_SUBDIR, dst_name)
         else:
             uid = gen()
-            rel = os.path.abspath(src)
+            rel = src_abs
 
-        existing.add(os.path.basename(rel))
-        u = Utterance(id=uid, audio=rel, lang=lang)
-        evaluate(u, d, require_features=False)
-        items.append(u)
-        added.append(uid)
+        seen_sources.add(key)
+        staged.append((uid, rel, src_abs))
 
-    save_meta(name, items)
+    # ---- 入册（读-改-写，加锁）。拷贝是慢操作放在锁外；锁内重读 meta，
+    # 中途别处写入的字段（比如用户同时补文本）不会丢。
+    if staged:
+        with _META_LOCK:
+            items = load_meta(name)
+            have = {u.id for u in items}
+            for uid, rel, src_abs in staged:
+                if uid in have:               # 有并发导入时 uid 撞号，重发一个
+                    uid = _next_id(items)()
+                u = Utterance(id=uid, audio=rel, lang=lang, source=src_abs)
+                evaluate(u, d, require_features=False)
+                items.append(u)
+                added.append(uid)
+            save_meta(name, items)
     if progress:
         progress(1.0, "导入完成")
     return {"added": len(added), "skipped": skipped, "failed": failed,

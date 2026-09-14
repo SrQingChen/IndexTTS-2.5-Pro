@@ -433,23 +433,10 @@ def check_feature(feat: Dict[str, Any]) -> List[str]:
 def _apply_meta(name: str, touched: Dict[str, Dict[str, Any]]) -> int:
     """一次性把多个样本的字段回写 meta.jsonl。
 
-    不用 DS.update()：那个每次都会 load+save 整个文件，在循环里调就是 O(n²)。
+    薄封装，真身在 DS.apply_fields（读-改-写加锁）：
+    提取结束的回写跑在 runner 线程，可能与 UI 线程的写文本并发。
     """
-    if not touched:
-        return 0
-    items = DS.load_meta(name)
-    n = 0
-    for u in items:
-        fields = touched.get(u.id)
-        if not fields:
-            continue
-        for k, v in fields.items():
-            if hasattr(u, k):
-                setattr(u, k, v)
-        n += 1
-    if n:
-        DS.save_meta(name, items)
-    return n
+    return DS.apply_fields(name, touched)
 
 
 def extract_dataset(name: str, overwrite: bool = False, only: str = "ready",

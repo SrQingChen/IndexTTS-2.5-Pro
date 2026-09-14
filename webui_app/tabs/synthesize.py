@@ -731,8 +731,12 @@ def render(ctx: AppContext):
         return engine_html(), ctx.status_html()
 
     def on_unload():
-        eng.unload()
-        gr.Info("模型已卸载，显存已归还")
+        try:
+            eng.unload()
+        except EngineError as e:
+            gr.Error(str(e))
+        else:
+            gr.Info("模型已卸载，显存已归还")
         return engine_html(), ctx.status_html()
 
     load_btn.click(on_load, inputs=[], outputs=[engine_state, sb])

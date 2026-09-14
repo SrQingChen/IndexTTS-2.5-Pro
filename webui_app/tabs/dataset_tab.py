@@ -244,7 +244,8 @@ def render(ctx: AppContext):
                 tts=eng.tts, device=str(getattr(eng.tts, "device", "cuda")))
 
         r = runner.submit("extract", f"特征提取 · {name}", fn,
-                          require_engine="none", engine=eng)
+                          require_engine="none", engine=eng,
+                          holds_engine=True)
         if not r["ok"]:
             return T.err(r["message"]), gr.update(), gr.update()
         return (T.tip("🚀 特征提取已在后台运行，可切到「训练」页继续配置。"),

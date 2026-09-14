@@ -222,6 +222,25 @@ class EngineError(RuntimeError):
     """引擎状态错误（未加载、显存不足等），UI 应捕获并友好提示。"""
 
 
+def _busy_runner_engine_req() -> str:
+    """有训练类后台任务在跑时，返回它对引擎的要求（loaded/unloaded）。
+
+    没有任务在跑（或 runner 不可用）返回 ""。这是 runner ↔ engine
+    的双向互斥：runner 在 submit 门口检查引擎状态，engine 在
+    load/unload 门口反查 runner —— 只拦一边，训练跑着的几十分钟里
+    用户仍能从合成页把 5GB 的引擎加载回来，WDDM 下显存互踩静默降速
+    20~30 倍且不报错。
+    """
+    try:
+        from webui_app.training.runner import get_runner  # 延迟导入避免环
+        r = get_runner()
+    except Exception:
+        return ""
+    if getattr(r, "running", False):
+        return str(getattr(r, "engine_req", "") or "")
+    return ""
+
+
 class TTSEngine:
     """线程安全的引擎封装。全应用只应存在一个实例（由 AppContext 持有）。"""
 
@@ -275,6 +294,15 @@ class TTSEngine:
     def load(self, force: bool = False) -> EngineStats:
         """加载主模型。已加载时直接返回（除非 force）。"""
         with self._lock:
+            req = _busy_runner_engine_req()
+            if req == "unloaded":
+                raise EngineError(
+                    "训练正在进行中，引擎不能加载（8 GB 显存放不下训练器"
+                    "加引擎两份）。请先停止训练或等它结束。")
+            if req == "loaded" and force:
+                raise EngineError(
+                    "后台任务（特征提取/偏好对构造/评测）正在使用引擎，"
+                    "不能强制重载。")
             if self._tts is not None and not force:
                 return self.stats
             if self._tts is not None and force:
@@ -328,6 +356,13 @@ class TTSEngine:
     def unload(self) -> EngineStats:
         """卸载主模型，归还显存。"""
         with self._lock:
+            if _busy_runner_engine_req() == "loaded":
+                # 任务线程手里还攥着 tts 的引用，这里删自己的引用并不会
+                # 释放显存 —— 状态条却会说已卸载。用户接着加载就得到
+                # GPU 上的第二份模型。所以直接拒绝，让任务先跑完。
+                raise EngineError(
+                    "后台任务（特征提取/偏好对构造/评测）正在使用引擎，"
+                    "完成或停止任务后再卸载。")
             self._unload_locked()
             self._emit("unloaded", "模型已卸载，显存已释放")
             return self.stats
@@ -551,7 +586,12 @@ class TTSEngine:
     # -- LoRA（阶段 2 使用，此处仅提供挂载点）------------------------------
 
     def attach_lora(self, adapter_dir: str, target: str = "gpt") -> str:
-        """把 LoRA adapter 挂到当前引擎上。target: gpt | cfm"""
+        """把 LoRA adapter 挂到当前引擎上（已挂着就先卸掉，替换语义）。
+
+        target: gpt | cfm。不先卸载的话 PEFT 会把已包装的模块再包一层，
+        而 detach 只解一层 —— UI 显示「纯底座」但内层 LoRA 仍在生效，
+        这比挂不上严重得多。
+        """
         with self._lock:
             tts = self.tts
             from peft import PeftModel
@@ -565,6 +605,10 @@ class TTSEngine:
 
             if not os.path.isdir(adapter_dir):
                 raise EngineError(f"adapter 目录不存在: {adapter_dir}")
+
+            if any(t.startswith(target + ":")
+                   for t in self.stats.lora_adapters):
+                self.detach_lora(target)   # _lock 是 RLock，重入安全
 
             wrapped = PeftModel.from_pretrained(base, adapter_dir)
             if target == "gpt":

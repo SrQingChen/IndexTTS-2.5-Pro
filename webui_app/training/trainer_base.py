@@ -587,19 +587,34 @@ class BaseTrainer:
         if os.path.isdir(ref):
             return os.path.abspath(ref)
         base = os.path.basename(str(ref).rstrip("\\/"))
-        roots = [RN.checkpoints_dir(self.run_name)]
+        # 候选 = 本 run 保险库 + 所有 run 的保险库（跨 run 续训）。
+        # "final" 特殊：它就在 run 目录下而不是 checkpoints/ 里。
+        cands = [os.path.join(RN.checkpoints_dir(self.run_name), base)]
         top = RN.root()
         if os.path.isdir(top):
             for d in sorted(os.listdir(top)):
-                roots.append(os.path.join(top, d, RN.CHECKPOINT_DIR))
-                roots.append(os.path.join(top, d, "final"))
-        for r in roots:
-            p = os.path.join(r, base)
+                cands.append(os.path.join(top, d, RN.CHECKPOINT_DIR, base))
+                if base == "final":
+                    cands.append(os.path.join(top, d, "final"))
+        for p in cands:
             if os.path.isdir(p):
                 return os.path.abspath(p)
         raise FileNotFoundError(
-            f"找不到 checkpoint：{ref}\n已搜索：{roots[:3]}…\n"
+            f"找不到 checkpoint：{ref}\n已搜索：{cands[:3]}…\n"
             "可以传绝对路径，或传保险库里的档位名（如 ckpt-e003-s000036）。")
+
+    def name_conflict(self) -> str:
+        """用户指定的运行名若已存在训练记录，返回错误文案；无冲突返回空串。
+
+        prepare() 会直接复用同名目录：旧 run.json 被覆盖（历史丢失），
+        新 checkpoint 还会混进旧保险库参与排序剪枝。必须在门口拦住，
+        preflight 与训练页也调它，让问题在开跑前就可见。
+        """
+        if self.run_name and RN.read_run(self.run_name):
+            return (f"运行名 `{self.run_name}` 已有训练记录，为避免覆盖"
+                    "请换一个名字或留空自动生成"
+                    "（确要重用请先在「训练记录」区删除旧记录）。")
+        return ""
 
     def _load_adapter_weights(self, ckpt_dir: str) -> int:
         """把 checkpoint 里的 adapter 权重灌回刚注入的模型，返回张量数。
@@ -791,6 +806,9 @@ class BaseTrainer:
             if not self.run_name:
                 self.run_name = RN.suggest_run_name(self.ARCH, self.dataset)
             self.run_name = RN.safe_run_name(self.run_name)
+            conflict = self.name_conflict()
+            if conflict:
+                raise RuntimeError(conflict)
             self.report.run = self.run_name
             RN.run_dir(self.run_name, create=True)
 

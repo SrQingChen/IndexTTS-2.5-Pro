@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import json
+import os
 from typing import Any, Dict, List, Optional
 
 import gradio as gr
@@ -61,12 +62,18 @@ def _runs_choices(arch: Optional[str] = None) -> List[str]:
     return [r.name for r in RN.list_runs(arch=arch)]
 
 
+NO_RESUME_RUN = "（无）"
+NO_RESUME_CKPT = "（从零开始）"
+
+
 def _ckpt_choices(run: str) -> List[str]:
-    out = ["（从零开始）"]
+    """某个 run 可选的续训档位。用 list_checkpoints（不创建目录）。"""
+    out = [NO_RESUME_CKPT]
     if run and RN.read_run(run).get("arch"):
         try:
-            for c in RN.vault(run).list():
-                out.append(c.name)
+            out.extend(c.name for c in RN.list_checkpoints(run))
+            if os.path.isdir(os.path.join(RN.run_dir(run), "final")):
+                out.append("final")
         except Exception:
             pass
     return out
@@ -96,11 +103,14 @@ def render(ctx: AppContext):
                 preset_desc = gr.HTML(T.hint(GD.PRESET_NOTES["balanced"]))
                 run_name_tb = gr.Textbox(label="运行名（留空自动生成）", value="")
 
-                resume_dd = gr.Dropdown(choices=_ckpt_choices(""),
-                                        value="（从零开始）",
-                                        label="续训 checkpoint",
-                                        info="跨 run 续训：选其他 run 的档位前，"
-                                             "先把上面数据集与目标换成当时的配置")
+                resume_run_dd = gr.Dropdown(
+                    choices=[NO_RESUME_RUN] + _runs_choices(),
+                    value=NO_RESUME_RUN, label="续训来源 run")
+                resume_dd = gr.Dropdown(
+                    choices=[NO_RESUME_CKPT], value=NO_RESUME_CKPT,
+                    label="续训 checkpoint",
+                    info="跨 run 续训：选其他 run 的档位前，"
+                         "先把上面数据集与目标换成当时的配置")
                 val_ratio = gr.Slider(0.02, 0.4, value=0.1, step=0.01,
                                       label="验证集比例（数据集未划分时自动划分）")
 
@@ -167,10 +177,24 @@ def render(ctx: AppContext):
         return (gr.update(value=_default_options_json(arch)),
                 gr.update(choices=DS.list_datasets()),
                 gr.update(choices=_runs_choices(
-                    arch if arch != "dpo" else "dpo")))
+                    arch if arch != "dpo" else "dpo")),
+                gr.update(choices=[NO_RESUME_RUN] + _runs_choices(arch),
+                          value=NO_RESUME_RUN))
 
     arch_dd.change(on_arch, inputs=[arch_dd, ds_dd],
-                   outputs=[options_ta, ds_dd, run_detail_dd])
+                   outputs=[options_ta, ds_dd, run_detail_dd, resume_run_dd])
+
+    def on_resume_run(run, arch_label):
+        """选了来源 run 才列出它的档位；换目标时按 arch 过滤。"""
+        arch = ARCH_OF.get(arch_label, "gpt")
+        if not run or run == NO_RESUME_RUN \
+                or (RN.read_run(run).get("arch") or arch) != arch:
+            return gr.update(choices=[NO_RESUME_CKPT], value=NO_RESUME_CKPT)
+        cks = _ckpt_choices(run)
+        return gr.update(choices=cks, value=cks[0])
+
+    resume_run_dd.change(on_resume_run, inputs=[resume_run_dd, arch_dd],
+                         outputs=[resume_dd])
 
     def _build_cfg(arch, preset_label, rank, alpha, lr, epochs,
                    replay_dd_label, replay_ratio):
@@ -239,6 +263,9 @@ def render(ctx: AppContext):
             replay_ratio, options_json, rname, resume_label, vratio)
         if err:
             return T.err(err)
+        conflict = tr.name_conflict()
+        if conflict:
+            return T.err(conflict)
         try:
             pf = tr.preflight()
         except Exception as e:
@@ -320,10 +347,13 @@ def render(ctx: AppContext):
     # ---------- 轮询 ----------
     poll_cache: Dict[str, Any] = {"snap": None}
 
+    # 输出固定 4 个（progress_html / log_ta / runs_md / run_detail_dd），
+    # 任何分支少返回一个都会让 Gradio 在 Timer 里抛
+    # "didn't return enough output values"。
     def on_poll():
         snap = runner.snapshot()
         if snap == poll_cache["snap"] and not snap["running"]:
-            return gr.update(), gr.update(), gr.update()
+            return gr.update(), gr.update(), gr.update(), gr.update()
         poll_cache["snap"] = snap
         just_done = snap["ok"] is not None and not snap["running"]
         if snap["running"] or just_done:
@@ -352,7 +382,7 @@ def render(ctx: AppContext):
                 else (gr.update(), gr.update())
             return (gr.update(value=bar), gr.update(value=runner.log_text()),
                     *runs_up)
-        return gr.update(), gr.update(), gr.update()
+        return gr.update(), gr.update(), gr.update(), gr.update()
 
     timer = gr.Timer(value=2.5, active=True)
     timer.tick(on_poll, inputs=[],
@@ -361,9 +391,11 @@ def render(ctx: AppContext):
     def on_page_load():
         return (gr.update(choices=DS.list_datasets()),
                 gr.update(choices=_runs_choices()),
+                gr.update(choices=[NO_RESUME_RUN] + _runs_choices()),
                 RN.runs_markdown(arch=None))
 
     return {
-        "page_load": (on_page_load, [ds_dd, run_detail_dd, runs_md]),
+        "page_load": (on_page_load,
+                      [ds_dd, run_detail_dd, resume_run_dd, runs_md]),
         "components": {"ds_dd": ds_dd, "arch_dd": arch_dd},
     }

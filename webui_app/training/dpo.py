@@ -507,10 +507,17 @@ class DpoTrainer(GL.GptTrainer):
             # chosen 的 NLL 锚（按 token 平均，与 SFT 同量纲）：
             # DPO 只关心相对差，chosen 的绝对似然可以塌到没人说得出话；
             # 锚把「说得好」拉回「至少说得出」。
-            n_tok = float(t["f_c"].mel_mask.sum())
-            anchor = -(t["pol_c"] / max(1.0, n_tok)) if t["f_c"].mel_mask.numel() \
-                else torch.zeros_like(t["pol_c"])
-            anchor = anchor.mean()
+            # length_normalize=True 时 pol_c 已经是每 token 平均的 logprob
+            # （mel_seq_logprob 里除过各自的有效 token 数），这里只能再对
+            # batch 取均值 —— 再除一次整批 token 数会把锚压小约三个数量级，
+            # sft_weight 就形同虚设。=False（sum 模式）才在这里按 token 折算。
+            if t["f_c"].mel_mask.numel() == 0:
+                anchor = torch.zeros((), device=logits.device)
+            elif self.options.length_normalize:
+                anchor = -t["pol_c"].mean()
+            else:
+                n_tok = float(t["f_c"].mel_mask.sum())
+                anchor = -(t["pol_c"].sum() / max(1.0, n_tok))
             loss = loss + w * anchor
         return loss, {
             "acc": float((logits > 0).float().mean()),
@@ -526,10 +533,6 @@ class DpoTrainer(GL.GptTrainer):
             return None
         # dropout_off 包住整批：policy 与 ref 必须看到同一个 dropout 世界，
         # 否则 (pol − ref) 里混进两次不同采样的随机差 —— margins 抖成噪声。
-        with GL.dropout_off(self.model) if hasattr(GL, "dropout_off") \
-                else _noop_ctx():
-            pass
-        # （GL 没有 dropout_off —— 它在 CFM 那边；这里自己包）
         t = None
         with _dropout_off_ctx(self.model):
             t = self._pair_tensors(items, self.pools, grad=True)
@@ -637,11 +640,6 @@ class DpoTrainer(GL.GptTrainer):
             # prepare 时刻的 None。
         })
         return d
-
-
-@contextlib.contextmanager
-def _noop_ctx():
-    yield
 
 
 @contextlib.contextmanager

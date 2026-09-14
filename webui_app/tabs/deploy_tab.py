@@ -42,7 +42,7 @@ def _vault_ckpts(run: str) -> List[str]:
     if not run:
         return []
     try:
-        return [c.name for c in RN.vault(run).list()]
+        return [c.name for c in RN.list_checkpoints(run)]
     except Exception:
         return []
 
@@ -244,7 +244,11 @@ def render(ctx: AppContext):
                     EV.Contender(**(r.get("a") or {"name": "a"})),
                     (EV.Contender(**r["b"]) if r.get("b") else None),
                     r.get("rows") or [], r["out_dir"],
-                    EV.EvalOptions(dataset=str(r.get("dataset", "")))))
+                    # run_eval 现在把完整 options 回传进 result；
+                    # 老结果的快照没有这个键，退回按 dataset 建（其余字段
+                    # 会是默认值，总比空串好）。
+                    EV.EvalOptions(**(r.get("options")
+                                      or {"dataset": str(r.get("dataset", ""))}))))
                 dir_html = f"试听目录：<code>{r['out_dir']}</code>"
                 if fsutil.open_in_explorer(r["out_dir"]):
                     dir_html += "（已在文件管理器打开）"
@@ -370,21 +374,18 @@ def render(ctx: AppContext):
                 man = g.snapshot(hashes=True)
                 n = len(man.get("files") or {})
                 vr = g.verify(hashes=False)
-                return (T.tip(f"✅ 快照已{'重建' if rebuild else '建立'}"
-                              f"（{n} 个文件），校验通过：底座未被改动。"),
-                        gr.update())
+                return T.tip(f"✅ 快照已{'重建' if rebuild else '建立'}"
+                             f"（{n} 个文件），校验通过：底座未被改动。")
             vr = g.verify(hashes=False)
             if vr.ok:
-                return (T.tip(f"✅ 校验通过：{vr.checked} 个底座文件未被改动。"),
-                        gr.update())
-            return (T.err("🔴 <b>底座被改动过！</b><br>变更："
-                          + "<br>".join(vr.changed[:5])
-                          + ("<br>…" if len(vr.changed) > 5 else "")
-                          + "<br>缺失：" + "<br>".join(vr.missing[:5])
-                          + "<br>请到「模型」页重新下载，或确认改动是您主动做的。"),
-                        gr.update())
+                return T.tip(f"✅ 校验通过：{vr.checked} 个底座文件未被改动。")
+            return T.err("🔴 <b>底座被改动过！</b><br>变更："
+                         + "<br>".join(vr.changed[:5])
+                         + ("<br>…" if len(vr.changed) > 5 else "")
+                         + "<br>缺失：" + "<br>".join(vr.missing[:5])
+                         + "<br>请到「模型」页重新下载，或确认改动是您主动做的。")
         except Exception as e:
-            return T.err(f"校验异常：{type(e).__name__}: {e}"), gr.update()
+            return T.err(f"校验异常：{type(e).__name__}: {e}")
 
     guard_btn.click(lambda: on_guard(False), inputs=[], outputs=[guard_out])
     rebuild_btn.click(lambda: on_guard(True), inputs=[], outputs=[guard_out])

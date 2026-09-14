@@ -140,7 +140,11 @@ def run_eval(engine, a: Contender, b: Optional[Contender],
     """
     out: Dict[str, Any] = {"ok": False, "rows": [], "errors": [],
                            "warnings": [], "a": a.to_dict(),
-                           "b": b.to_dict() if b else None}
+                           "b": b.to_dict() if b else None,
+                           # UI 轮询只拿到 result dict，报告要用它们原样重建：
+                           # 缺了 options，重建的报告头会退回默认值（seed=42 之类）
+                           "dataset": opts.dataset,
+                           "options": opts.to_dict()}
     notes = opts.validate()
     out["errors"] += [x.message for x in notes if x.level == "error"]
     out["warnings"] += [x.message for x in notes if x.level == "warn"]
@@ -182,9 +186,21 @@ def run_eval(engine, a: Contender, b: Optional[Contender],
 
     # ---- 引擎状态管理 ----
     # 开场先卸掉用户挂着的 adapter（记录在案）：attach 会把 PEFT 包在
-    # 当前模块上，双重包装后 detach 一次解不干净。评测完再尽力还原。
+    # 当前模块上，双重包装后 detach 一次解不干净。评测完再尽力还原，
+    # 还原时把用户原来的强度旋钮值也原样放回去。
     pre_attached = list(getattr(getattr(engine, "stats", None),
                                 "lora_adapters", []) or [])
+    pre_scales: Dict[str, float] = {}
+    for tag in pre_attached:
+        tgt = tag.split(":", 1)[0]
+        try:
+            mod = (getattr(engine.tts, "gpt", None) if tgt == "gpt"
+                   else engine.tts.s2mel.models.get("cfm"))
+            if mod is not None:
+                pre_scales[tgt] = float(
+                    GD.get_adapter_scale(mod).get("_mean", 1.0))
+        except Exception:
+            pass
     if pre_attached:
         out["warnings"].append(
             f"评测开始前引擎挂着 adapter（{', '.join(pre_attached)}），"
@@ -274,7 +290,10 @@ def run_eval(engine, a: Contender, b: Optional[Contender],
         out["rows"] = rows
         out["summary"] = summarize(a, b, rows)
         out["seconds"] = round(time.perf_counter() - t0, 1)
-        out["ok"] = bool(rows) and not out["errors"]
+        # 每条都可能因引擎中途卸载等原因失败（只记在 row 里）；
+        # 一条都没成的评测不能算成功，否则 UI 会挂 🎉 满屏 🔴。
+        out["ok"] = (bool(rows) and not out["errors"]
+                     and any(r.get("ok") for r in rows))
 
         with open(os.path.join(out_dir, "report.json"), "w",
                   encoding="utf-8") as f:
@@ -292,21 +311,26 @@ def run_eval(engine, a: Contender, b: Optional[Contender],
             for tag in list(getattr(getattr(engine, "stats", None),
                                     "lora_adapters", []) or []):
                 engine.detach_lora(target=tag.split(":", 1)[0])
-            for tag in pre_attached:
-                tgt, name = tag.split(":", 1)
+        except Exception:
+            pass
+        for tag in pre_attached:
+            tgt, name = tag.split(":", 1)
+            try:
                 d = _find_adapter_dir(name)
                 if d:
                     engine.attach_lora(d, target=tgt)
                     mod = (getattr(engine.tts, "gpt", None) if tgt == "gpt"
                            else engine.tts.s2mel.models.get("cfm"))
                     if mod is not None:
-                        GD.set_adapter_scale(mod, 1.0)
+                        GD.set_adapter_scale(mod,
+                                             float(pre_scales.get(tgt, 1.0)))
                 else:
                     out["warnings"].append(
                         f"无法还原评测前挂着的 adapter `{tag}`："
                         "目录找不到了，请到「训练」页重新挂载")
-        except Exception:
-            pass
+            except Exception as e:
+                out["warnings"].append(
+                    f"还原 adapter `{tag}` 失败：{type(e).__name__}: {e}")
         sc.unload()
     return out
 

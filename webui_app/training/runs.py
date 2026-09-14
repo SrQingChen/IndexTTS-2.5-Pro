@@ -28,6 +28,7 @@ import json
 import os
 import re
 import shutil
+import threading
 import time
 from dataclasses import asdict, dataclass
 from typing import Any, Dict, List, Optional
@@ -35,6 +36,11 @@ from typing import Any, Dict, List, Optional
 from webui_app.training import guard as GD
 
 ROOT = GD.TRAINING_ROOT
+
+# update_run 是「读-改-写」，训练线程（epoch 末回写状态）与 UI 线程
+# （激活 checkpoint）可能同时进來；不加锁会互相丢字段，极端情况下
+# 两个线程共用同一个 run.json.tmp 还会写出损坏的 JSON。
+_RUN_LOCK = threading.RLock()
 
 RUN_FILE = "run.json"
 ADAPTER_DIR = GD.ADAPTER_SUBDIR          # "adapter"
@@ -161,11 +167,19 @@ def update_run(name: str, **kw) -> Dict[str, Any]:
     频率高的字段（history）由训练器自己攒在内存里，结束时一次性写；
     这里只负责低频的状态字段，避免每步都重写整个文件。
     """
-    d = read_run(name)
-    d.update(kw)
-    d["updated_at"] = time.time()
-    write_run(name, d)
-    return d
+    with _RUN_LOCK:
+        d = read_run(name)
+        d.update(kw)
+        d["updated_at"] = time.time()
+        write_run(name, d)
+        return d
+
+
+def list_checkpoints(name: str) -> List[GD.CkptInfo]:
+    """列出某个 run 保险库里的档位。**不创建目录** —— UI 下拉框刷新
+    会频繁调它，用 vault() 会在每个 run 名下留一个空 checkpoints/。"""
+    v = GD.CheckpointVault(checkpoints_dir(name), mode="min")
+    return v.list()
 
 
 def append_log(name: str, line: str) -> None:

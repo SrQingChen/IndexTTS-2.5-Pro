@@ -341,6 +341,17 @@ def make_pair(prompt: Dict[str, Any], target: Dict[str, Any],
         return None
     if int(p["mel"].shape[1]) < int(opt.min_prompt_frames):
         return None
+    # 总长预算（Tp+Tt ≤ max_total_frames）同样按「截 target」处理：
+    # prompt 已可截到 1292、target 到 1600，两者相加 2892 默认就超 2200 ——
+    # 若在这里返回 None，长 prompt 配长句的样本会被**静默整对丢掉**，
+    # 与 preflight「截断而不是丢弃」的承诺矛盾，步数预估也会虚高。
+    total = int(opt.max_total_frames)
+    if total > 0:
+        budget = total - int(p["mel"].shape[1])
+        if budget < int(opt.min_target_frames):
+            return None          # prompt 独吞了预算，这条对确实拼不出来
+        if Tt > budget:
+            t = truncate_target(t, budget)
     return FT.build_cfm_pair(p, t, max_frames=int(opt.max_total_frames))
 
 
@@ -753,11 +764,21 @@ class CfmTrainer(TB.BaseTrainer):
                      if int((tgt.meta.get(u) or {}).get("mel_len") or 0)
                      > int(opt.max_target_frames or 0) > 0)
         if n_long and opt.truncate_target:
-            _add(GD.Notice("info",
-                           f"{n_long} 条样本超过 max_target_frames="
-                           f"{opt.max_target_frames}，会被**截断**到该长度"
-                           "（不是丢弃）。想保留完整长句就调大这个上限，"
-                           "代价是显存按平方涨。"))
+            _add(GD.Notice(
+                "info",
+                f"{n_long} 条样本超过 max_target_frames="
+                f"{opt.max_target_frames}，会被**截断**到该长度"
+                "（不是丢弃）。想保留完整长句就调大这个上限，"
+                "代价是显存按平方涨。"))
+        if int(opt.max_total_frames or 0) < (
+                int(opt.max_prompt_frames) + int(opt.max_target_frames)):
+            _add(GD.Notice(
+                "info",
+                f"max_total_frames={opt.max_total_frames} 小于 "
+                f"prompt 上限与 target 上限之和"
+                f"（{opt.max_prompt_frames}+{opt.max_target_frames}）："
+                "两侧都顶格时 target 会被再截到剩余预算"
+                "（截断，不是丢弃）。"))
 
         # val 池：与训练池同一套下限，但配对要单独定死（见 __init__ 的说明）
         vp = CfmSamplePool(self.dataset, self.val_ids, kind="target")
