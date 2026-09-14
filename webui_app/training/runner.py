@@ -26,6 +26,7 @@ __all__ = ["TrainRunner", "get_runner"]
 JOB_LABELS = {
     "train": "训练", "pairs": "偏好对构造", "eval": "A/B 评测",
     "merge": "合并", "distill": "底座蒸馏", "extract": "特征提取",
+    "oneclick": "一键三连",
 }
 
 
@@ -57,6 +58,25 @@ class TrainRunner:
     @property
     def engine_req(self) -> str:
         """running 时的任务对引擎的要求：loaded / unloaded / none。"""
+        return self._engine_req
+
+    def set_engine_req(self, req: str) -> str:
+        """任务运行中**动态**改自己对引擎的要求。
+
+        给「一键三连」这类横跨多种引擎状态的长流水线用：它在特征提取阶段
+        需要引擎常驻（要求 "loaded"），训练阶段必须独占显存（要求
+        "unloaded"）。提交时只能填 "none"（否则 load/unload 会被自己的
+        要求挡死），于是训练那几十分钟里 engine.load() 就不再受保护 ——
+        用户在别处一点加载，WDDM 下显存互踩、静默降速 20~30 倍且不报错。
+
+        这个方法是那个缺口的补丁：流水线在每个阶段边界把要求切换成当前
+        真实需要，双向互斥因此全程有效。
+
+        只接受 loaded / unloaded / none；其它值忽略（返回当前值）。
+        """
+        if req not in ("loaded", "unloaded", "none"):
+            return self._engine_req
+        self._engine_req = req
         return self._engine_req
 
     # ------------------------------------------------------------------

@@ -1,0 +1,282 @@
+{
+  "time": "2026-09-14 22:16:18",
+  "passed": 61,
+  "failed": 0,
+  "failures": [],
+  "seconds": 415.7,
+  "workflow_seconds": 225.0,
+  "dataset": "accept_oneclick_0914-2209",
+  "inputs": {
+    "added": 11,
+    "sliced": 1,
+    "pieces": 15,
+    "skipped": [],
+    "failed": []
+  },
+  "data": {
+    "total": 26,
+    "dropped": {
+      "状态": 1
+    },
+    "ready_before": 25,
+    "ready_after": 25,
+    "by_status": {
+      "ready": 25,
+      "over_hard_limit": 1
+    },
+    "dropped_total": 1,
+    "minutes": 3.08,
+    "split": {
+      "train": 21,
+      "val": 4
+    }
+  },
+  "candidates": [
+    {
+      "arch": "gpt",
+      "preset": "conservative",
+      "rank": 4,
+      "alpha": 8,
+      "lr": 5e-05,
+      "epochs": 2,
+      "target_preset": "attn",
+      "warnings": [
+        "可用样本 25 条（约 12 个 step）。属于极小数据集，请用「保守」档并把 replay_ratio 提到 0.5 以上。"
+      ],
+      "total_steps": 12,
+      "n_train": 21,
+      "n_val": 4,
+      "est_vram_gb": 2.73,
+      "eval_every": 3,
+      "chosen": true
+    },
+    {
+      "arch": "cfm",
+      "preset": "conservative",
+      "rank": 4,
+      "alpha": 8,
+      "lr": 5e-05,
+      "epochs": 2,
+      "target_preset": "attn",
+      "warnings": [
+        "可用样本 25 条（约 6 个 step）。属于极小数据集，请用「保守」档并把 replay_ratio 提到 0.5 以上。"
+      ],
+      "total_steps": 6,
+      "n_train": 21,
+      "n_val": 4,
+      "est_vram_gb": 1.34,
+      "eval_every": 1,
+      "chosen": true
+    }
+  ],
+  "chosen": {
+    "gpt": {
+      "preset": "conservative",
+      "rank": 4,
+      "alpha": 8,
+      "lr": 5e-05,
+      "epochs": 2,
+      "eval_every": 3,
+      "keep_checkpoints": 3,
+      "target_preset": "attn",
+      "total_steps": 12,
+      "est_vram_gb": 2.73
+    },
+    "cfm": {
+      "preset": "conservative",
+      "rank": 4,
+      "alpha": 8,
+      "lr": 5e-05,
+      "epochs": 2,
+      "eval_every": 1,
+      "keep_checkpoints": 3,
+      "target_preset": "attn",
+      "total_steps": 6,
+      "est_vram_gb": 1.34
+    }
+  },
+  "training": [
+    {
+      "arch": "gpt",
+      "run": "accept_oneclick_0914-2209_gpt",
+      "preset": "conservative",
+      "ok": true,
+      "steps": 12,
+      "epochs": 2,
+      "first_val": 4.2876,
+      "best_val": 4.2804,
+      "improved": 0.0017,
+      "stopped_early": false,
+      "stop_reason": "",
+      "vram_peak_gb": 1.95,
+      "n_checkpoints": 3,
+      "checkpoints": [
+        {
+          "name": "ckpt-e001-s000009",
+          "metric": 4.281541142399951,
+          "epoch": 1,
+          "step": 9
+        },
+        {
+          "name": "ckpt-e001-s000012",
+          "metric": 4.28036388302197,
+          "epoch": 1,
+          "step": 12
+        },
+        {
+          "name": "ckpt-e002-s000012",
+          "metric": 4.28036388302197,
+          "epoch": 2,
+          "step": 12
+        }
+      ],
+      "seconds": 6.8,
+      "error": ""
+    },
+    {
+      "arch": "cfm",
+      "run": "accept_oneclick_0914-2209_cfm",
+      "preset": "conservative",
+      "ok": true,
+      "steps": 6,
+      "epochs": 2,
+      "first_val": 0.5521,
+      "best_val": 0.5505,
+      "improved": 0.0028,
+      "stopped_early": false,
+      "stop_reason": "",
+      "vram_peak_gb": 1.67,
+      "n_checkpoints": 3,
+      "checkpoints": [
+        {
+          "name": "ckpt-e001-s000004",
+          "metric": 0.5506237572812019,
+          "epoch": 1,
+          "step": 4
+        },
+        {
+          "name": "ckpt-e001-s000005",
+          "metric": 0.5505013410503983,
+          "epoch": 1,
+          "step": 5
+        },
+        {
+          "name": "ckpt-e002-s000006",
+          "metric": 0.5504486449432712,
+          "epoch": 2,
+          "step": 6
+        }
+      ],
+      "seconds": 8.5,
+      "error": ""
+    }
+  ],
+  "ranking": [
+    {
+      "run": "accept_oneclick_0914-2209_gpt",
+      "checkpoint": "ckpt-e001-s000012",
+      "arch": "gpt",
+      "val": 4.2804,
+      "reward": 0.9604,
+      "wer": 0.0333,
+      "sim": 0.9511,
+      "n": 3,
+      "out_dir": "E:\\AI\\indextts2.5\\index-tts-2.5.0\\outputs\\oneclick\\20260914-221431_rank_accept_oneclick_0914-2209_gpt_ckpt-e001-s000012",
+      "ok": true,
+      "error": "",
+      "place": 1,
+      "activated": true
+    },
+    {
+      "run": "accept_oneclick_0914-2209_gpt",
+      "checkpoint": "ckpt-e002-s000012",
+      "arch": "gpt",
+      "val": 4.2804,
+      "reward": 0.9604,
+      "wer": 0.0333,
+      "sim": 0.9511,
+      "n": 3,
+      "out_dir": "E:\\AI\\indextts2.5\\index-tts-2.5.0\\outputs\\oneclick\\20260914-221450_rank_accept_oneclick_0914-2209_gpt_ckpt-e002-s000012",
+      "ok": true,
+      "error": "",
+      "place": 2
+    },
+    {
+      "run": "accept_oneclick_0914-2209_gpt",
+      "checkpoint": "ckpt-e001-s000009",
+      "arch": "gpt",
+      "val": 4.2815,
+      "reward": 0.9516,
+      "wer": 0.05,
+      "sim": 0.954,
+      "n": 3,
+      "out_dir": "E:\\AI\\indextts2.5\\index-tts-2.5.0\\outputs\\oneclick\\20260914-221508_rank_accept_oneclick_0914-2209_gpt_ckpt-e001-s000009",
+      "ok": true,
+      "error": "",
+      "place": 3
+    },
+    {
+      "run": "accept_oneclick_0914-2209_cfm",
+      "checkpoint": "ckpt-e002-s000006",
+      "arch": "cfm",
+      "val": 0.5504,
+      "reward": 0.9484,
+      "wer": 0.05,
+      "sim": 0.946,
+      "n": 3,
+      "out_dir": "E:\\AI\\indextts2.5\\index-tts-2.5.0\\outputs\\oneclick\\20260914-221526_rank_accept_oneclick_0914-2209_cfm_ckpt-e002-s000006",
+      "ok": true,
+      "error": "",
+      "place": 4
+    },
+    {
+      "run": "accept_oneclick_0914-2209_cfm",
+      "checkpoint": "ckpt-e001-s000004",
+      "arch": "cfm",
+      "val": 0.5506,
+      "reward": 0.9484,
+      "wer": 0.05,
+      "sim": 0.946,
+      "n": 3,
+      "out_dir": "E:\\AI\\indextts2.5\\index-tts-2.5.0\\outputs\\oneclick\\20260914-221557_rank_accept_oneclick_0914-2209_cfm_ckpt-e001-s000004",
+      "ok": true,
+      "error": "",
+      "place": 5
+    },
+    {
+      "run": "accept_oneclick_0914-2209_cfm",
+      "checkpoint": "ckpt-e001-s000005",
+      "arch": "cfm",
+      "val": 0.5505,
+      "reward": 0.9483,
+      "wer": 0.05,
+      "sim": 0.9457,
+      "n": 3,
+      "out_dir": "E:\\AI\\indextts2.5\\index-tts-2.5.0\\outputs\\oneclick\\20260914-221542_rank_accept_oneclick_0914-2209_cfm_ckpt-e001-s000005",
+      "ok": true,
+      "error": "",
+      "place": 6
+    }
+  ],
+  "best": {
+    "run": "accept_oneclick_0914-2209_gpt",
+    "checkpoint": "ckpt-e001-s000012",
+    "arch": "gpt",
+    "val": 4.2804,
+    "reward": 0.9604,
+    "wer": 0.0333,
+    "sim": 0.9511,
+    "n": 3,
+    "out_dir": "E:\\AI\\indextts2.5\\index-tts-2.5.0\\outputs\\oneclick\\20260914-221431_rank_accept_oneclick_0914-2209_gpt_ckpt-e001-s000012",
+    "ok": true,
+    "error": "",
+    "place": 1,
+    "activated": true
+  },
+  "observed_engine_reqs": [
+    "loaded",
+    "none",
+    "unloaded"
+  ],
+  "out_dir": "E:\\AI\\indextts2.5\\index-tts-2.5.0\\outputs\\oneclick\\20260914-221613"
+}

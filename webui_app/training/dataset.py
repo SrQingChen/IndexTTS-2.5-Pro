@@ -29,7 +29,7 @@ import shutil
 import threading
 import time
 from dataclasses import asdict, dataclass, field
-from typing import Any, Callable, Dict, List, Optional, Sequence
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from webui_app.config import PROJECT_ROOT
 
@@ -508,16 +508,26 @@ def import_audio(name: str, paths: Sequence[str], copy: bool = True,
 # ---------------------------------------------------------------------------
 
 def split_long(name: str, uid: str, target_sec: float = 12.0,
-               min_sec: float = 4.0, max_pieces: int = 12) -> Dict[str, Any]:
+               min_sec: float = 4.0, max_pieces: int = 12,
+               text: str = "") -> Dict[str, Any]:
     """把一条过长的样本切成多条。
 
     复用「参考音频工作台」的 find_segments —— 它按语音占比/信噪比/削波/响度
     打分，并优先让切分点落在停顿处，比等长硬切好得多。
+
+    切分产物本身无法继承文本（各片说的不是同一句话），所以 `text` 默认留空：
+    由调用方补（「一键三连」的做法是先切片再**逐片转写**，见
+    training/oneclick.py 的对齐说明），或用户在数据集页手填。
+
+    并发：切片是慢 IO（每个片段都要解码+重采样+写文件），所以**文件写出放在
+    锁外**，只在最后入册时加锁重读 meta —— 否则用户在 UI 里补文本会被
+    这里最后那次 save 用旧快照覆盖掉（import_audio 用的是同一套 staged 模式）。
     """
     from webui_app.services import audio_lab as AL
 
     d = dir_of(name)
-    items = load_meta(name)
+    with _META_LOCK:
+        items = load_meta(name)
     src_u = next((u for u in items if u.id == uid), None)
     if src_u is None:
         return {"ok": False, "error": f"样本 {uid} 不存在"}
@@ -541,29 +551,52 @@ def split_long(name: str, uid: str, target_sec: float = 12.0,
         if len(picked) >= max_pieces:
             break
 
-    audio_dir = os.path.join(d, AUDIO_SUBDIR)
+    # ---- 锁外：切片文件写盘（慢）----
     gen = _next_id(items)
-    created = []
+    staged: List[Tuple[str, str, int, Any]] = []     # (uid, rel, 片号, seg)
+    fails: List[str] = []
     for k, s in enumerate(picked):
         new_id = gen()
         out_rel = os.path.join(AUDIO_SUBDIR, f"{new_id}.wav")
         try:
             AL.extract_segment(ap, s, os.path.join(d, out_rel))
         except Exception as e:
+            fails.append(f"片段 {k + 1}: {type(e).__name__}: {e}")
             continue
-        nu = Utterance(
-            id=new_id, audio=out_rel, lang=src_u.lang,
-            note=f"由 {uid} 切分而来（片段 {k+1}/{len(picked)}，"
-                 f"{s.start:.2f}~{s.end:.2f}s，评分 {s.score:.0f}）",
-        )
-        evaluate(nu, d, require_features=False)
-        items.append(nu)
-        created.append(new_id)
+        staged.append((new_id, out_rel, k, s))
 
-    save_meta(name, items)
-    return {"ok": True, "created": len(created), "ids": created,
-            "segments": [(round(s.start, 2), round(s.end, 2), round(s.score, 1))
-                         for s in picked]}
+    # ---- 锁内：重读 meta 再入册，避免覆盖并发写入 ----
+    created: List[str] = []
+    if staged:
+        with _META_LOCK:
+            items = load_meta(name)
+            have = {u.id for u in items}
+            for new_id, out_rel, k, s in staged:
+                if new_id in have:                  # 并发导入撞号，重发一个
+                    old_abs = os.path.join(d, out_rel)
+                    new_id = _next_id(items)()
+                    out_rel = os.path.join(AUDIO_SUBDIR, f"{new_id}.wav")
+                    try:
+                        os.replace(old_abs, os.path.join(d, out_rel))
+                    except OSError:
+                        pass
+                nu = Utterance(
+                    id=new_id, audio=out_rel, lang=src_u.lang, text=text,
+                    note=f"由 {uid} 切分而来（片段 {k + 1}/{len(picked)}，"
+                         f"{s.start:.2f}~{s.end:.2f}s，评分 {s.score:.0f}）",
+                )
+                evaluate(nu, d, require_features=False)
+                items.append(nu)
+                created.append(new_id)
+            save_meta(name, items)
+
+    out: Dict[str, Any] = {"ok": True, "created": len(created), "ids": created,
+                           "segments": [(round(s.start, 2), round(s.end, 2),
+                                         round(s.score, 1))
+                                        for s in picked]}
+    if fails:
+        out["failed"] = fails
+    return out
 
 
 # ---------------------------------------------------------------------------

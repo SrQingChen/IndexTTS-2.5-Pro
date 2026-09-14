@@ -40,6 +40,8 @@ TAB_SPECS: List[Tuple[str, str, str, str]] = [
     ("lab",    "🔬 音频工作台", "webui_app.tabs.audio_lab",  "体检 · 智能切片 · 降噪归一 · 音色库"),
     ("batch",  "📦 批量",       "webui_app.tabs.batch",      "多行文本 / JSONL · 进度 · 打包"),
     ("preset", "💾 预设",       "webui_app.tabs.presets",    "参数快照 · 与官方 webui.py 互通"),
+    ("oneclick", "🚀 一键三连", "webui_app.tabs.oneclick_tab",
+     "丢音频进来 · 切片识别调参训练择优 · 全自动"),
     ("data",   "🗂 数据集",     "webui_app.tabs.dataset_tab", "建集 · 导入 · 文本 · 划分 · 特征提取"),
     ("train",  "🎓 训练",       "webui_app.tabs.train_tab",  "GPT/CFM/DPO · 预检 · 保险库 · 记录"),
     ("align",  "⚖️ 对齐",       "webui_app.tabs.align_tab",  "DPO 偏好对构造 · 浏览 · 划分"),

@@ -25,6 +25,84 @@ from webui_app.services import inference as INF
 from webui_app.services import pronunciation as PR
 from webui_app.services import voice_bank
 from webui_app.services.engine import EngineError
+from webui_app.training import guard as GD
+from webui_app.training import merge as MG
+from webui_app.training import runs as RN
+
+# ---------------------------------------------------------------------------
+# LoRA 挂载区的辅助函数（模块级：不依赖 ctx，便于单独测试）
+# ---------------------------------------------------------------------------
+
+LORA_NONE = "（不使用 LoRA）"
+
+
+def _lora_run_choices() -> List[Any]:
+    """带 adapter 的训练记录 → [(显示文本, run 名)]。
+
+    只列出 `has_adapter` 的 run —— 训练失败的记录挂在引擎上只会报错，
+    不该出现在推理页里让人误选。
+    """
+    out: List[Any] = [(LORA_NONE, "")]
+    try:
+        for r in RN.list_runs():
+            if not getattr(r, "has_adapter", False):
+                continue
+            bv = (f"val {r.best_val:.4f}"
+                  if getattr(r, "best_val", None) is not None else "val —")
+            out.append((f"{r.name} · {r.arch} · {bv}", r.name))
+    except Exception:
+        pass
+    return out
+
+
+def _lora_ckpt_choices(run: str) -> List[str]:
+    """某个 run 可选的档位。用 list_checkpoints（不创建目录）。
+
+    `best` 指的是 `<run>/adapter` —— 训练器每次改善都会把最好的一档同步
+    过去，所以它就是「该 run 表现最好的权重」；保险库里的具名档位也一并
+    列出（一键三连正是靠它们做择优的）。
+    """
+    if not run:
+        return ["best"]
+    out = ["best"]
+    try:
+        out.extend(c.name for c in RN.list_checkpoints(run))
+    except Exception:
+        pass
+    try:
+        if os.path.isdir(os.path.join(RN.run_dir(run), "final")):
+            out.append("final")
+    except Exception:
+        pass
+    seen: List[str] = []
+    for x in out:
+        if x not in seen:
+            seen.append(x)
+    return seen
+
+
+def _lora_state_html(eng) -> str:
+    """当前引擎上挂着什么、强度多少。"""
+    tags = list(getattr(getattr(eng, "stats", None), "lora_adapters", []) or [])
+    if not tags:
+        return T.hint("当前引擎上是 <b>纯底座</b>（未挂载 LoRA）。"
+                      "选一个训练记录后点「🧬 挂载到引擎」。")
+    rows = []
+    for tag in tags:
+        tgt = str(tag).split(":", 1)[0]
+        mean = None
+        try:
+            mod = (getattr(eng.tts, "gpt", None) if tgt == "gpt"
+                   else eng.tts.s2mel.models.get("cfm"))
+            if mod is not None:
+                mean = float(GD.get_adapter_scale(mod).get("_mean", 1.0))
+        except Exception:
+            pass
+        rows.append(f"<code>{tag}</code>"
+                    + (f" · 强度 {mean:.2f}" if mean is not None else ""))
+    return T.tip("🧬 <b>已挂载</b>：" + " ｜ ".join(rows)
+                 + "<br><sub>强度 0 = 纯底座，1 = 完整 LoRA，"
+                   "0.6~0.8 是「像」与「稳」的常见折中。</sub>")
 
 EXAMPLE_TEXTS = [
     ("中文 · 日常", "大家好，欢迎使用 IndexTTS 二点五，这是一段用于测试的中文语音。", "ZH"),
@@ -130,6 +208,35 @@ def render(ctx: AppContext):
                     voice_detail_btn = gr.Button("查看该音色体检报告", size="sm", scale=1)
                     to_lab_btn = gr.Button("→ 送去工作台优化", size="sm", scale=1)
                 voice_info = gr.HTML("")
+
+            # ---------- LoRA 音色模型（自训练产物） ----------
+            with gr.Column(elem_classes=["ix-section"]):
+                gr.HTML(T.section(
+                    "LoRA 音色模型", "🧬",
+                    "挂载自训练出来的 adapter。下拉框直接读 "
+                    "<code>training_runs/</code> 里的训练记录 —— "
+                    "「🚀 一键三连」或「🎓 训练」跑完的模型会自动出现在这里。"
+                    "挂上之后照常点「生成」即可，参数不必改。"))
+                with gr.Row():
+                    lora_run_dd = gr.Dropdown(
+                        choices=_lora_run_choices(), value="",
+                        label="训练记录（run）", scale=3,
+                        allow_custom_value=False,
+                        info="只列出已经产出 adapter 的记录")
+                    lora_reload_btn = gr.Button("↻", scale=0,
+                                                variant="secondary", size="sm")
+                with gr.Row():
+                    lora_ckpt_dd = gr.Dropdown(
+                        choices=["best"], value="best", label="档位", scale=1,
+                        info="best = 该 run 表现最好的一档；"
+                             "具名档位来自 checkpoints 保险库")
+                    lora_scale_sl = gr.Slider(
+                        0.0, 1.5, value=1.0, step=0.05, label="强度", scale=2,
+                        info="推理期实时生效，不用重训")
+                with gr.Row():
+                    lora_mount_btn = gr.Button("🧬 挂载到引擎", size="sm", scale=1)
+                    lora_unmount_btn = gr.Button("卸载 LoRA", size="sm", scale=1)
+                lora_state_html = gr.HTML(_lora_state_html(eng))
 
             # ---------- 文本 ----------
             with gr.Column(elem_classes=["ix-section"]):
@@ -324,6 +431,9 @@ def render(ctx: AppContext):
         v0, v1, v2, v3, v4, v5, v6, v7, emo_text, emo_rand,
         do_sample, top_p, top_k, temperature, num_beams,
         rep_pen, len_pen, max_mel,
+        # 末尾 3 个不是合成参数，而是「挂哪个 LoRA」—— 它们必须排在
+        # _collect 的 keys 之后，由 on_generate 单独解包（见下）。
+        lora_run_dd, lora_ckpt_dd, lora_scale_sl,
     ]
 
     def _collect(*vals) -> Dict[str, Any]:
@@ -339,8 +449,29 @@ def render(ctx: AppContext):
         ]
         return dict(zip(keys, vals))
 
+    def _sync_lora(run: str, ckpt: str, scale: float) -> str:
+        """保证「下拉框选的」与「引擎上挂的」一致。返回一行提示（或空串）。
+
+        只在选择变化时才真的重挂：每次生成都重挂要重读一遍 adapter 文件，
+        没必要。换 run / 换档位 / 改强度都会触发。
+        """
+        if not run:
+            return ""
+        want = (run, ckpt or "best", round(float(scale), 2))
+        if ctx.shared.get("lora_want") == want and getattr(eng, "loaded", False):
+            return ""
+        try:
+            if not eng.loaded:
+                eng.load()
+            tag = MG.mount_run(eng, run, checkpoint=want[1], scale=want[2])
+        except Exception as e:
+            return f"<br>⚠️ LoRA 挂载失败：{type(e).__name__}: {e}"
+        ctx.shared["lora_want"] = want
+        return f"<br>🧬 已自动挂载 <code>{tag}</code>（强度 {want[2]}）"
+
     def on_generate(*vals, progress=gr.Progress(track_tqdm=False)):
-        raw = _collect(*vals)
+        *core, lora_run, lora_ckpt, lora_scale = vals
+        raw = _collect(*core)
         raw["emo_control_method"] = W.emo_mode_index(raw["emo_control_method"])
         # 记下本次参数快照，供「预设管理」页的「保存当前参数」使用
         ctx.shared["last_gen_values"] = dict(raw)
@@ -355,19 +486,24 @@ def render(ctx: AppContext):
                 gr.Error(str(e))
                 return (gr.update(),
                         T.err(f"<b>加载失败</b>：{e}"),
-                        ctx.status_html())
+                        ctx.status_html(),
+                        _lora_state_html(eng))
+
+        # 选的 LoRA 与挂的不一致就先挂上，再合成
+        lora_note = _sync_lora(lora_run, lora_ckpt, lora_scale)
 
         try:
             progress(0.05, desc="准备中…")
             res = INF.generate(eng, req, progress=progress)
         except EngineError as e:
             gr.Error(str(e))
-            return gr.update(), T.err(f"<b>合成失败</b>：{e}"), ctx.status_html()
+            return (gr.update(), T.err(f"<b>合成失败</b>：{e}"),
+                    ctx.status_html(), _lora_state_html(eng))
         except Exception as e:
             gr.Error(f"{type(e).__name__}: {e}")
             return (gr.update(),
                     T.err(f"<b>合成失败</b>：{type(e).__name__}: {e}"),
-                    ctx.status_html())
+                    ctx.status_html(), _lora_state_html(eng))
 
         kw = res["kwargs"]
         rtf = res.get("rtf")
@@ -389,7 +525,7 @@ def render(ctx: AppContext):
         info = "\n".join([
             '<div class="ix-tip">✅ <b>合成完成</b></div>',
             "| 项 | 值 |", "|---|---|",
-        ] + [f"| {a} | {b} |" for a, b in rows])
+        ] + [f"| {a} | {b} |" for a, b in rows]) + lora_note
 
         if getattr(eng.tts, "low_vram", False) and len(req.text or "") > 40:
             info += T.warn(
@@ -397,12 +533,89 @@ def render(ctx: AppContext):
                 "逐块独立合成后拼接。块与块之间韵律不接续是正常现象，不是 bug。"
                 "缓解办法见「参数手册 → 显存策略 → 低显存自动分块」。")
 
-        return res["path"], info, ctx.status_html()
+        return res["path"], info, ctx.status_html(), _lora_state_html(eng)
 
     gen_btn.click(
         on_generate, inputs=all_inputs,
-        outputs=[out_audio, out_info, sb],
+        outputs=[out_audio, out_info, sb, lora_state_html],
     )
+
+    # ---------- LoRA 选择与挂载 ----------
+
+    def on_lora_run(run):
+        """换 run 时刷新档位列表。"""
+        cks = _lora_ckpt_choices(run)
+        return gr.update(choices=cks, value=cks[0])
+
+    lora_run_dd.change(on_lora_run, inputs=[lora_run_dd],
+                       outputs=[lora_ckpt_dd])
+
+    def on_lora_mount(run, ckpt, scale):
+        if not run:
+            return T.hint("先在上面的下拉框里选一个训练记录。")
+        if not eng.loaded:
+            gr.Info("引擎未加载，正在自动加载…")
+            try:
+                eng.load()
+            except Exception as e:
+                return T.err(f"引擎加载失败：{type(e).__name__}: {e}")
+        try:
+            tag = MG.mount_run(eng, run, checkpoint=(ckpt or "best"),
+                               scale=float(scale))
+        except FileNotFoundError as e:
+            return T.err(f"找不到 adapter：{e}")
+        except Exception as e:
+            return T.err(f"挂载失败：{type(e).__name__}: {e}")
+        ctx.shared["lora_want"] = (run, ckpt or "best", round(float(scale), 2))
+        gr.Info(f"已挂载 {tag}")
+        return _lora_state_html(eng)
+
+    lora_mount_btn.click(on_lora_mount,
+                         inputs=[lora_run_dd, lora_ckpt_dd, lora_scale_sl],
+                         outputs=[lora_state_html])
+
+    def on_lora_unmount():
+        tags = list(getattr(eng.stats, "lora_adapters", []) or [])
+        if not tags:
+            return _lora_state_html(eng)
+        for tag in tags:
+            try:
+                eng.detach_lora(target=str(tag).split(":", 1)[0])
+            except Exception as e:
+                return T.err(f"卸载 {tag} 失败：{type(e).__name__}: {e}")
+        ctx.shared["lora_want"] = None
+        gr.Info("已卸载 LoRA，回到纯底座")
+        return _lora_state_html(eng)
+
+    lora_unmount_btn.click(on_lora_unmount, inputs=[],
+                           outputs=[lora_state_html])
+
+    def on_lora_refresh():
+        return (gr.update(choices=_lora_run_choices()),
+                _lora_state_html(eng))
+
+    lora_reload_btn.click(on_lora_refresh, inputs=[],
+                          outputs=[lora_run_dd, lora_state_html])
+
+    def on_lora_scale(scale, run, ckpt):
+        """拖动强度旋钮即时生效（已挂载时不用重新挂）。"""
+        if not run:
+            return gr.update()
+        tags = list(getattr(eng.stats, "lora_adapters", []) or [])
+        if not tags:
+            return gr.update()
+        try:
+            for tag in tags:
+                MG.set_scale(eng, float(scale),
+                             target=str(tag).split(":", 1)[0])
+        except Exception:
+            return gr.update()
+        ctx.shared["lora_want"] = (run, ckpt or "best", round(float(scale), 2))
+        return _lora_state_html(eng)
+
+    lora_scale_sl.release(on_lora_scale,
+                          inputs=[lora_scale_sl, lora_run_dd, lora_ckpt_dd],
+                          outputs=[lora_state_html])
 
     # ---------- 情感模式联动 ----------
     MODE_HINTS = [
@@ -728,7 +941,7 @@ def render(ctx: AppContext):
             gr.Error(str(e))
         except Exception as e:
             gr.Error(f"{type(e).__name__}: {e}")
-        return engine_html(), ctx.status_html()
+        return engine_html(), ctx.status_html(), _lora_state_html(eng)
 
     def on_unload():
         try:
@@ -737,10 +950,15 @@ def render(ctx: AppContext):
             gr.Error(str(e))
         else:
             gr.Info("模型已卸载，显存已归还")
-        return engine_html(), ctx.status_html()
+        # 卸载会清空 stats.lora_adapters（引擎上的 LoRA 随之消失），
+        # 所以「想挂的那个」的标记也要一起失效，否则下次生成会以为还挂着。
+        ctx.shared["lora_want"] = None
+        return engine_html(), ctx.status_html(), _lora_state_html(eng)
 
-    load_btn.click(on_load, inputs=[], outputs=[engine_state, sb])
-    unload_btn.click(on_unload, inputs=[], outputs=[engine_state, sb])
+    load_btn.click(on_load, inputs=[],
+                   outputs=[engine_state, sb, lora_state_html])
+    unload_btn.click(on_unload, inputs=[],
+                     outputs=[engine_state, sb, lora_state_html])
 
     def on_clear_ref_cache():
         if not eng.loaded:
@@ -781,7 +999,9 @@ def render(ctx: AppContext):
     # 而是把回调与输出列表交给 app.py 统一绑定。
     def on_page_load():
         return (engine_html(), ctx.status_html(),
-                gr.update(choices=[""] + voice_bank.names()))
+                gr.update(choices=[""] + voice_bank.names()),
+                gr.update(choices=_lora_run_choices()),
+                _lora_state_html(eng))
 
     # 登记「预设可写入的控件」有序列表，供「预设管理」Tab 的
     # 「应用到合成页」按钮使用。顺序必须与 presets.on_apply 返回的
@@ -802,7 +1022,8 @@ def render(ctx: AppContext):
     # 合成页把最近一次生成的参数快照存起来，供预设页「保存当前参数」使用。
     # Gradio 服务端无法主动读控件值，所以在 on_generate 里顺带写入。
     return {
-        "page_load": (on_page_load, [engine_state, sb, voice_dd]),
+        "page_load": (on_page_load,
+                      [engine_state, sb, voice_dd, lora_run_dd, lora_state_html]),
         "components": {
             "prompt_audio": prompt_audio,
             "text": text_in,
@@ -811,5 +1032,7 @@ def render(ctx: AppContext):
             "emo_audio": emo_audio,
             "out_audio": out_audio,
             "engine_state": engine_state,
+            "lora_run": lora_run_dd,
+            "lora_state": lora_state_html,
         },
     }

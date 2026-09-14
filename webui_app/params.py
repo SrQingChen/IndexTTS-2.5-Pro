@@ -61,6 +61,7 @@ GROUP_TITLES: Dict[str, str] = {
     "segment":  "分句与时长",
     "engine":   "引擎与精度",
     "memory":   "显存策略",
+    "oneclick": "一键三连（全自动）",
     "dataset":  "训练 · 数据集",
     "lora":     "训练 · LoRA",
     "optim":    "训练 · 优化器与调度",

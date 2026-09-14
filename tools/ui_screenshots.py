@@ -4,7 +4,7 @@
 任何新依赖 —— `websockets` 已经随 gradio 装好了，而无头截图只需要
 「开一个调试端口 → WebSocket 发两条命令」。
 
-为什么不用 Playwright：为了 11 张文档截图去装一个 150 MB 的浏览器运行时
+为什么不用 Playwright：为了 12 张文档截图去装一个 150 MB 的浏览器运行时
 不划算，而且 Chrome 本来就装在机器上。
 
 用法：
@@ -41,6 +41,9 @@ import urllib.request
 
 # 与 webui_app/app.py 的 TAB_SPECS 顺序一致；名字只用于文件名。
 # 标签文本用于在页面上定位要点击的按钮（模糊匹配，前缀 emoji 可省）。
+# 注：`oneclick` 排在 TABS 末尾（文件名 12_），但它在页面上的位置在「预设」
+# 之后 —— 编号不重排是为了不动已有 11 张截图的名字，避免 README 里一片链接
+# 集体失效。点击是按标签文本找的，与列表顺序无关。
 TABS = [
     ("syn", "01_synthesis", "合成"),
     ("lab", "02_audio_lab", "音频工作台"),
@@ -53,6 +56,7 @@ TABS = [
     ("model", "09_models", "模型"),
     ("sys", "10_system", "系统"),
     ("manual", "11_manual", "手册"),
+    ("oneclick", "12_oneclick", "一键三连"),
 ]
 
 CHROME_CANDIDATES = [
