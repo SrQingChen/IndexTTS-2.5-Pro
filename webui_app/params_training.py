@@ -164,11 +164,11 @@ MFA / CTC 对齐，上游只留了一段无人调用的死代码），所以这�
 
     reg(P(
         key="oc_whisper_size", group="oneclick", label="识别模型（whisper）",
-        kind="dropdown", default="small",
+        kind="dropdown", default="medium",
         choices=["tiny", "base", "small", "medium", "large-v3", "turbo"],
         summary="转写用的 whisper 尺寸，直接影响文本准确率与耗时。",
-        info="tiny 0.10 GB / base 0.20 / small 0.55 / medium 1.60 / "
-             "large-v3 3.20 / turbo 1.70（fp16 显存）",
+        info="默认 medium。tiny 0.10 GB / base 0.20 / small 0.55 / "
+             "medium 1.60 / large-v3 3.20 / turbo 1.70（fp16 显存）",
         affects="文本正确率 → 训练质量；以及识别耗时",
         detail_md="""
 转写准确率决定训练文本的质量，而训练文本错字多会直接教坏模型 ——
@@ -178,13 +178,51 @@ MFA / CTC 对齐，上游只留了一段无人调用的死代码），所以这�
 只加载 whisper + campplus（约 0.6 GB），所以识别阶段**不需要**加载大模型。
 """,
         tuning_md="""
-- 中文日常语音：small 够用，性价比最高。
-- 有专业术语/方言/多人对话：medium 或 large-v3，但注意显存与时间。
-- turbo：速度与 large 接近、质量接近 medium，是个折中选项。
+- **默认 medium**：它的产出直接成为训练文本，准确率决定模型学什么。
+  实测同一批合成语音，`small` 把「转眼间」写成「专业间」、把「西莲」写成「西蓮」，
+  换成 medium 后逐字正确（WER 从 0.033 降到 0.0）。
+- 显存紧张、只想先跑通流程 → 用 small（0.55 GB）。
+- 有专业术语/方言/多人对话 → large-v3（3.2 GB），但识别会明显变慢。
+- turbo：速度接近 large、质量接近 medium，是个折中。
+
+**打分用的是另一个旋钮**（`oc_score_whisper_size`），见那一条的说明。
 """,
         pitfall_md="""
 whisper ≥ medium 会触发一条 warn（显存提醒）。8 GB 卡上与其它阶段错峰跑没问题，
 但如果同时挂着引擎就会紧张 —— 流水线本身是分阶段串行的，不会撞。
+""",
+    ))
+
+    reg(P(
+        key="oc_score_whisper_size", group="oneclick",
+        label="打分模型（whisper，择优用）",
+        kind="dropdown", default="small",
+        choices=["tiny", "base", "small", "medium", "large-v3", "turbo"],
+        summary="择优时给候选打 reward 用的模型，**故意比识别小一档**。",
+        info="默认 small。改大它不会让识别更准（那是上一个旋钮的事），"
+             "只会让打分更慢、更吃显存。",
+        affects="择优打分的速度与显存占用；对名次影响很小",
+        detail_md="""
+**为什么和识别分开**：两者的需求并不对等。
+
+| | 识别（`oc_whisper_size`） | 打分（这一条） |
+|---|---|---|
+| 产出用途 | **直接成为训练文本**，决定模型学什么 | 只在**候选之间**做相对比较 |
+| 准确率要求 | 高 —— 错字会教坏模型 | 够用即可 —— 转写噪声是所有候选的共同项 |
+| 运行时显存 | 引擎**已卸载**，1.6 GB 放得下 | 引擎**必然驻留**，与它抢显存 |
+
+把打分也设成 medium 时，8 GB 卡上会出现
+`引擎 4.94 + medium 1.6 + campplus ≈ 7.85 / 8.19 GB`，
+只剩几百 MB —— 实测后果是 Windows 把扩散采样挤到共享内存，
+**s2mel 从 0.9 秒变成 25 秒**（WDDM 静默降速，不报 OOM），
+整轮验收从 6.9 分钟涨到 13.9 分钟。所以这里默认 small。
+
+若显存充裕（≥ 12 GB）想统一成 medium，改这一条即可；
+流水线在开跑前也会做显存余量体检，不够会直接给出提示。
+""",
+        pitfall_md="""
+改大它**不会**提高识别准确率 —— 那只由 `oc_whisper_size` 决定。
+这两条容易看串，label 里已经分别写明「识别」与「打分」。
 """,
     ))
 

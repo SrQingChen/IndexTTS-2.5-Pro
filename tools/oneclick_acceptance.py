@@ -39,6 +39,7 @@ from webui_app.services.engine import TTSEngine                # noqa: E402
 from webui_app.training import dataset as DS                   # noqa: E402
 from webui_app.training import features as FT                  # noqa: E402
 from webui_app.training import oneclick as OC                  # noqa: E402
+from webui_app.training import reward as RW                    # noqa: E402
 from webui_app.training import runs as RN                      # noqa: E402
 from webui_app.training.runner import get_runner               # noqa: E402
 
@@ -221,7 +222,8 @@ def main() -> int:
         denoise=True,
         denoise_strength=0.6,
         asr=True,
-        whisper_size="small",
+        # 故意不给 whisper_size：验收要用**默认值**跑，否则升到 medium
+        # 这类改动就永远测不到（默认值装的是用户实际拿到的那条路径）。
         min_score=0.0,          # 合成音频本身很干净，这里不靠分数筛
         max_text_repeats=3,
         val_ratio=0.15,
@@ -295,6 +297,28 @@ def main() -> int:
         check(f"阶段「{title}」存在且完成",
               bool(s) and s.get("status") == "done",
               f"{s.get('status') if s else '缺失'} · {s.get('detail', '') if s else ''}")
+
+    # ---- 识别阶段：默认模型 + 提示词 + 用完卸载 ----
+    asr_info = (stages.get("asr") or {}).get("info") or {}
+    check("识别用的是默认 whisper（medium，产出训练文本）",
+          str(asr_info.get("whisper")) == RW.DEFAULT_WHISPER,
+          f"实际 {asr_info.get('whisper')} / 默认 {RW.DEFAULT_WHISPER}")
+    check("打分的 whisper 比识别小一档（8 GB 卡上引擎与它同时驻留）",
+          OC.OneClickOptions().score_whisper_size == "small",
+          OC.OneClickOptions().score_whisper_size)
+    check("识别带了简体提示词（修繁体字）",
+          "普通话" in str(asr_info.get("prompt", "")),
+          str(asr_info.get("prompt")))
+    check("识别结束后 whisper 已卸载（不留驻显存）",
+          asr_info.get("loaded_after_unload") is False,
+          str(asr_info.get("loaded_after_unload")))
+    check("识别阶段报告了显存释放量",
+          asr_info.get("freed_gb") is not None,
+          f"before={asr_info.get('vram_before_gb')} "
+          f"after={asr_info.get('vram_after_gb')} "
+          f"freed={asr_info.get('freed_gb')}")
+    check("转写没有大量失败", int(asr_info.get("failed", 0)) == 0,
+          f"failed={asr_info.get('failed')} empty={asr_info.get('empty')}")
 
     inputs = report.get("inputs") or {}
     check("长音频被切片", int(inputs.get("sliced", 0)) >= 1,
@@ -434,6 +458,20 @@ def main() -> int:
     check("离线特征已提取（训练时不再碰大模型）",
           int(fstats.get("ready_with_features", 0)) >= OC.MIN_SAMPLES,
           f"with_features={fstats.get('with_features')}")
+
+    # ---- 择优阶段：打分器只加载一次并最终释放 ----
+    rank_info = stages.get("rank") or {}
+    check("择优的打分器在结束时已释放",
+          rank_info.get("info", {}).get("scorer_released") is not False,
+          str(rank_info.get("info", {})))
+
+    # ---- 模型命名：报告里要能看出每个目标叫什么 ----
+    names = report.get("names") or {}
+    check("报告记录了每个目标的训练记录名", len(names) >= 1, str(names))
+    if names:
+        check("记录名可在 training_runs 里查到（便于区分管理）",
+              all(os.path.isdir(RN.run_dir(n)) for n in names.values()),
+              str(list(names.values())))
 
     # =====================================================================
     print("\n" + "=" * 70)

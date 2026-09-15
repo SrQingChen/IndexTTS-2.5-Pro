@@ -569,8 +569,43 @@ def _trim(y: np.ndarray, sr: int, thresh_db: float) -> np.ndarray:
     return y[a:b]
 
 
+# noisereduce 是**可选依赖**（没写进 pyproject 的基础依赖里）。它缺席时
+# `_denoise` 只能原样返回 —— 这是个**静默跳过**：界面说「已降噪」，实际一个
+# 采样点都没动。所以这里暴露一个能力探测，让上层（一键三连的参数面板、
+# 数据集页、手册）能把「降噪不可用」明确说出来。
+_NOISEREDUCE_OK: Optional[bool] = None
+
+
+def noisereduce_available() -> bool:
+    """noisereduce 是否可用。结果缓存（探测要 import，不必反复做）。"""
+    global _NOISEREDUCE_OK
+    if _NOISEREDUCE_OK is None:
+        try:
+            import noisereduce  # noqa: F401
+            _NOISEREDUCE_OK = True
+        except Exception:
+            _NOISEREDUCE_OK = False
+    return bool(_NOISEREDUCE_OK)
+
+
+def denoise_note() -> str:
+    """给界面用的一句话说明。可用时返回空串。"""
+    if noisereduce_available():
+        return ""
+    return ("未安装 <code>noisereduce</code>，**降噪已被静默跳过**"
+            "（其余增强步骤照常执行）。装上它即可生效：<br>"
+            "<code>uv pip install --python .venv\Scripts\python.exe "
+            "noisereduce</code>")
+
+
 def _denoise(y: np.ndarray, sr: int, strength: float) -> np.ndarray:
-    """频谱门限降噪。strength 0~1 映射到 noisereduce 的 prop_decrease。"""
+    """频谱门限降噪。strength 0~1 映射到 noisereduce 的 prop_decrease。
+
+    没有 noisereduce 时原样返回 —— 调用方应先问 `noisereduce_available()`
+    并把「已跳过」明确告知用户，不要让这步看起来像是做过了。
+    """
+    if not noisereduce_available():
+        return y
     try:
         import noisereduce as nr
         return np.asarray(
@@ -581,6 +616,8 @@ def _denoise(y: np.ndarray, sr: int, strength: float) -> np.ndarray:
             dtype=np.float32,
         )
     except Exception:
+        # 运行期失败（异常参数、NaN 输入等）不该连累整条样本的增强：
+        # 原样返回，其余步骤继续。缺包的情况由上面的能力探测单独处理。
         return y
 
 

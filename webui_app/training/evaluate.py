@@ -73,7 +73,10 @@ class EvalOptions:
     max_mel_tokens: int = 900
     duration_factor: float = 1.0
     # 打分
-    whisper_size: str = RW.DEFAULT_WHISPER
+    # 评测是**相对比较**（A/B 之间、候选之间），小模型足够，而且这一步
+    # 引擎必然驻留显存 —— 用 medium 会把 8 GB 卡挤到触发 WDDM 静默降速。
+    # 所以这里显式用 small，而不是跟着 RW.DEFAULT_WHISPER 走。
+    whisper_size: str = "small"
     language: str = "zh"
     wer_weight: float = 0.6
     sim_weight: float = 0.4
@@ -171,6 +174,10 @@ def run_eval(engine, a: Contender, b: Optional[Contender],
     os.makedirs(out_dir, exist_ok=True)
     out["out_dir"] = out_dir
 
+    # 谁创建、谁负责卸载：外部传进来的 scorer 由调用方自己收尾。
+    # 一键三连的择优阶段要对 6 个候选打分，复用一个 scorer 能省掉
+    # 5 次「加载 1.6 GB 的 whisper medium + 卸掉」的来回。
+    own_scorer = scorer is None
     sc = scorer or RW.RewardScorer(RW.RewardOptions(
         whisper_size=opts.whisper_size, language=opts.language,
         wer_weight=opts.wer_weight, sim_weight=opts.sim_weight))
@@ -331,7 +338,8 @@ def run_eval(engine, a: Contender, b: Optional[Contender],
             except Exception as e:
                 out["warnings"].append(
                     f"还原 adapter `{tag}` 失败：{type(e).__name__}: {e}")
-        sc.unload()
+        if own_scorer:
+            sc.unload()
     return out
 
 

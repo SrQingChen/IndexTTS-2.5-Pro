@@ -17,6 +17,8 @@ from typing import Any, Dict, List
 
 import gradio as gr
 
+from webui_app import fsutil
+from webui_app import logging_setup as LOG
 from webui_app import theme as T
 from webui_app.config import LOW_VRAM_THRESHOLD_GB, refresh_vram_free
 from webui_app.context import AppContext
@@ -26,6 +28,49 @@ from webui_app.services.engine import EngineError
 
 def _bar(ratio: float, label: str) -> str:
     return T.progress_bar(max(0.0, min(1.0, ratio)), label)
+
+
+# ---------------------------------------------------------------------------
+# 调试日志面板的两个纯函数（模块级：只依赖 LOG 与主题，便于单独测试）
+# ---------------------------------------------------------------------------
+
+def _log_info_html() -> str:
+    """面板顶部那行状态：级别、目录、两个文件的大小、内存缓冲条数。"""
+    st = LOG.stats()
+    if not st["log"]:
+        return T.warn("文件日志未启用（日志目录不可写？）—— "
+                      "只有内存里的最近记录可看。")
+
+    def kb(b: int) -> str:
+        return f"{b / 1024:.0f} KB" if b < 1024 * 1024 else f"{b / 1048576:.1f} MB"
+
+    return T.hint(
+        f"级别 <b>{st['level']}</b> · 目录 <code>{st['dir']}</code><br>"
+        f"indextts.log {kb(st['log_bytes'])} · "
+        f"error.log {kb(st['error_bytes'])} · "
+        f"内存缓冲 {st['ring']} 条")
+
+
+def _dl_payload(level: str, source: str, n: int):
+    """(说明 HTML, 日志正文**纯文本**)。
+
+    必须返回裸文本而不是 `gr.update(...)` 字典：`gr.Code` 的 postprocess
+    会对值调 `value.strip()`，塞字典进去就是
+    `'dict' object has no attribute 'strip'` —— 真机截图验收抓到的真实故障。
+
+    单独抽成函数还有一个好处：探针可以直接断言「第二个元素是 str」，
+    把这个坑焊死。
+    """
+    if level:
+        LOG.set_level(str(level))
+    n = int(n or 300)
+    if source == "ring":
+        body = LOG.recent_markdown(n)
+    elif source == "err":
+        body = LOG.file_tail(n, LOG.error_log_path())
+    else:
+        body = LOG.file_tail(n, LOG.log_path())
+    return _log_info_html(), str(body or "")
 
 
 def render(ctx: AppContext):
@@ -76,9 +121,33 @@ def render(ctx: AppContext):
         # =================================================================
         with gr.Column(scale=1, min_width=420):
             with gr.Column(elem_classes=["ix-section"]):
+                gr.HTML(T.section("调试日志", "📝",
+                                  "出问题先看这里。<b>error.log 只记问题</b>（含完整异常堆栈），"
+                                  "indextts.log 是全量。级别切到 DEBUG 会记下每次回调与"
+                                  "每步训练，排查完记得切回 INFO。"))
+                with gr.Row():
+                    dl_level = gr.Dropdown(
+                        choices=list(LOG.LEVELS), value=LOG.level(),
+                        label="级别", scale=1,
+                        info="运行期即时生效，不需要重启")
+                    dl_source = gr.Dropdown(
+                        choices=[("内存最近记录（快）", "ring"),
+                                 ("error.log（只看问题）", "err"),
+                                 ("indextts.log（全量）", "log")],
+                        value="err", label="看哪一份", scale=2)
+                with gr.Row():
+                    dl_btn = gr.Button("↻ 刷新", size="sm", scale=1)
+                    dl_open_btn = gr.Button("📂 打开日志目录", size="sm", scale=1)
+                    dl_n = gr.Slider(50, 2000, 300, step=50,
+                                     label="显示行数", scale=2)
+                dl_info = gr.HTML("")
+                dl_out = gr.Code(label="日志内容", language="python",
+                                 lines=22, interactive=False)
+
+            with gr.Column(elem_classes=["ix-section"]):
                 gr.HTML(T.section("事件日志", "📜",
                                   "引擎生命周期事件（加载/卸载/推理/QwenEmotion/LoRA/错误），"
-                                  "环形缓冲 300 条。"))
+                                  "环形缓冲 300 条。完整的落盘版本在上一块。"))
                 with gr.Row():
                     log_btn = gr.Button("↻ 刷新日志", size="sm", scale=1)
                     log_n = gr.Slider(10, 300, 60, step=10, label="显示条数", scale=2)
@@ -296,6 +365,29 @@ def render(ctx: AppContext):
     log_btn.click(on_log, inputs=[log_n], outputs=[log_md])
     log_n.change(on_log, inputs=[log_n], outputs=[log_md])
 
+    # ---------- 调试日志查看器 ----------
+    # 两个纯函数在模块级（_log_info_html / _dl_payload），便于探针直接断言
+    def on_dl(level, source, n):
+        info, body = _dl_payload(level, source, n)
+        return info, gr.update(value=body)
+
+    dl_btn.click(on_dl, inputs=[dl_level, dl_source, dl_n],
+                 outputs=[dl_info, dl_out])
+    dl_level.change(on_dl, inputs=[dl_level, dl_source, dl_n],
+                    outputs=[dl_info, dl_out])
+    dl_source.change(on_dl, inputs=[dl_level, dl_source, dl_n],
+                     outputs=[dl_info, dl_out])
+
+    def on_dl_open():
+        d = LOG.log_dir()
+        if not d or not os.path.isdir(d):
+            return T.err("日志目录不存在（文件日志可能没启用）。")
+        ok = fsutil.open_in_explorer(d)
+        return T.tip(f"已打开 <code>{d}</code>") if ok else T.hint(
+            f"日志目录：<code>{d}</code>（无法自动打开，请手动前往）")
+
+    dl_open_btn.click(on_dl_open, inputs=[], outputs=[dl_info])
+
     # ---------- 维护 ----------
     def _after_maint(msg: str):
         return msg, ctx.status_html()
@@ -418,10 +510,13 @@ def render(ctx: AppContext):
 
     def on_page_load():
         snap = sample()
+        # 调试日志也顺手填上：进这一页就是为了看日志，不该还要先点一次刷新
+        info, body = _dl_payload(LOG.level(), "err", 300)
         return (ctx.status_html(), vram_markdown(snap), engine_markdown(snap),
-                ctx.log.markdown(60))
+                ctx.log.markdown(60), info, gr.update(value=body))
 
     return {
-        "page_load": (on_page_load, [gauge_html, vram_md, engine_md, log_md]),
+        "page_load": (on_page_load,
+                      [gauge_html, vram_md, engine_md, log_md, dl_info, dl_out]),
         "components": {"gauge_html": gauge_html},
     }

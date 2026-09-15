@@ -25,6 +25,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from webui_app.config import PROJECT_ROOT
 from webui_app.training import guard as GD
+from webui_app import logging_setup as LOG
 from webui_app.training import runs as RN
 
 # 一个 epoch 里为了「长度接近的排一起」而打包的大块尺寸（× batch_size）
@@ -922,6 +923,11 @@ class BaseTrainer:
         rep = self.report
         cfg = self.cfg
         t0 = time.perf_counter()
+        log = LOG.get_logger("trainer")
+        log.info("训练开始 %s · arch=%s · 数据集=%s · rank=%d · lr=%g · "
+                 "epochs=%d · 总步数=%s · 注入面=%s",
+                 self.run_name, self.ARCH, self.dataset, cfg.rank, cfg.lr,
+                 cfg.epochs, self.total_steps, ",".join(cfg.target_modules))
         status = RN.STATUS_DONE
         n_epochs = max(1, int(cfg.epochs))
         halt = ""
@@ -1201,6 +1207,21 @@ class BaseTrainer:
                   f"{self._step} 步 · {rep.seconds/60:.1f} 分钟"
                   + (f" · 峰值显存 {rep.vram_peak_gb:.2f} GB"
                      if rep.vram_peak_gb else ""))
+        # 中央日志也记一份：训练目录里的 log.txt 只有跑到那一页才看得到，
+        # 而「训练为什么失败」往往是在别处发现的。
+        log = LOG.get_logger("trainer")
+        if rep.ok:
+            log.info("训练结束 %s · %s · %d 步 · val %s → %s · %.1f 分钟 · "
+                     "峰值显存 %s GB · 档位 %d · 底座未变=%s",
+                     self.run_name, RN.STATUS_LABELS.get(status, (status,))[0],
+                     self._step, rep.first_val, rep.best_val,
+                     rep.seconds / 60, rep.vram_peak_gb, rep.n_checkpoints,
+                     (rep.base_verify or {}).get("ok"))
+        else:
+            log.error("训练未正常完成 %s · 状态=%s · 步数=%d · error=%s · "
+                      "stop_reason=%s · verify=%s",
+                      self.run_name, status, self._step, rep.error or "(无)",
+                      rep.stop_reason or "(无)", rep.base_verify)
         self.release()
 
     def release(self) -> None:

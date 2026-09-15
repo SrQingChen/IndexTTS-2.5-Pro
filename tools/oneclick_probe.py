@@ -19,6 +19,7 @@
 
 import _env  # noqa: F401  路径与 Windows 控制台编码引导，必须在最前
 
+import hashlib
 import os
 import shutil
 import tempfile
@@ -30,7 +31,8 @@ import soundfile as sf
 
 from webui_app.training import dataset as DS                 # noqa: E402
 from webui_app.training import guard as GD                   # noqa: E402
-from webui_app.training import oneclick as OC                # noqa: E402
+from webui_app.training import oneclick as OC
+from webui_app.training import runs as RN                # noqa: E402
 from webui_app.training.runner import TrainRunner            # noqa: E402
 
 PASS = FAIL = 0
@@ -456,13 +458,43 @@ def main() -> int:
         check("失败报告明确标红", "🔴" in md_bad)
         check("失败报告带上错误原因", "样本不够" in md_bad)
 
+        # finish(**info) 必须把关键结果落进阶段里 —— 否则「识别用的哪个模型、
+        # 有没有卸载、释放了多少显存」这些事实在报告与 UI 面板里全是空的
+        # （真机验收正是靠这条断言抓到了这个漏写）。
+        r2 = OC.OneClickReport(dataset="d3")
+        r2.start("asr", "x")
+        r2.finish("asr", "done", whisper="medium",
+                  prompt="以下是普通话的句子。", loaded_after_unload=False,
+                  freed_gb=1.6, failed=0)
+        info = (r2.stage_of("asr") or {}).get("info") or {}
+        check("finish(**info) 把结果写进了阶段",
+              info.get("whisper") == "medium", str(info))
+        check("识别阶段如实记录是否已卸载",
+              info.get("loaded_after_unload") is False, str(info))
+        check("识别阶段记录释放的显存", info.get("freed_gb") == 1.6, str(info))
+        check("带 info 的报告仍能渲染且无裸露 None",
+              len(r2.markdown()) > 50 and "None" not in r2.markdown())
+        r3 = OC.OneClickReport(dataset="d4")
+        r3.start("train", "x")
+        r3.finish("train", "done")
+        # 报告里渲染的是**阶段标题**（LoRA 训练），不是内部键名 train
+        check("没有 info 的阶段也能渲染（向后兼容）",
+              OC.STAGE_TITLE["train"] in r3.markdown()
+              and r3.stage_of("train")["info"] == {},
+              str(r3.stage_of("train")))
+
         # =================================================================
         head("[9] UI 计划面板（按钮下方那块「自动参数」）")
         # =================================================================
         from webui_app.tabs import oneclick_tab as OT      # noqa: E402
 
-        check("OPT_KEYS 与控件列表长度一致（漏一个就会错位）",
-              len(OT.OPT_KEYS) == 21, str(len(OT.OPT_KEYS)))
+        # 不写死数量：加一个选项就要改一次断言的话，迟早有人忘了改而放过去。
+        # 改成「必须覆盖这些关键项 + 无重复 + 每项都是真实字段」。
+        check("OPT_KEYS 无重复（有重复就会两个控件抢一个字段）",
+              len(OT.OPT_KEYS) == len(set(OT.OPT_KEYS)), str(OT.OPT_KEYS))
+        for must in ("model_name", "cpu_workers", "lang", "asr",
+                     "preset_mode", "top_k", "rank_eval", "seed"):
+            check(f"OPT_KEYS 覆盖了 {must}", must in OT.OPT_KEYS)
         check("OPT_KEYS 都是 OneClickOptions 的真实字段",
               all(hasattr(OC.OneClickOptions(), k) for k in OT.OPT_KEYS),
               str([k for k in OT.OPT_KEYS
@@ -521,16 +553,171 @@ def main() -> int:
                   any(p.key == k for p in PM.by_group("oneclick")))
 
         # =================================================================
+        head("[11] CPU 并行：结果必须与串行逐字节一致")
+        # =================================================================
+        from webui_app.training import parallel as PL
+
+        check("default_workers 上限 4", PL.default_workers(999, 0) <= PL.MAX_WORKERS,
+              str(PL.default_workers(999, 0)))
+        check("default_workers 不超过条数", PL.default_workers(2, 0) <= 2,
+              str(PL.default_workers(2, 0)))
+        check("requested=1 就是串行", PL.default_workers(50, 1) == 1)
+        check("requested 超上限被裁剪", PL.default_workers(50, 99) == PL.MAX_WORKERS,
+              str(PL.default_workers(50, 99)))
+        check("空输入也不报错", PL.default_workers(0, 0) >= 1)
+
+        # -- map_parallel 的三个承诺：保序、隔离失败、可停止 --
+        out = PL.map_parallel(lambda x: x * 2, list(range(8)), workers=4)
+        check("map_parallel 保序（与输入逐位对应）",
+              out.items == [x * 2 for x in range(8)], str(out.items))
+        check("map_parallel 报告用了几个线程", out.workers == 4, str(out.workers))
+
+        def _maybe_boom(x):
+            if x == 3:
+                raise ValueError("第 3 个炸了")
+            return x
+
+        out = PL.map_parallel(_maybe_boom, list(range(6)), workers=3)
+        check("单条失败不影响其它条目",
+              [out.items[i] for i in (0, 1, 2, 4, 5)] == [0, 1, 2, 4, 5],
+              str(out.items))
+        check("失败位置是 None 且记了错因",
+              out.items[3] is None and 3 in out.errors
+              and "ValueError" in out.errors[3], str(out.errors))
+        check("outcome.ok 反映有失败", out.ok is False)
+
+        seen = []
+        out = PL.map_parallel(lambda x: x, list(range(10)), workers=3,
+                              on_done=lambda i, r: seen.append(i))
+        check("on_done 每条都被回调一次（进度不丢）",
+              sorted(seen) == list(range(10)), str(sorted(seen)))
+
+        flag = {"stop": False}
+        out = PL.map_parallel(lambda x: x, list(range(50)), workers=2,
+                              should_stop=lambda: flag["stop"])
+        check("未请求停止时跑完全部", out.n_done == 50 and not out.stopped)
+
+        # -- 真正的核心承诺：增强结果与线程数无关 --
+        def _hash_dir(name: str) -> dict:
+            d = DS.dir_of(name)
+            h = {}
+            for u in DS.load_meta(name):
+                p = u.audio_abs(d)
+                if p and os.path.isfile(p):
+                    h[u.id] = hashlib.sha256(open(p, "rb").read()).hexdigest()
+            return h
+
+        srcs = [make_wav(os.path.join(tmp, f"p{i}.wav"), 3.0, seed=70 + i)
+                for i in range(8)]
+        names = {}
+        for tag, workers in (("seq", 1), ("par", 4)):
+            nm = f"probe_par_{tag}"
+            names[tag] = nm
+            if DS.exists(nm):
+                DS.delete(nm)
+            DS.create(nm, note="parallel probe")
+            imp = DS.import_audio(nm, srcs, copy=True, lang="ZH")
+            DS.apply_fields(nm, {uid: {"text": f"第{i}句"}
+                                 for i, uid in enumerate(imp["ids"])})
+            DS.refresh_all(nm, require_features=False)
+            o = OC.OneClickOptions(enhance=True, denoise=False,
+                                   normalize=True, trim_silence=True,
+                                   cpu_workers=workers, dataset_name=nm,
+                                   max_text_repeats=0, min_score=0.0)
+            st = OC.stage_optimize(nm, o, progress=None, should_stop=None,
+                                   report=None, bands=None)
+            check(f"优化阶段（workers={workers}）处理了全部样本",
+                  st["enhanced"] >= 6, f"enhanced={st['enhanced']} "
+                                       f"failed={st['failed']}")
+            if workers > 1:
+                check("并行路径确实启用了多线程", int(st.get("workers", 1)) > 1,
+                      str(st.get("workers")))
+
+        hs, hp = _hash_dir(names["seq"]), _hash_dir(names["par"])
+        check("两次运行的样本集合一致", set(hs) == set(hp),
+              f"{sorted(hs)} vs {sorted(hp)}")
+        diff = [k for k in hs if hs[k] != hp.get(k)]
+        check("**并行与串行的音频输出逐字节一致**（不影响效果）",
+              not diff, f"不一致 {diff}")
+        s1 = DS.stats(names["seq"])
+        s2 = DS.stats(names["par"])
+        check("两次运行的状态与样本数也一致",
+              (s1["total"], s1["ready"], s1["by_status"])
+              == (s2["total"], s2["ready"], s2["by_status"]),
+              f"{s1['ready']}/{s2['ready']}")
+
+        # =================================================================
+        head("[12] 模型命名（便于区分管理）")
+        # =================================================================
+        o_multi = OC.OneClickOptions(model_name="小明_播客", arches="gpt,cfm")
+        nms = o_multi.plan_run_names()
+        check("多目标：加 _gpt / _cfm 后缀（不然互相覆盖）",
+              nms == {"gpt": "小明_播客_gpt", "cfm": "小明_播客_cfm"}, str(nms))
+        o_one = OC.OneClickOptions(model_name="小明_播客", arches="gpt")
+        check("单目标：就用用户取的名字（所见即所得）",
+              o_one.plan_run_names() == {"gpt": "小明_播客"},
+              str(o_one.plan_run_names()))
+        o_slash = OC.OneClickOptions(model_name="a/b:c", arches="gpt")
+        check("非法字符被安全化（Windows 上不能做目录名）",
+              "/" not in list(o_slash.plan_run_names().values())[0]
+              and ":" not in list(o_slash.plan_run_names().values())[0],
+              str(o_slash.plan_run_names()))
+        check("名字含非法字符时给出 warn",
+              any(n.level == "warn" for n in o_slash.validate()))
+        o_empty = OC.OneClickOptions()
+        got = list(o_empty.plan_run_names().values())
+        check("留空则自动生成（带时间戳、可区分）",
+              all(x.startswith("oneclick_") for x in got), str(got))
+        check("未指定模型名时不报冲突", OC.OneClickOptions().check_run_names() == "")
+
+        # 已存在的 run 名必须能拦下。**自建一条临时记录**来测 ——
+        # 不依赖机器上恰好有训练产物，探针在任何环境都能跑。
+        tmp_run = "probe_name_conflict"
+        try:
+            RN.run_dir(tmp_run, create=True)
+            RN.write_run(tmp_run, {"arch": "gpt", "run": tmp_run,
+                                   "status": "done", "dataset": "x"})
+            o_conf = OC.OneClickOptions(model_name=tmp_run, arches="gpt")
+            msg = o_conf.check_run_names()
+            check("已占用的模型名会被拦下（不用白等一轮训练）", bool(msg),
+                  str(msg)[:70])
+            check("拦下的提示里点名了冲突的记录", tmp_run in msg, msg[:90])
+            check("提示给出了解决办法（改名或删旧记录）",
+                  "换一个名称" in msg or "删掉旧记录" in msg, msg[:90])
+            # 多目标时实际用的是 <名字>_gpt / <名字>_cfm，
+            # 所以冲突检测必须把后缀加上再去查（否则会漏判）
+            tmp_run_cfm = tmp_run + "_cfm"
+            RN.run_dir(tmp_run_cfm, create=True)
+            RN.write_run(tmp_run_cfm, {"arch": "cfm", "run": tmp_run_cfm,
+                                       "status": "done", "dataset": "x"})
+            o_conf2 = OC.OneClickOptions(model_name=tmp_run, arches="gpt,cfm")
+            msg2 = o_conf2.check_run_names()
+            check("多目标时按带后缀的名字检出冲突（<名>_cfm）",
+                  tmp_run_cfm in msg2, str(msg2)[:80])
+            RN.delete_run(tmp_run_cfm)
+            RN.delete_run(tmp_run)
+            check("删掉旧记录后冲突解除",
+                  OC.OneClickOptions(model_name=tmp_run,
+                                     arches="gpt").check_run_names() == "")
+        finally:
+            try:
+                if RN.read_run(tmp_run):
+                    RN.delete_run(tmp_run)
+            except Exception:
+                pass
+
+        # =================================================================
         head("清理")
         # =================================================================
-        for d in (ds_name, ds_small):
+        for d in (ds_name, ds_small, "probe_par_seq", "probe_par_par"):
             if DS.exists(d):
                 DS.delete(d)
         shutil.rmtree(tmp, ignore_errors=True)
         check("临时目录已删除", not os.path.isdir(tmp))
 
     finally:
-        for d in (ds_name, "probe_oneclick_small", "probe_oneclick_dup"):
+        for d in (ds_name, "probe_oneclick_small", "probe_oneclick_dup",
+                  "probe_par_seq", "probe_par_par"):
             try:
                 if DS.exists(d):
                     DS.delete(d)

@@ -7,6 +7,7 @@ Gradio 的每个 Tab 是独立函数，但它们需要共享同一个引擎实�
 
 from __future__ import annotations
 
+import logging
 import threading
 import time
 from collections import deque
@@ -33,6 +34,17 @@ class EventLog:
                 "message": message,
                 "level": level,
             })
+        # 同时落到文件日志里 —— 内存这份进程一退就没了，而排查往往发生在
+        # 「重启一次试试」之后，那时只有文件还留着现场。
+        try:
+            from webui_app import logging_setup as LOG
+            lv = {"ok": logging.INFO, "info": logging.INFO,
+                  "warn": logging.WARNING, "error": logging.ERROR}.get(
+                      level, logging.INFO)
+            LOG.get_logger("event").log(
+                lv, "%s%s", event, f" · {message}" if message else "")
+        except Exception:
+            pass
 
     def tail(self, n: int = 40) -> List[Dict[str, Any]]:
         with self._lock:

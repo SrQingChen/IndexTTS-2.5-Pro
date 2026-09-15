@@ -338,8 +338,15 @@ def _next_id(items: Sequence[Utterance]) -> Callable[[], str]:
 # 体检与状态判定
 # ---------------------------------------------------------------------------
 
-def evaluate(u: Utterance, ds_dir: str, require_features: bool = True) -> Utterance:
-    """重算一条样本的指标与状态。不写盘。"""
+def evaluate(u: Utterance, ds_dir: str, require_features: bool = True,
+             report: Any = None) -> Utterance:
+    """重算一条样本的指标与状态。不写盘。
+
+    report：**预先算好的** `audio_lab.AudioReport`（可选）。refresh_all 可以
+    并行把体检算完再逐条套用，省掉重复解码；传 None 就自己算 —— 这是串行
+    路径的默认行为，与加这个参数之前完全一致。
+    传进来一个异常对象表示「那条音频体检时抛了」，走与自行调用相同的失败分支。
+    """
     from webui_app.services import audio_lab as AL
 
     problems: List[str] = []
@@ -350,7 +357,9 @@ def evaluate(u: Utterance, ds_dir: str, require_features: bool = True) -> Uttera
         return u
 
     try:
-        r = AL.analyze(ap)
+        r = report if report is not None else AL.analyze(ap)
+        if isinstance(r, BaseException):
+            raise r
         u.duration = round(r.duration, 3)
         u.sample_rate = int(r.sample_rate)
         u.channels = int(r.channels)
@@ -399,16 +408,50 @@ def evaluate(u: Utterance, ds_dir: str, require_features: bool = True) -> Uttera
 
 
 def refresh_all(name: str, require_features: bool = True,
-                progress: Optional[Callable[[float, str], None]] = None
+                progress: Optional[Callable[[float, str], None]] = None,
+                workers: int = 1
                 ) -> Dict[str, int]:
-    """重算全部样本的状态。导入后/提取特征后调用。"""
+    """重算全部样本的状态。导入后/提取后调用。
+
+    workers > 1 时把「解码 + 体检指标」这一段并行掉（见 training/parallel.py
+    的说明），状态归约仍按原顺序在主线程做 —— 所以结果与串行逐位一致。
+    默认 1 = 纯串行，与本参数加入之前的行为完全一样。
+    """
     d = dir_of(name)
     with _META_LOCK:
         items = load_meta(name)
         n = len(items)
+        w = max(1, int(workers or 1))
+
+        # 并行只覆盖「解码 + 体检指标」这段纯计算（见 training/parallel.py），
+        # 状态归约与写盘仍在主线程按原顺序做，因此与串行结果逐位一致。
+        parallel_mode = bool(w > 1 and n > 1)
+        reports: List[Any] = [None] * n
+        if parallel_mode:
+            from webui_app.services import audio_lab as AL
+            from webui_app.training import parallel as PL
+
+            paths = [u.audio_abs(d) if u.audio else "" for u in items]
+
+            def _analyze(i: int) -> Any:
+                p = paths[i]
+                if not p or not os.path.isfile(p):
+                    return None          # 缺文件时 evaluate 会自己早退，不必算
+                try:
+                    return AL.analyze(p)
+                except Exception as e:
+                    return e             # 交给 evaluate 走它原本的失败分支
+
+            def _done(i: int, _res: Any) -> None:
+                if progress and n:
+                    progress((i + 1) / n, f"体检 {i+1}/{n}")
+
+            reports = PL.map_parallel(_analyze, list(range(n)), workers=w,
+                                      on_done=_done).items
+
         for i, u in enumerate(items):
-            evaluate(u, d, require_features)
-            if progress and n:
+            evaluate(u, d, require_features, report=reports[i])
+            if not parallel_mode and progress and n:
                 progress((i + 1) / n, f"体检 {i+1}/{n}")
         save_meta(name, items)
     return stats(name)

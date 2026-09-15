@@ -19,6 +19,7 @@ import time
 import traceback
 from typing import Any, Callable, Dict, List, Optional
 
+from webui_app import logging_setup as LOG
 from webui_app.training import runs as RN
 
 __all__ = ["TrainRunner", "get_runner"]
@@ -141,14 +142,32 @@ class TrainRunner:
             return self._stop_flag.is_set()
 
         def _work():
+            log = LOG.get_logger("runner")
+            log.info("后台任务开始 kind=%s label=%s", kind, self.label)
             try:
                 res = fn(_progress, _should_stop)
                 self.result = res if isinstance(res, dict) else {"value": res}
                 # dict 结果里 ok=False 才算失败；没给 ok 的当成功
-                self._finish((res.get("ok") is not False)
-                             if isinstance(res, dict) else True)
+                ok = ((res.get("ok") is not False)
+                      if isinstance(res, dict) else True)
+                if ok:
+                    log.info("后台任务完成 kind=%s · %.1fs · %s",
+                             kind, time.time() - self.started_at,
+                             (res.get("markdown", "")[:80].replace("\n", " ")
+                              if isinstance(res, dict) else ""))
+                else:
+                    # 任务自己报失败：把它的错误文案也落盘，方便事后追
+                    err = str((res or {}).get("error") or "未给出原因")
+                    log.error("后台任务失败 kind=%s · %.1fs · %s\n"
+                              "（任务内部记的最后一个阶段：%s）",
+                              kind, time.time() - self.started_at, err,
+                              self.phase or "未知")
+                self._finish(ok)
             except Exception as e:
-                self._log_lines.append(traceback.format_exc(limit=8))
+                tb = traceback.format_exc()
+                self._log_lines.append(tb)
+                log.error("后台任务抛异常 kind=%s label=%s：\n%s",
+                          kind, self.label, tb)
                 self._finish(False, error=f"{type(e).__name__}: {e}")
 
         self._thread = threading.Thread(target=_work, daemon=True,

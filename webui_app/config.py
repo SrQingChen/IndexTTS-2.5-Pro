@@ -210,6 +210,11 @@ class AppConfig:
     gui_seg_tokens: int = 120
     verbose: bool = False
 
+    # 日志（阶段 3.5 加入）
+    log_level: str = "INFO"
+    log_dir: Optional[str] = None
+    quiet: bool = False
+
     # 训练（阶段 2 使用）
     dataset_dir: str = field(default_factory=lambda: _d("datasets"))
     lora_dir: str = field(default_factory=lambda: _d("outputs", "lora"))
@@ -335,6 +340,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
     g.add_argument("--gui_seg_tokens", type=int, default=120,
                    help="分句最大 Token 数的界面默认值")
     g.add_argument("--verbose", action="store_true", help="打印详细推理日志")
+
+    g = p.add_argument_group("日志")
+    g.add_argument("--log-level", default="INFO",
+                   choices=["DEBUG", "INFO", "WARNING", "ERROR"],
+                   help="日志级别；排查问题用 DEBUG（会记下每次回调与每步训练）")
+    g.add_argument("--log-dir", default=None,
+                   help="日志目录，默认 ./outputs/logs")
+    g.add_argument("--quiet", action="store_true",
+                   help="只写日志文件，不往控制台打")
 
     return p
 

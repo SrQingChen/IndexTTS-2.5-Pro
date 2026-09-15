@@ -1,4 +1,4 @@
-"""推理参数登记：音色 / 文本 / 情感 / 采样 / 分句 / 引擎 / 显存。"""
+"""推理参数登记：音色 / 文本 / 情感 / 采样 / 分句 / 引擎 / 显存 / 日志。"""
 
 from __future__ import annotations
 
@@ -16,6 +16,76 @@ def build(reg, P):
     _segment(reg, P)
     _engine(reg, P)
     _memory(reg, P)
+    _logging(reg, P)
+
+
+# ---------------------------------------------------------------------------
+
+def _logging(reg, P):
+    """调试日志（阶段 3.5）。出问题先看这里说的文件。"""
+    reg(P(
+        key="log_level", group="logging", label="日志级别",
+        kind="dropdown", default="INFO",
+        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
+        summary="决定记多少。排查问题用 DEBUG，平时 INFO。",
+        info="启动参数 --log-level；运行期可在「系统 → 调试日志」里即时切换，无需重启。",
+        affects="日志文件体积与信息量",
+        detail_md="""
+四个级别的取舍：
+
+| 级别 | 会记什么 | 什么时候用 |
+|---|---|---|
+| `ERROR` | 只记失败 | 只想看坏事 |
+| `WARNING` | 加上「可疑但不致命」（状态脱节、无效操作） | 默认观察 |
+| `INFO` | **默认**：引擎加载/卸载、LoRA 挂载/卸载、后台任务起止、训练起止、识别与优化的用时与线程数 | 日常 |
+| `DEBUG` | 加上每次 UI 回调的入参与耗时、强度旋钮的实际生效值、参数校验细节 | 排查具体问题时**临时**打开 |
+
+DEBUG 会明显增加日志体积（每次点按钮都记一行），排查完记得切回 INFO。
+""",
+        pitfall_md="""
+级别只影响**记录**，不影响任何行为 —— 开 DEBUG 不会让训练变慢，但会多写盘。
+`outputs/logs/` 上限约 50 MB（两个文件各 5 MB × 5 份轮转）。
+""",
+    ))
+
+    reg(P(
+        key="log_dir", group="logging", label="日志目录",
+        kind="text", default="outputs/logs",
+        summary="日志落盘位置。默认 ./outputs/logs。",
+        info="启动参数 --log-dir；写入两个文件：indextts.log（全量）+ error.log（只记问题）。",
+        affects="排查时去哪里找证据",
+        detail_md="""
+```
+outputs/logs/indextts.log    全量日志，5 MB × 5 份轮转
+outputs/logs/error.log      只记 WARNING 及以上，**含完整异常堆栈**
+```
+
+**`.log` 与 `log.txt` 不是一回事**：`training_runs/<run>/log.txt` 是训练器
+自己的日志（只在那一个训练目录里），`outputs/logs/` 才是全局的。查
+「界面点了没反应」「切换模型报错」这类问题要看后者。
+
+`error.log` 单独一份的意义：出了问题不用在几千行里翻，直接开它。
+
+另外，**未捕获异常也会落盘** —— 主线程与子线程的 excepthook 都挂上了。
+后台任务线程崩溃以前只会静默消失，现在会留下完整堆栈与线程名。
+""",
+        pitfall_md="""
+Windows 上只要日志文件还被进程打开着，日志目录就删不掉。
+脚本里要清理日志目录，先调 `logging_setup.shutdown()` 释放句柄。
+""",
+    ))
+
+    reg(P(
+        key="quiet", group="logging", label="静默模式（只写文件）",
+        kind="checkbox", default=False,
+        summary="不往控制台打日志，但文件照写。",
+        info="启动参数 --quiet。适合把服务挂在后台或重定向输出的场景。",
+        affects="控制台整洁程度；不影响文件日志",
+        detail_md="""
+`--quiet` 只是摘掉控制台处理器，`indextts.log` / `error.log` 照常写 ——
+「静默」不等于「不留证据」，事后照样能查。
+""",
+    ))
 
 
 # ---------------------------------------------------------------------------

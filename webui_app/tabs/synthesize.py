@@ -23,6 +23,7 @@ from webui_app.config import EMO_BIAS, EMO_SUM_LIMIT, EMO_VECTOR_LABELS
 from webui_app.context import AppContext
 from webui_app.services import inference as INF
 from webui_app.services import pronunciation as PR
+from webui_app import logging_setup as LOG
 from webui_app.services import voice_bank
 from webui_app.services.engine import EngineError
 from webui_app.training import guard as GD
@@ -81,15 +82,52 @@ def _lora_ckpt_choices(run: str) -> List[str]:
     return seen
 
 
+def lora_action(run: str, mounted_runs: set) -> str:
+    """「下拉框选了什么」×「引擎上实际挂着什么」→ 该做什么。
+
+    纯函数（便于回归测试）。三种结果：
+
+        "mount"    选择与现状不一致 → 需要挂载
+        "unmount"  选择了「不使用 LoRA」但引擎上还挂着 → 卸掉
+        "none"     已经一致 → 什么都不做（避免每次生成都重读 adapter 文件）
+
+    之所以要显式判定「实际挂着什么」而不是只比一个「上次挂过什么」的记录：
+    那个记录在引擎被卸载/重载（可能发生在别的页面）之后会过期，
+    只信它就会出现「以为还挂着、其实早没了」——结果是**静默用底座合成**，
+    听到的声音不对却没有任何报错。
+    """
+    run = (run or "").strip()
+    mounted = set(mounted_runs or ())
+    if not run:
+        return "unmount" if mounted else "none"
+    return "none" if run in mounted else "mount"
+
+
 def _lora_state_html(eng) -> str:
-    """当前引擎上挂着什么、强度多少。"""
-    tags = list(getattr(getattr(eng, "stats", None), "lora_adapters", []) or [])
-    if not tags:
+    """当前引擎上挂着什么、强度多少。
+
+    读的是**引擎报告的真实模块状态**（`engine.lora_status()`），不是标签
+    列表 —— 标签和实际包装状态可能脱节，那时面板会明说，而不是让用户
+    对着「显示纯底座但声音还是那个人」猜。
+    """
+    try:
+        st = eng.lora_status()
+    except Exception as e:
+        LOG.get_logger("ui.lora").warning("读取 LoRA 状态失败：%s", e)
+        return T.warn(f"读取 LoRA 状态失败：{type(e).__name__}: {e}")
+
+    if not st:
+        return T.hint("引擎未加载。挂载 LoRA 时会自动加载；"
+                      "当前显示不了实际挂载状态。")
+
+    mounted = [x for x in st if x.get("wrapped")]
+    if not mounted:
         return T.hint("当前引擎上是 <b>纯底座</b>（未挂载 LoRA）。"
                       "选一个训练记录后点「🧬 挂载到引擎」。")
-    rows = []
-    for tag in tags:
-        tgt = str(tag).split(":", 1)[0]
+
+    rows, bad = [], []
+    for x in mounted:
+        tgt = x["target"]
         mean = None
         try:
             mod = (getattr(eng.tts, "gpt", None) if tgt == "gpt"
@@ -98,11 +136,21 @@ def _lora_state_html(eng) -> str:
                 mean = float(GD.get_adapter_scale(mod).get("_mean", 1.0))
         except Exception:
             pass
-        rows.append(f"<code>{tag}</code>"
+        label = "、".join(x.get("tags") or []) or "(无标签)"
+        rows.append(f"<code>{tgt}</code> · {label}"
                     + (f" · 强度 {mean:.2f}" if mean is not None else ""))
-    return T.tip("🧬 <b>已挂载</b>：" + " ｜ ".join(rows)
+        if not x.get("consistent"):
+            bad.append(tgt)
+
+    html = T.tip("🧬 <b>已挂载</b>：" + " ｜ ".join(rows)
                  + "<br><sub>强度 0 = 纯底座，1 = 完整 LoRA，"
                    "0.6~0.8 是「像」与「稳」的常见折中。</sub>")
+    if bad:
+        # 状态脱节的可见化：这类不一致正是「切 LoRA 偶现持续报错」的温床
+        html += T.warn("⚠️ " + "、".join(bad) + " 的标签与实际包装状态不一致。"
+                       "建议点「🧵 卸载 LoRA」清干净后重挂；"
+                       "已写入日志（系统页可看，error.log 里有堆栈）。")
+    return html
 
 EXAMPLE_TEXTS = [
     ("中文 · 日常", "大家好，欢迎使用 IndexTTS 二点五，这是一段用于测试的中文语音。", "ZH"),
@@ -449,26 +497,54 @@ def render(ctx: AppContext):
         ]
         return dict(zip(keys, vals))
 
-    def _sync_lora(run: str, ckpt: str, scale: float) -> str:
-        """保证「下拉框选的」与「引擎上挂的」一致。返回一行提示（或空串）。
+    def _mounted_runs() -> set:
+        """引擎上**实际**挂着的 adapter 对应的 run 名集合。
+
+        只看真实包装状态（`lora_status`），不看 `lora_want` —— 后者只是
+        「上次挂过什么」，引擎在别的页面被卸载/重载之后就过期了。
+        """
+        try:
+            return {t.split(":", 1)[1]
+                    for x in eng.lora_status() if x.get("wrapped")
+                    for t in (x.get("tags") or [])}
+        except Exception:
+            return set()
+
+    def _sync_lora(run: str, ckpt: str, scale: float):
+        """保证「下拉框选的」与「引擎上挂的」一致。返回 (提示, 是否成功)。
 
         只在选择变化时才真的重挂：每次生成都重挂要重读一遍 adapter 文件，
         没必要。换 run / 换档位 / 改强度都会触发。
+
+        **挂载失败时返回 ok=False**，让上层中止这次生成。原因：
+        用户明确选了某个音色，系统却做不到 —— 这时用底座静默出一版音频
+        比直接报错更糟（听起来"像"，但其实是错的模型）。
         """
-        if not run:
-            return ""
+        act = lora_action(run, _mounted_runs())
+        if act == "unmount":
+            # 选「不使用 LoRA」= 要纯底座。挂着的就卸掉，与下拉框语义一致。
+            try:
+                for tag in list(eng.stats.lora_adapters):
+                    eng.detach_lora(target=str(tag).split(":", 1)[0])
+                ctx.shared["lora_want"] = None
+                return "<br>🧬 已按选择卸下 LoRA，本次用<b>纯底座</b>合成", True
+            except Exception as e:
+                return (f"<br>⚠️ 卸载 LoRA 失败：{type(e).__name__}: {e}", False)
+        if act == "none":
+            return "", True
+
         want = (run, ckpt or "best", round(float(scale), 2))
-        if ctx.shared.get("lora_want") == want and getattr(eng, "loaded", False):
-            return ""
         try:
             if not eng.loaded:
                 eng.load()
             tag = MG.mount_run(eng, run, checkpoint=want[1], scale=want[2])
         except Exception as e:
-            return f"<br>⚠️ LoRA 挂载失败：{type(e).__name__}: {e}"
+            return (f"LoRA 挂载失败：{type(e).__name__}: {e}"
+                    "（已中止本次合成，避免用错模型出声）", False)
         ctx.shared["lora_want"] = want
-        return f"<br>🧬 已自动挂载 <code>{tag}</code>（强度 {want[2]}）"
+        return f"<br>🧬 已自动挂载 <code>{tag}</code>（强度 {want[2]}）", True
 
+    @LOG.ui_guard("synthesize.on_generate", slow_sec=1.0)
     def on_generate(*vals, progress=gr.Progress(track_tqdm=False)):
         *core, lora_run, lora_ckpt, lora_scale = vals
         raw = _collect(*core)
@@ -489,8 +565,14 @@ def render(ctx: AppContext):
                         ctx.status_html(),
                         _lora_state_html(eng))
 
-        # 选的 LoRA 与挂的不一致就先挂上，再合成
-        lora_note = _sync_lora(lora_run, lora_ckpt, lora_scale)
+        # 选的 LoRA 与挂的不一致就先挂上，再合成。挂不上就**中止** ——
+        # 用户指定了音色却用底座出声，听起来"像"但其实是错模型，比报错更糟。
+        lora_note, lora_ok = _sync_lora(lora_run, lora_ckpt, lora_scale)
+        if not lora_ok:
+            gr.Error(lora_note.replace("<br>", " "))
+            return (gr.update(),
+                    T.err(f"<b>未合成</b>：{lora_note}"),
+                    ctx.status_html(), _lora_state_html(eng))
 
         try:
             progress(0.05, desc="准备中…")
@@ -542,6 +624,7 @@ def render(ctx: AppContext):
 
     # ---------- LoRA 选择与挂载 ----------
 
+    @LOG.ui_guard("synthesize.on_lora_run")
     def on_lora_run(run):
         """换 run 时刷新档位列表。"""
         cks = _lora_ckpt_choices(run)
@@ -550,6 +633,7 @@ def render(ctx: AppContext):
     lora_run_dd.change(on_lora_run, inputs=[lora_run_dd],
                        outputs=[lora_ckpt_dd])
 
+    @LOG.ui_guard("synthesize.on_lora_mount")
     def on_lora_mount(run, ckpt, scale):
         if not run:
             return T.hint("先在上面的下拉框里选一个训练记录。")
@@ -574,6 +658,7 @@ def render(ctx: AppContext):
                          inputs=[lora_run_dd, lora_ckpt_dd, lora_scale_sl],
                          outputs=[lora_state_html])
 
+    @LOG.ui_guard("synthesize.on_lora_unmount")
     def on_lora_unmount():
         tags = list(getattr(eng.stats, "lora_adapters", []) or [])
         if not tags:
@@ -590,6 +675,7 @@ def render(ctx: AppContext):
     lora_unmount_btn.click(on_lora_unmount, inputs=[],
                            outputs=[lora_state_html])
 
+    @LOG.ui_guard("synthesize.on_lora_refresh")
     def on_lora_refresh():
         return (gr.update(choices=_lora_run_choices()),
                 _lora_state_html(eng))
@@ -597,6 +683,7 @@ def render(ctx: AppContext):
     lora_reload_btn.click(on_lora_refresh, inputs=[],
                           outputs=[lora_run_dd, lora_state_html])
 
+    @LOG.ui_guard("synthesize.on_lora_scale")
     def on_lora_scale(scale, run, ckpt):
         """拖动强度旋钮即时生效（已挂载时不用重新挂）。"""
         if not run:
@@ -933,6 +1020,7 @@ def render(ctx: AppContext):
             + ("".join(T.hint(n) for n in s.notes) if s.notes else "")
         )
 
+    @LOG.ui_guard("synthesize.on_load", slow_sec=5.0)
     def on_load():
         try:
             eng.load()
@@ -943,6 +1031,7 @@ def render(ctx: AppContext):
             gr.Error(f"{type(e).__name__}: {e}")
         return engine_html(), ctx.status_html(), _lora_state_html(eng)
 
+    @LOG.ui_guard("synthesize.on_unload")
     def on_unload():
         try:
             eng.unload()

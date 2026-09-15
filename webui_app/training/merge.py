@@ -31,6 +31,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 
+from webui_app import logging_setup as LOG
 from webui_app.config import PROJECT_ROOT
 from webui_app.training import cfm_lora as CL
 from webui_app.training import gpt_lora as GL
@@ -63,25 +64,53 @@ def resolve_mount_dir(run: str, checkpoint: str = "best") -> Tuple[str, str]:
 def mount_run(engine, run: str, checkpoint: str = "best",
               scale: float = 1.0) -> str:
     """把某个 run 的 adapter 挂到引擎上并设强度。返回 tag。"""
+    log = LOG.get_logger("merge")
+    t0 = time.perf_counter()
     d, arch = resolve_mount_dir(run, checkpoint)
-    tag = engine.attach_lora(d, target=arch)
-    if abs(float(scale) - 1.0) > 1e-9:
-        set_scale(engine, float(scale), arch)
+    log.info("挂载 run=%s checkpoint=%s → arch=%s scale=%s dir=%s",
+             run, checkpoint, arch, scale, d)
+    try:
+        tag = engine.attach_lora(d, target=arch)
+        if abs(float(scale) - 1.0) > 1e-9:
+            set_scale(engine, float(scale), arch)
+    except Exception:
+        log.error("挂载 run=%s 失败（dir=%s）", run, d, exc_info=True)
+        raise
+    log.info("挂载完成 %s · %.2fs", tag, time.perf_counter() - t0)
     return tag
 
 
 def unmount(engine, target: str = "gpt") -> None:
     """卸掉引擎上 target（gpt|cfm）的 adapter。"""
+    LOG.get_logger("merge").info("卸载 target=%s", target)
     engine.detach_lora(target=target)
 
 
 def set_scale(engine, factor: float, target: str = "gpt") -> int:
     """推理期强度旋钮：0=纯底座，1=完整 LoRA，0.6~0.8=常见折中。"""
+    log = LOG.get_logger("merge")
     mod = (getattr(engine.tts, "gpt", None) if target == "gpt"
            else engine.tts.s2mel.models.get("cfm"))
     if mod is None:
+        log.warning("设强度失败：target=%s 上没有模块（引擎未加载？）", target)
         return 0
-    return GD.set_adapter_scale(mod, factor)
+    # 没挂 adapter 就调强度是无效操作。记一笔 —— 否则以后对着
+    # 「拖了旋钮但声音没变」会百思不得其解。
+    # 用 getattr 探测而不是直接调：`_is_wrapped` 是引擎的私有实现，
+    # 替身/桩引擎（探针、外部调用方）不一定有，不该因此报错。
+    _chk = getattr(engine, "_is_wrapped", None)
+    if callable(_chk) and not _chk(mod):
+        log.warning("设强度 %.2f：target=%s 并未挂载 LoRA（模块 %s），操作无效",
+                    float(factor), target, type(mod).__name__)
+        return 0
+    n = GD.set_adapter_scale(mod, float(factor))
+    try:
+        mean = float(GD.get_adapter_scale(mod).get("_mean", 0.0))
+    except Exception:
+        mean = -1.0
+    log.debug("设强度 %.2f → target=%s，%d 层生效，实测均值 %.3f",
+              float(factor), target, n, mean)
+    return n
 
 
 # ===========================================================================

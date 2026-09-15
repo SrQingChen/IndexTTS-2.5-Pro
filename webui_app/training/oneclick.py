@@ -52,6 +52,7 @@ from webui_app.training import evaluate as EV
 from webui_app.training import features as FT
 from webui_app.training import gpt_lora as GL
 from webui_app.training import guard as GD
+from webui_app.training import parallel as PL
 from webui_app.training import reward as RW
 from webui_app.training import runs as RN
 
@@ -86,7 +87,11 @@ class OneClickOptions:
 
     # ---- 目标 ----
     dataset_name: str = ""            # "" = 自动生成 oneclick_<时间戳>
+    model_name: str = ""              # 训练记录名（「模型名称」，便于区分管理）
     lang: str = "ZH"                  # 训练语种（也决定 whisper 的转写语言）
+
+    # ---- CPU 并行（只作用于纯 CPU 的音频处理，见 training/parallel.py）----
+    cpu_workers: int = 0              # 0 = 自动（保守值）；1 = 关掉并行；上限 4
 
     # ---- S1 切片（只对超过 slice_over_sec 的长音频生效）----
     slice_over_sec: float = DS.MAX_TRAIN_SEC   # 20s：超过就不算「可直接训练」
@@ -104,6 +109,11 @@ class OneClickOptions:
     # ---- S3 识别 ----
     asr: bool = True                  # 关掉则需要自己补文本（数据集会留 no_text）
     whisper_size: str = RW.DEFAULT_WHISPER
+    # S7 择优打分用的模型。**故意比 ASR 小一档**：打分只在候选之间做相对比较，
+    # 而它运行时引擎还驻留在显存里 —— ASR 用 medium（1.6 GB）+ 引擎（4.94 GB）
+    # 在 8 GB 卡上只剩几百 MB，实测会把扩散采样挤到共享内存，
+    # s2mel 从 0.9 秒变成 25 秒（WDDM 静默降速，不报 OOM）。
+    score_whisper_size: str = "small"
 
     # ---- S4 筛选 ----
     min_score: float = 45.0           # 音频体检分低于此值丢弃（0 = 不按分筛）
@@ -187,6 +197,9 @@ class OneClickOptions:
         if self.whisper_size not in RW.WHISPER_SIZES:
             err(f"whisper_size={self.whisper_size} 不在 "
                 f"{list(RW.WHISPER_SIZES)} 里")
+        if self.score_whisper_size not in RW.WHISPER_SIZES:
+            err(f"score_whisper_size={self.score_whisper_size} 不在 "
+                f"{list(RW.WHISPER_SIZES)} 里")
         if not self.asr:
             warn("已关闭语音识别：数据集里的文本会是空的，"
                  "需要到「数据集」页手动补文本，否则筛选阶段一条都留不下。")
@@ -195,7 +208,47 @@ class OneClickOptions:
                 f"auto / {list(GD.CONFIG_PRESETS)} 里")
         if int(self.eval_samples) and int(self.eval_samples) < 3:
             warn("eval_samples < 3：择优的名次会很不稳（打分本身有转写噪声）。")
+        if int(self.cpu_workers or 0) > PL.MAX_WORKERS:
+            warn(f"cpu_workers={self.cpu_workers} 超过上限 {PL.MAX_WORKERS}，"
+                 "会按上限裁剪。音频处理是辅助工序，抢太多 CPU 反而拖慢训练。")
+        if int(self.cpu_workers or 0) < 0:
+            err("cpu_workers 不能为负数（0 = 自动，1 = 关掉并行）")
+        if (self.model_name or "").strip():
+            got = RN.safe_run_name(self.model_name)
+            if got != (self.model_name or "").strip():
+                warn(f"模型名称含非法字符，将按 `{got}` 落盘"
+                     "（斜杠、冒号等在 Windows 上不能做目录名）。")
         return n
+
+    def plan_run_names(self) -> Dict[str, str]:
+        """模型名称 → 每个目标实际使用的训练记录名。
+
+        单个目标时就用用户给的名字（所见即所得）；两个目标时必须加后缀区分，
+        否则 CFM 会把 GPT 的记录目录覆盖掉。
+        """
+        base = (self.model_name or "").strip() or (self.dataset_name or "").strip()
+        arches = self.arch_list()
+        if not base:
+            base = time.strftime("oneclick_%Y%m%d-%H%M")
+        base = RN.safe_run_name(base)
+        if len(arches) <= 1:
+            return {arches[0]: base} if arches else {}
+        return {a: RN.safe_run_name(f"{base}_{a}") for a in arches}
+
+    def check_run_names(self) -> str:
+        """训练记录名是否已被占用。占用则返回错误文案（在开工前拦下）。"""
+        clash = []
+        for arch, name in self.plan_run_names().items():
+            try:
+                if RN.read_run(name):
+                    clash.append(f"{name}（{arch}）")
+            except Exception:
+                pass
+        if not clash:
+            return ""
+        return ("模型名称已被占用：" + "、".join(clash)
+                + "。请换一个名称，或到「🎓 训练」页删掉旧记录后再跑"
+                  "——现在拦下是为了不让你白等一整轮训练才发现名字冲突。")
 
 
 # ===========================================================================
@@ -208,6 +261,7 @@ class OneClickReport:
 
     ok: bool = False
     dataset: str = ""
+    names: Dict[str, str] = field(default_factory=dict)   # arch -> 训练记录名
     started_at: float = 0.0
     seconds: float = 0.0
     options: Dict[str, Any] = field(default_factory=dict)
@@ -263,6 +317,10 @@ class OneClickReport:
         L.append(T.tip(f"<b>{head}</b> · 数据集 <code>{self.dataset}</code>"
                        + (f" · 耗时 {self.seconds / 60:.1f} 分钟"
                           if self.seconds else "")))
+        if self.names:
+            pairs = " · ".join(f"{a} → <code>{n}</code>"
+                               for a, n in self.names.items())
+            L.append(T.hint(f"训练记录名：{pairs}"))
         if self.error:
             L.append(T.err(self.error))
 
@@ -453,15 +511,24 @@ def collect_inputs(paths: Sequence[str], extra_path: str = "",
     return {"files": files, "missing": missing, "skipped": skipped}
 
 
-def _durations(paths: Sequence[str]) -> Dict[str, float]:
-    """批量取时长；读不出来的记为 -1。"""
-    out: Dict[str, float] = {}
-    for p in paths:
+def _durations(paths: Sequence[str], workers: int = 1) -> Dict[str, float]:
+    """批量取时长；读不出来的记为 -1。
+
+    解码 + 帧能量统计是纯 CPU 的独立计算，走并行没副作用（每条只读自己的文件）。
+    """
+    uniq = list(dict.fromkeys(paths))
+    if not uniq:
+        return {}
+
+    def _one(p: str) -> float:
         try:
-            out[p] = float(AL.analyze(p).duration or 0.0)
+            return float(AL.analyze(p).duration or 0.0)
         except Exception:
-            out[p] = -1.0
-    return out
+            return -1.0
+
+    out = PL.map_parallel(_one, uniq, workers=workers)
+    return {p: (out.items[i] if out.items[i] is not None else -1.0)
+            for i, p in enumerate(uniq)}
 
 
 # ===========================================================================
@@ -489,7 +556,8 @@ def stage_ingest(dataset: str, files: Sequence[str], opt: OneClickOptions,
     # ---- 找出需要切片的长音频 ----
     items = {u.id: u for u in DS.load_meta(dataset)}
     dur = _durations([items[i].audio_abs(DS.dir_of(dataset))
-                      for i in added if i in items])
+                      for i in added if i in items],
+                     workers=PL.default_workers(len(added), opt.cpu_workers))
     long_uids = []
     for uid in added:
         u = items.get(uid)
@@ -588,33 +656,61 @@ def stage_optimize(dataset: str, opt: OneClickOptions,
         cb(1.0, "已关闭音频优化，跳过")
         return out
 
-    touched: Dict[str, Dict[str, Any]] = {}
-    scores_before, scores_after = [], []
-    n = max(1, len(items))
-    for i, u in enumerate(items):
-        if should_stop and should_stop():
-            out["stopped"] = True
-            break
+    # 待处理的条目（跳过空音频与不可训练的超长原件）
+    todo: List[DS.Utterance] = []
+    for u in items:
         if not u.audio:
             continue
-        # 超长原件（切片后留下的那条）不可训练，别再花时间增强它
         if float(u.duration or 0.0) > float(opt.slice_over_sec):
             out["skipped_long"] += 1
             continue
-        cb(i / n, f"优化 {i + 1}/{len(items)} · {u.id}")
+        todo.append(u)
+
+    n = max(1, len(todo))
+    touched: Dict[str, Dict[str, Any]] = {}
+    scores_before, scores_after = [], []
+
+    def _one(u: DS.Utterance) -> Dict[str, Any]:
+        return _enhance_one(ds_dir, u, opt)
+
+    def _done(i: int, res: Any) -> None:
+        cb(i / n, f"优化 {i + 1}/{len(todo)} · {todo[i].id}")
+
+    # 每条样本：读自己的音频 → 算 → 写自己的文件。彼此独立，所以并行安全，
+    # 而且结果与串行逐字节一致（探针里有对账）。见 training/parallel.py。
+    workers = PL.default_workers(len(todo), opt.cpu_workers)
+    outcome = PL.map_parallel(_one, todo, workers=workers,
+                              should_stop=should_stop, on_done=_done)
+    out["workers"] = outcome.workers
+    out["seconds"] = outcome.seconds
+    out["stopped"] = bool(outcome.stopped)
+
+    for i, u in enumerate(todo):
+        if i in outcome.errors:
+            out["failed"] += 1
+            out.setdefault("errors", []).append(f"{u.id}: {outcome.errors[i]}")
+            continue
+        r = outcome.items[i]
+        if not isinstance(r, dict) or not r.get("ok"):
+            out["failed"] += 1
+            continue
         try:
             scores_before.append(float(u.score or 0.0))
         except Exception:
             pass
-        r = _enhance_one(ds_dir, u, opt)
-        if not r.get("ok"):
-            out["failed"] += 1
-            continue
         touched[u.id] = r["fields"]
         out["enhanced"] += 1
 
+    if opt.denoise:
+        note = AL.denoise_note()
+        if note:
+            # 缺 noisereduce 时 _denoise 会原样返回 —— 这是**静默跳过**，
+            # 必须在报告里说出来，否则用户会以为降噪做过了。
+            out["denoise_note"] = note
+
     FT._apply_meta(dataset, touched)
     DS.refresh_all(dataset, require_features=False,
+                   workers=workers,
                    progress=lambda f, m: cb(0.9 + 0.1 * f, m))
 
     after = {x.id: x for x in DS.load_meta(dataset)}
@@ -627,8 +723,11 @@ def stage_optimize(dataset: str, opt: OneClickOptions,
     if scores_after:
         out["after_avg_score"] = round(sum(scores_after) / len(scores_after), 1)
 
+    tail = f"（{workers} 线程 · {outcome.seconds}s）" if workers > 1 else ""
+    if out.get("denoise_note"):
+        tail += " · 降噪已跳过（未装 noisereduce）"
     cb(1.0, f"优化 {out['enhanced']} 条，平均体检分 "
-            f"{out['before_avg_score']} → {out['after_avg_score']}")
+            f"{out['before_avg_score']} → {out['after_avg_score']}{tail}")
     return out
 
 
@@ -664,9 +763,13 @@ def stage_asr(dataset: str, opt: OneClickOptions,
     sc = RW.RewardScorer(
         RW.RewardOptions(whisper_size=str(opt.whisper_size),
                          language=RW.asr_language(opt.lang)))
+    out["prompt"] = sc.resolve_prompt()
+    out["vram_before_gb"] = sc.vram_free_gb()
     touched: Dict[str, Dict[str, Any]] = {}
     n = max(1, len(todo))
     try:
+        cb(0.01, f"加载 whisper-{opt.whisper_size}"
+                 f"（首次会下载，空闲显存 {out['vram_before_gb']} GB）")
         for i, u in enumerate(todo):
             if should_stop and should_stop():
                 out["stopped"] = True
@@ -688,14 +791,25 @@ def stage_asr(dataset: str, opt: OneClickOptions,
                              "asr_model": f"whisper-{opt.whisper_size}"}
             out["transcribed"] += 1
     finally:
+        # 用完立刻卸载：后面要加载推理引擎（特征是笔大开销），显存必须先腾出来。
+        # medium/large 是 GB 量级，留在卡上会直接导致引擎加载失败或静默降速。
         try:
             sc.unload()
         except Exception:
             pass
 
+    out["loaded_after_unload"] = bool(sc.is_loaded())
+    out["vram_after_gb"] = sc.vram_free_gb()
+    out["freed_gb"] = round(float(out["vram_after_gb"])
+                            - float(out["vram_before_gb"]), 2)
+
     FT._apply_meta(dataset, touched)
+    release = ("已卸载" if not out.get("loaded_after_unload")
+               else "⚠️ 卸载后仍有驻留")
     cb(1.0, f"转写 {out['transcribed']} 条"
-            f"（无输出 {out['empty']}，失败 {out['failed']}）")
+            f"（无输出 {out['empty']}，失败 {out['failed']}）· "
+            f"whisper-{opt.whisper_size} {release}，"
+            f"释放 {out.get('freed_gb')} GB")
     return out
 
 
@@ -980,7 +1094,10 @@ def stage_train(dataset: str, engine, tuning: Dict[str, Any],
         out["error"] = "没有选定的配置，跳过训练"
         return out
 
-    base = opt.dataset_name or dataset
+    # 训练记录名：用户给的「模型名称」优先。单目标就用原名（所见即所得），
+    # 多目标必须加 `_arch` 后缀 —— 否则 CFM 会把 GPT 的记录目录覆盖掉。
+    names = opt.plan_run_names()
+    out["run_names"] = dict(names)
     n = len(chosen)
     results = []
     for i, (arch, pick) in enumerate(chosen.items()):
@@ -994,13 +1111,14 @@ def stage_train(dataset: str, engine, tuning: Dict[str, Any],
                                   "[训练] 卸载引擎，腾出显存给训练器…")
             engine.unload()
 
-        run_name = RN.safe_run_name(f"{base}_{arch}")
+        run_name = names.get(arch) or RN.safe_run_name(f"{arch}_{time.strftime('%H%M%S')}")
         cfg = pick["cfg"]
         opts = pick["options"]
         cb = _sub(progress, bands, "train", f"训练·{arch}",
                   base=i / n, span=1.0 / n)
 
-        cb(0.01, f"{arch} 准备（rank={cfg.rank}, preset={pick['preset']}）")
+        cb(0.01, f"{arch} 准备（名称 {run_name} · rank={cfg.rank} · "
+                f"preset={pick['preset']}）")
         tr = _make_trainer(arch, dataset, cfg, opts, run_name=run_name,
                            val_ratio=float(opt.val_ratio))
         # 名字冲突在 prepare 里才暴露，这里提前挡住并换个名字
@@ -1120,43 +1238,91 @@ def stage_rank(dataset: str, engine, training: Dict[str, Any],
     st = DS.stats(dataset)
     scored: List[Dict[str, Any]] = []
     n = max(1, len(cands))
-    for i, (run, ck, val, arch) in enumerate(cands):
-        if should_stop and should_stop():
-            out["stopped"] = True
-            break
-        cb(0.05 + 0.9 * (i / n), f"评测 {i + 1}/{len(cands)} · {run}/{ck}")
-        opts = EV.EvalOptions(
-            dataset=dataset,
-            out_dir=os.path.join(ONECLICK_ROOT,
-                                 f"{time.strftime('%Y%m%d-%H%M%S')}_rank_{run}_{ck}"),
-            n_samples=int(opt.eval_samples or 0),
-            seed=int(opt.seed),
-            whisper_size=str(opt.whisper_size),
-            language=RW.asr_language(opt.lang),
-        )
-        try:
-            a = EV.Contender(name=f"{run}:{ck}", run=run, checkpoint=ck)
-            res = EV.run_eval(engine, a, None, opts,
-                              progress=lambda f, m: cb(
-                                  0.05 + 0.9 * ((i + f) / n), m),
-                              should_stop=should_stop)
-        except Exception as e:
-            scored.append({"run": run, "checkpoint": ck, "arch": arch,
-                           "val": val, "reward": None, "wer": None, "sim": None,
-                           "n": 0, "error": f"{type(e).__name__}: {e}"})
-            continue
 
-        summ = (res or {}).get("summary", {}) or {}
-        aa = summ.get("a") or {}
-        scored.append({
-            "run": run, "checkpoint": ck, "arch": arch,
-            "val": round(val, 4) if val == val else None,
-            "reward": aa.get("reward"), "wer": aa.get("wer"),
-            "sim": aa.get("sim"), "n": int(aa.get("n") or 0),
-            "out_dir": (res or {}).get("out_dir", ""),
-            "ok": bool((res or {}).get("ok")),
-            "error": ("；".join((res or {}).get("errors") or []) or "")[:200],
-        })
+    # 一个 scorer 服务全部候选：run_eval 只卸载自己创建的 scorer，
+    # 外面传进去的由这里收尾。否则每个候选都要「加载 1.6 GB whisper + 卸掉」，
+    # 6 个候选就是 6 个来回 —— 白等好几分钟，还反复挤压引擎的显存。
+    shared = RW.RewardScorer(RW.RewardOptions(
+        whisper_size=str(opt.score_whisper_size),
+        language=RW.asr_language(opt.lang)))
+
+    # ---- 显存余量体检：这一步是引擎与打分器**同时驻留**的唯一阶段 ----
+    # 实测 8 GB 卡上：引擎 4.94 + whisper medium 1.6 + campplus ≈ 7.8/8.2 GB，
+    # 只剩几百 MB 余量。溢出不会报 OOM，而是在 WDDM 下静默降速 20~30 倍
+    # （CFM 25 步 2.4s → 66s 那种），所以宁可提前说清楚。
+    if getattr(engine, "loaded", False):
+        est = RW.WHISPER_SIZES.get(str(opt.score_whisper_size), (0, 0))[1]
+        try:
+            vr = GD.vram_headroom(need_gb=float(est))
+            if not vr.ok:
+                msg = (f"评分阶段引擎与 whisper-{opt.score_whisper_size}"
+                       f"（约 {est:.2f} GB）需要同时驻留，"
+                       f"当前空闲 {vr.free_gb} GB、缺口 {vr.shortfall_gb} GB —— "
+                       "可能触发 Windows 显存溢出静默降速（不是 OOM）。"
+                       "建议把「打分模型」换成 small，"
+                       "或关掉浏览器等占显存的程序。")
+                out.setdefault("warnings", []).append(msg)
+                if progress:
+                    progress(bands.at("rank", 0.02), "[择优] ⚠️ " + msg)
+        except Exception:
+            pass
+    out["vram_headroom"] = {}
+    try:
+        _vr = GD.vram_headroom()
+        out["vram_headroom"] = {"free_gb": _vr.free_gb, "need_gb": _vr.need_gb,
+                                "level": _vr.level}
+    except Exception:
+        pass
+
+    try:
+        for i, (run, ck, val, arch) in enumerate(cands):
+            if should_stop and should_stop():
+                out["stopped"] = True
+                break
+            cb(0.05 + 0.9 * (i / n), f"评测 {i + 1}/{len(cands)} · {run}/{ck}")
+            opts = EV.EvalOptions(
+                dataset=dataset,
+                out_dir=os.path.join(ONECLICK_ROOT,
+                                     f"{time.strftime('%Y%m%d-%H%M%S')}"
+                                     f"_rank_{run}_{ck}"),
+                n_samples=int(opt.eval_samples or 0),
+                seed=int(opt.seed),
+                whisper_size=str(opt.score_whisper_size),
+                language=RW.asr_language(opt.lang),
+            )
+            try:
+                a = EV.Contender(name=f"{run}:{ck}", run=run, checkpoint=ck)
+                res = EV.run_eval(engine, a, None, opts,
+                                  progress=lambda f, m: cb(
+                                      0.05 + 0.9 * ((i + f) / n), m),
+                                  should_stop=should_stop,
+                                  scorer=shared)
+            except Exception as e:
+                scored.append({"run": run, "checkpoint": ck, "arch": arch,
+                               "val": val, "reward": None, "wer": None,
+                               "sim": None, "n": 0,
+                               "error": f"{type(e).__name__}: {e}"})
+                continue
+
+            summ = (res or {}).get("summary", {}) or {}
+            aa = summ.get("a") or {}
+            scored.append({
+                "run": run, "checkpoint": ck, "arch": arch,
+                "val": round(val, 4) if val == val else None,
+                "reward": aa.get("reward"), "wer": aa.get("wer"),
+                "sim": aa.get("sim"), "n": int(aa.get("n") or 0),
+                "out_dir": (res or {}).get("out_dir", ""),
+                "ok": bool((res or {}).get("ok")),
+                "error": ("；".join((res or {}).get("errors") or []) or "")[:200],
+            })
+    finally:
+        # 无论成功、失败还是被停止，打分器都要还回去（medium 是 1.6 GB）。
+        try:
+            shared.unload()
+        except Exception:
+            pass
+        out["scorer_released"] = not shared.is_loaded()
+        out["vram_after_gb"] = shared.vram_free_gb()
 
     out["candidates"] = scored
     rankable = [x for x in scored if x.get("reward") is not None and x.get("n")]
@@ -1275,6 +1441,16 @@ def run_oneclick(engine, options: OneClickOptions,
     dataset = options.dataset_name
     rep.dataset = dataset
 
+    # ---- 训练记录名预检：名字撞了就在**开工前**拦下 ----
+    # 放到 ingest 之前是刻意的：否则用户要等切片 / 识别 / 特征提取全都跑完，
+    # 才在训练器里发现「这个 run 名已存在」，白等十几分钟。
+    clash = options.check_run_names()
+    if clash:
+        rep.start("ingest", "训练记录名预检")
+        rep.finish("ingest", clash, status="failed")
+        return done("failed", clash)
+    rep.names = dict(options.plan_run_names())
+
     # ---- 输入收集 ----
     got = collect_inputs(paths, extra_path)
     files = got["files"]
@@ -1309,7 +1485,11 @@ def run_oneclick(engine, options: OneClickOptions,
                           rep, bands)
         rep.finish("ingest",
                    f"导入 {st1['added']} 条 · 长音频 {st1['sliced']} 条切成 "
-                   f"{st1['pieces']} 片", seconds=time.perf_counter() - t)
+                   f"{st1['pieces']} 片", seconds=time.perf_counter() - t,
+                   added=st1.get("added"), sliced=st1.get("sliced"),
+                   pieces=st1.get("pieces"),
+                   skipped=len(st1.get("skipped") or []),
+                   failed=len(st1.get("failed") or []))
         if st1.get("stopped"):
             rep.mark("ingest", "skipped")
             return done("stopped", "用户在采集阶段停止")
@@ -1321,10 +1501,21 @@ def run_oneclick(engine, options: OneClickOptions,
         rep.finish("optimize",
                    f"优化 {st2['enhanced']} 条 · 平均体检分 "
                    f"{st2['before_avg_score']} → {st2['after_avg_score']}",
-                   seconds=time.perf_counter() - t)
+                   seconds=time.perf_counter() - t,
+                   enhanced=st2.get("enhanced"), failed=st2.get("failed"),
+                   before_avg_score=st2.get("before_avg_score"),
+                   after_avg_score=st2.get("after_avg_score"),
+                   workers=st2.get("workers"),
+                   denoise_skipped=bool(st2.get("denoise_note")))
         if st2.get("stopped"):
             rep.mark("optimize", "skipped")
             return done("stopped", "用户在优化阶段停止")
+        if st2.get("denoise_note"):
+            rep.add_note("音频优化：" + str(st2["denoise_note"]))
+        if int(st2.get("workers") or 1) > 1:
+            rep.add_note(f"CPU 并行生效：音频优化用 {st2['workers']} 线程，"
+                         f"{st2.get('seconds')} 秒处理完 {st2.get('enhanced')} 条"
+                         "（结果与串行逐字节一致，见 tools/oneclick_probe.py）")
 
         # ---- S3 识别 ----
         rep.start("asr", f"whisper {options.whisper_size} 逐条转写")
@@ -1332,7 +1523,14 @@ def run_oneclick(engine, options: OneClickOptions,
         st3 = stage_asr(dataset, options, progress, should_stop, rep, bands)
         rep.finish("asr",
                    f"转写 {st3['transcribed']} 条（无输出 {st3['empty']} · "
-                   f"失败 {st3['failed']}）", seconds=time.perf_counter() - t)
+                   f"失败 {st3['failed']}）", seconds=time.perf_counter() - t,
+                   whisper=st3.get("whisper"), prompt=st3.get("prompt"),
+                   transcribed=st3.get("transcribed"),
+                   empty=st3.get("empty"), failed=st3.get("failed"),
+                   vram_before_gb=st3.get("vram_before_gb"),
+                   vram_after_gb=st3.get("vram_after_gb"),
+                   freed_gb=st3.get("freed_gb"),
+                   loaded_after_unload=st3.get("loaded_after_unload"))
         if st3.get("stopped"):
             rep.mark("asr", "skipped")
             return done("stopped", "用户在识别阶段停止")

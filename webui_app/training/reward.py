@@ -44,7 +44,30 @@ WHISPER_SIZES: Dict[str, Tuple[float, float]] = {
     "tiny": (39, 0.10), "base": (74, 0.20), "small": (244, 0.55),
     "medium": (769, 1.60), "large-v3": (1550, 3.20), "turbo": (809, 1.70),
 }
-DEFAULT_WHISPER = "small"
+# 默认档位从 small 升到 medium —— small 在中文上会把「西莲」写成「西蓮」、
+# 长句还容易糊成一片，当训练文本用会直接教坏模型（它会照着错字学发音）。
+# medium 参数量约 3.2 倍，中文准确率提升明显；ASR 阶段引擎是卸载状态，
+# 1.6 GB 完全放得下。
+DEFAULT_WHISPER = "medium"
+
+# 语言 → whisper 的 initial_prompt。
+#
+# 这是**修繁体字的关键**：whisper 在 language="zh" 下经常输出繁体
+# （实测 small 把「我是西莲,很高兴见到你」写成「我是西蓮,很高興見到你」）。
+# 给一段简体中文的提示词后，输出会稳定落在简体上 —— 不换模型、零成本，
+# 实测 5/5 条全部纠正。它同时能压低「莫名其妙蹦出一串乱码」的概率。
+LANGUAGE_PROMPTS: Dict[str, str] = {
+    "zh": "以下是普通话的句子。",
+    "en": "This is a sentence in English.",
+    "ja": "これは日本語の文章です。",
+    "es": "Esta es una frase en español.",
+    "ar": "هذه جملة باللغة العربية.",
+}
+
+
+def default_prompt(lang: str) -> str:
+    """按语言给一段默认提示词。未知语言返回空串（不传 prompt）。"""
+    return LANGUAGE_PROMPTS.get(str(lang or "").strip().lower(), "")
 
 _PUNCT = re.compile(
     r"[\s\u3000`~!@#$%^&*()_\-+=\[\]{}\\|;:'\",.<>/?·！？…。，、；：‘’“”"
@@ -109,6 +132,10 @@ class RewardOptions:
     beam_size: int = 5                # 温度 0 + beam，保证同音频两次转写一致
     fp16: bool = True                 # 只在 cuda 上生效
     device: str = ""                  # 空 = 自动（cuda 优先）
+    # 转写提示词：非空则原样使用；留空时按 auto_prompt 取语言默认值。
+    # 默认值的作用见 LANGUAGE_PROMPTS 的说明（修繁体字）。
+    initial_prompt: str = ""
+    auto_prompt: bool = True
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -189,15 +216,38 @@ class RewardScorer:
         return self._device
 
     def unload(self) -> None:
-        """显式归还显存。两个模型都很小，但 DPO 打分完就该还。"""
+        """显式归还显存。两个模型都很小，但打完分就该还。
+
+        一键三连的识别阶段会在用完后立刻调它 —— 引擎随后要加载，
+        显存必须先腾出来（默认 medium 是 1.6 GB，不是可以无视的量）。
+        """
+        import gc
+
         import torch
         self._asr = None
         self._spk = None
+        gc.collect()
         try:
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
+                torch.cuda.ipc_collect()
         except Exception:
             pass
+
+    def is_loaded(self) -> bool:
+        """whisper 或 campplus 是否还驻留在内存/显存里。"""
+        return self._asr is not None or self._spk is not None
+
+    def vram_free_gb(self) -> float:
+        """当前整卡空闲显存（GB）。非 CUDA 返回 0。"""
+        try:
+            import torch
+            if not torch.cuda.is_available():
+                return 0.0
+            free, _total = torch.cuda.mem_get_info(0)
+            return round(free / (1024 ** 3), 2)
+        except Exception:
+            return 0.0
 
     def vram_note(self) -> str:
         p, v = WHISPER_SIZES.get(self.opt.whisper_size, (0, 0))
@@ -277,8 +327,17 @@ class RewardScorer:
         m = self._whisper()
         lang = asr_language(self.opt.language) if self.opt.language else None
         r = m.transcribe(audio_path, language=lang, temperature=0.0,
-                         beam_size=int(self.opt.beam_size))
+                         beam_size=int(self.opt.beam_size),
+                         initial_prompt=self.resolve_prompt() or None)
         return (r.get("text") or "").strip()
+
+    def resolve_prompt(self) -> str:
+        """本次转写实际使用的提示词。显式给了就用显式的。"""
+        if (self.opt.initial_prompt or "").strip():
+            return self.opt.initial_prompt.strip()
+        if not self.opt.auto_prompt:
+            return ""
+        return default_prompt(self.opt.language)
 
     # ------------------------------------------------------------------
     # 组合打分

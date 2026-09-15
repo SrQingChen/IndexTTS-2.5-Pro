@@ -22,6 +22,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional
 
+from webui_app import logging_setup as LOG
 from webui_app.config import AppConfig, refresh_vram_free
 
 
@@ -585,67 +586,188 @@ class TTSEngine:
 
     # -- LoRA（阶段 2 使用，此处仅提供挂载点）------------------------------
 
+    # -- LoRA 挂载 ---------------------------------------------------------
+
+    def _lora_module(self, target: str):
+        """取该目标的当前模块（可能是 PeftModel，也可能是纯底座）。"""
+        tts = self.tts
+        if target == "gpt":
+            return tts.gpt
+        if target == "cfm":
+            return tts.s2mel.models["cfm"]
+        raise EngineError(f"未知 LoRA 目标: {target}")
+
+    def _lora_set_module(self, target: str, mod) -> None:
+        tts = self.tts
+        if target == "gpt":
+            tts.gpt = mod
+        else:
+            tts.s2mel.models["cfm"] = mod
+
+    @staticmethod
+    def _is_wrapped(mod) -> bool:
+        """模块是否已被 PEFT 包过一层。
+
+        **不能只信 `stats.lora_adapters` 这个标签列表** —— 它会和真实状态
+        脱节：`from_pretrained` 中途抛异常时，LoRA 层可能已经注进了底座，
+        却既没被包装也没打上标签。只按标签判断就会在 PeftModel 上再包一层，
+        之后每次挂载都报错，且持续到引擎重载 —— 正是「偶现后持续报错」
+        这种故障形态。所以判断以**模块自身状态**为准。
+        """
+        try:
+            from peft import PeftModel
+            if isinstance(mod, PeftModel):
+                return True
+        except Exception:
+            pass
+        # 兜底：PeftModel 会把底座挂在 .base_model 上
+        return getattr(mod, "base_model", None) is not None
+
+    @staticmethod
+    def _lora_hint(mod) -> str:
+        """给日志用的一句话模块状态描述。"""
+        try:
+            n = sum(1 for m in mod.modules() if hasattr(m, "lora_A"))
+        except Exception:
+            n = -1
+        return (f"{type(mod).__name__}(wrapped="
+                f"{TTSEngine._is_wrapped(mod)}, lora_layers={n})")
+
     def attach_lora(self, adapter_dir: str, target: str = "gpt") -> str:
         """把 LoRA adapter 挂到当前引擎上（已挂着就先卸掉，替换语义）。
 
         target: gpt | cfm。不先卸载的话 PEFT 会把已包装的模块再包一层，
         而 detach 只解一层 —— UI 显示「纯底座」但内层 LoRA 仍在生效，
         这比挂不上严重得多。
+
+        判断「是否已挂着」用**模块真实状态 ∪ 标签**：任何一方与实际脱节
+        都不会造成二次包装（打包后失败的残留也能被清掉）。
         """
+        log = LOG.get_logger("engine.lora")
+        t0 = time.perf_counter()
+        # 先把"请求"记下来：引擎没加载时 self.tts 会直接抛，
+        # 那样就什么痕迹都没有了 —— 而"点了没反应"恰恰最难查。
+        log.info("挂载请求 target=%s dir=%s（引擎已加载=%s）",
+                 target, adapter_dir, self.loaded)
         with self._lock:
             tts = self.tts
             from peft import PeftModel
 
-            if target == "gpt":
-                base = tts.gpt
-            elif target == "cfm":
-                base = tts.s2mel.models["cfm"]
-            else:
+            if target not in ("gpt", "cfm"):
+                log.error("挂载失败：未知目标 %r", target)
                 raise EngineError(f"未知 LoRA 目标: {target}")
 
             if not os.path.isdir(adapter_dir):
+                log.error("挂载失败：adapter 目录不存在 %s", adapter_dir)
                 raise EngineError(f"adapter 目录不存在: {adapter_dir}")
 
-            if any(t.startswith(target + ":")
-                   for t in self.stats.lora_adapters):
+            before = self._lora_module(target)
+            tags = [t for t in self.stats.lora_adapters
+                    if t.startswith(target + ":")]
+            log.info("挂载前状态 target=%s · 当前 %s · 标签 %s",
+                     target, self._lora_hint(before), tags or "无")
+
+            if self._is_wrapped(before) or tags:
+                if not tags:
+                    log.warning(
+                        "目标 %s 已被包装但没有对应标签 —— 状态曾经脱节，"
+                        "先强制卸载再挂。请把这段日志连同报错一起反馈", target)
                 self.detach_lora(target)   # _lock 是 RLock，重入安全
 
-            wrapped = PeftModel.from_pretrained(base, adapter_dir)
-            if target == "gpt":
-                tts.gpt = wrapped
-            else:
-                tts.s2mel.models["cfm"] = wrapped
+            base = self._lora_module(target)
+            try:
+                wrapped = PeftModel.from_pretrained(base, adapter_dir)
+            except Exception:
+                # 失败可能已经把 LoRA 层注进底座却没包装起来。立刻清理：
+                # 否则底座会带着一层随机初始化的旁路继续跑，输出变成垃圾，
+                # 而且看起来像「模型坏了」而不是「挂载失败」。
+                log.error(
+                    "PeftModel.from_pretrained 失败（target=%s dir=%s）：\n%s",
+                    target, adapter_dir, exc_info=True)
+                try:
+                    self.detach_lora(target)
+                    log.warning("已在失败后清理 target=%s 的残留", target)
+                except Exception:
+                    log.error("失败后清理 target=%s 也失败了", target,
+                              exc_info=True)
+                raise EngineError(
+                    f"加载 adapter 失败：{adapter_dir}（详见 error.log）") from None
+
+            self._lora_set_module(target, wrapped)
 
             name = os.path.basename(adapter_dir.rstrip("/\\"))
             tag = f"{target}:{name}"
             if tag not in self.stats.lora_adapters:
                 self.stats.lora_adapters.append(tag)
+            log.info("挂载完成 %s · %.2fs · 之后 %s · 标签 %s",
+                     tag, time.perf_counter() - t0,
+                     self._lora_hint(self._lora_module(target)),
+                     list(self.stats.lora_adapters))
             self._emit("lora_attached", f"已挂载 LoRA {tag}")
             return tag
 
     def detach_lora(self, target: str = "gpt"):
         """卸载 LoRA，恢复 base 模型。"""
+        log = LOG.get_logger("engine.lora")
+        t0 = time.perf_counter()
+        log.info("卸载请求 target=%s（引擎已加载=%s）", target, self.loaded)
         with self._lock:
             tts = self.tts
-            if target == "gpt":
-                mod = tts.gpt
-            elif target == "cfm":
-                mod = tts.s2mel.models["cfm"]
-            else:
-                raise EngineError(f"未知 LoRA 目标: {target}")
+            mod = self._lora_module(target)
+            before = self._lora_hint(mod)
+            tags = [t for t in self.stats.lora_adapters
+                    if t.startswith(target + ":")]
 
             base = getattr(mod, "base_model", None)
             if base is not None and hasattr(mod, "unload"):
-                unwrapped = mod.unload()
-                if target == "gpt":
-                    tts.gpt = unwrapped
-                else:
-                    tts.s2mel.models["cfm"] = unwrapped
+                try:
+                    unwrapped = mod.unload()
+                    self._lora_set_module(target, unwrapped)
+                except Exception:
+                    log.error("卸载 %s 失败（模块状态 %s）", target, before,
+                              exc_info=True)
+                    raise
+            elif tags:
+                # 不是 PeftModel 却带着标签 —— 状态脱节。记下来：
+                # 这类脱节正是一批「持续报错」的源头。
+                log.warning("卸载 %s：模块并非 PeftModel（%s）却带着标签 %s"
+                            " —— 状态脱节，仅清理标签", target, before, tags)
+            else:
+                log.debug("卸载 %s：本来就没挂载（%s）", target, before)
+
             self.stats.lora_adapters = [
                 t for t in self.stats.lora_adapters if not t.startswith(target + ":")
             ]
             self._empty_cache()
+            log.info("卸载完成 %s · %.2fs · %s → %s · 标签 %s",
+                     target, time.perf_counter() - t0, before,
+                     self._lora_hint(self._lora_module(target)),
+                     list(self.stats.lora_adapters) or "无")
             self._emit("lora_detached", f"已卸载 {target} 的 LoRA")
+
+    def lora_status(self) -> List[Dict[str, Any]]:
+        """引擎上 LoRA 的**真实**状态（不信标签，直接看模块）。
+
+        推理页的 LoRA 面板用它显示 —— 标签与模块脱节时立刻看得出来，
+        而不是等用户发现「选了纯底座却还是那个声音」。
+        """
+        out: List[Dict[str, Any]] = []
+        if not self.loaded:
+            return out
+        with self._lock:
+            for target in ("gpt", "cfm"):
+                try:
+                    mod = self._lora_module(target)
+                except Exception as e:
+                    out.append({"target": target, "error": str(e)})
+                    continue
+                wrapped = self._is_wrapped(mod)
+                tags = [t for t in self.stats.lora_adapters
+                        if t.startswith(target + ":")]
+                out.append({"target": target, "wrapped": wrapped, "tags": tags,
+                            "module": type(mod).__name__,
+                            "consistent": bool(wrapped) == bool(tags)})
+        return out
 
     # -- 推理 --------------------------------------------------------------
 

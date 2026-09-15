@@ -18,20 +18,25 @@ from typing import Any, Dict, List
 
 import gradio as gr
 
+from webui_app import logging_setup as LOG
 from webui_app import theme as T
 from webui_app.context import AppContext
+from webui_app.services import audio_lab as AL
 from webui_app.training import dataset as DS
 from webui_app.training import oneclick as OC
+from webui_app.training import parallel as PL
 from webui_app.training import reward as RW
 from webui_app.training.runner import get_runner
 
-# 高级选项控件的顺序，必须与 OPT_KEYS 一一对应（_opts_from 靠位置装配）
+# 高级选项控件的顺序，必须与 OPT_KEYS 一一对应（_opts_from 靠位置装配）。
+# model_name 虽然在主区域（不藏在高级选项里），但同样算一个取值来源。
 OPT_KEYS = [
-    "lang", "slice_target_sec", "slice_min_sec", "slice_over_sec",
-    "slice_max_pieces", "enhance", "denoise", "denoise_strength",
-    "normalize", "trim_silence", "asr", "whisper_size", "min_score",
-    "max_text_repeats", "val_ratio", "arch_list", "preset_mode", "top_k",
-    "rank_eval", "eval_samples", "seed",
+    "model_name", "lang", "slice_target_sec", "slice_min_sec",
+    "slice_over_sec", "slice_max_pieces", "enhance", "denoise",
+    "denoise_strength", "normalize", "trim_silence", "asr", "whisper_size",
+    "score_whisper_size",
+    "min_score", "max_text_repeats", "val_ratio", "arch_list", "preset_mode",
+    "top_k", "rank_eval", "eval_samples", "cpu_workers", "seed",
 ]
 
 LANG_CHOICES = [("中文 (ZH)", "ZH"), ("英语 (EN)", "EN"), ("日语 (JA)", "JA"),
@@ -77,6 +82,22 @@ def plan_markdown(opt: OC.OneClickOptions) -> str:
         L.append(T.err("<br>".join(errs)))
         L.append("")
 
+    # ---- 身份与并行：最常被问到的两件事，放在最前面 ----
+    names = opt.plan_run_names()
+    if names:
+        pairs = " · ".join(f"{a} → <code>{n}</code>" for a, n in names.items())
+        L.append(T.hint(f"训练记录名（模型名称）：{pairs}"
+                        + ("" if (opt.model_name or "").strip()
+                           else "　留空则自动生成，填了便于区分管理")))
+    w = PL.default_workers(99, opt.cpu_workers)
+    L.append(T.hint(
+        f"CPU 并行：<b>{w} 线程</b>"
+        + ("（自动）" if not int(opt.cpu_workers or 0) else "")
+        + "，只作用于音频体检与增强；GPU 阶段串行，结果与串行逐字节一致。"
+        + ("" if AL.noisereduce_available()
+           else "　⚠️ <b>未安装 noisereduce，降噪会被跳过</b>")))
+    L.append("")
+
     rows: List[str] = []
     rows.append(
         "| 阶段 | 自动做什么 | 用到的参数 |")
@@ -94,8 +115,8 @@ def plan_markdown(opt: OC.OneClickOptions) -> str:
     rows.append(
         "| S3 识别与对齐 | 逐条 whisper 转写；**长音频先切片再逐片转写**，"
         "于是文本与音频按「一片一段」配对 | "
-        f"总开关 {_fmt(opt.asr)} · 模型 whisper-{opt.whisper_size} · "
-        f"语言 {opt.lang} |")
+        f"总开关 {_fmt(opt.asr)} · 识别用 whisper-{opt.whisper_size}"
+        f"（产出训练文本）· 语言 {opt.lang} |")
     rows.append(
         "| S4 筛选与划分 | 体检复算 → 丢掉不合格 → 同文本去重 → "
         f"划 train/val | 体检分下限 {_fmt(opt.min_score)} · 同文本最多 "
@@ -114,7 +135,8 @@ def plan_markdown(opt: OC.OneClickOptions) -> str:
         "| S7 择优与交付 | 逐个档位挂载 → 真机合成 → reward 打分 → 排序 → "
         "激活最优 | "
         f"评分开关 {_fmt(opt.rank_eval)} · 每候选评 "
-        f"{opt.eval_samples or '全部'} 条 · 指标 whisper-{opt.whisper_size}"
+        f"{opt.eval_samples or '全部'} 条 · 指标 whisper-"
+        f"{opt.score_whisper_size}（只做相对比较，故意比识别小一档）"
         " + 声纹相似 |")
     L.extend(rows)
 
@@ -186,6 +208,12 @@ def render(ctx: AppContext):
                 lang_dd = gr.Dropdown(choices=LANG_CHOICES, value="ZH",
                                       label="语种",
                                       info="训练语种，也决定语音识别的转写语言")
+                model_name_tb = gr.Textbox(
+                    label="模型名称（训练记录名，便于区分管理）",
+                    value="", placeholder="例：小明_播客_2026",
+                    info="留空则自动生成 oneclick_<时间戳>。"
+                         "两个目标时自动加后缀（_gpt / _cfm）以免互相覆盖；"
+                         "重名会在开工前拦下，不会让你白等一轮训练")
 
             with gr.Row():
                 run_btn = gr.Button("🚀 一键三连（切片→识别→调参→训练→择优）",
@@ -251,9 +279,15 @@ def render(ctx: AppContext):
                     asr_cb = gr.Checkbox(True, label="自动转写为训练文本")
                     whisper_dd = gr.Dropdown(
                         choices=list(RW.WHISPER_SIZES.keys()),
-                        value=RW.DEFAULT_WHISPER, label="whisper 模型",
-                        info="small 在中文上已经够用（0.55 GB）；"
-                             "medium 以上更准但明显更慢更吃显存")
+                        value=RW.DEFAULT_WHISPER, label="识别模型（转写成训练文本）",
+                        info="默认 medium：它的产出**直接成为训练文本**，"
+                             "准确率决定模型学什么，值得用大一点的")
+                    score_whisper_dd = gr.Dropdown(
+                        choices=list(RW.WHISPER_SIZES.keys()),
+                        value="small", label="打分模型（择优时评 reward）",
+                        info="默认 small：打分只在候选之间做**相对比较**，"
+                             "而它运行时引擎还占着显存 —— 用 medium 会挤爆 8 GB 卡，"
+                             "触发 WMDD 静默降速（实测把扩散采样从 0.9s 拖到 25s）".replace("WMDD", "WDDM"))
 
                 with gr.Column(elem_classes=["ix-section"]):
                     gr.HTML(T.section("筛选", "🧽", ""))
@@ -288,6 +322,18 @@ def render(ctx: AppContext):
                                              "它们全部进真机打分，最后激活最优的那一个")
                     seed_nb = gr.Number(42, label="随机种子", precision=0,
                                         info="固定种子才能复现划分与采样")
+
+                with gr.Column(elem_classes=["ix-section"]):
+                    gr.HTML(T.section("性能", "⚡",
+                                      "这里只并行**纯 CPU** 的音频处理（体检与增强）："
+                                      "每条音频各读各写、互不干扰，所以加速与结果无关 —— "
+                                      "输出和串行逐字节一致。GPU 阶段（特征提取、"
+                                      "择优合成）必须串行，不会被动到。"))
+                    cpu_workers_sl = gr.Slider(
+                        0, 4, value=0, step=1,
+                        label="CPU 并行线程数（0 = 自动，1 = 关掉）",
+                        info="自动 = min(4, CPU 核数÷4)，本机约 4 线程。"
+                             "上限 4 是刻意的：训练与推理也要 CPU，抢太狠整体更慢")
 
                 with gr.Column(elem_classes=["ix-section"]):
                     gr.HTML(T.section("择优", "🏆",
@@ -329,11 +375,13 @@ def render(ctx: AppContext):
     # =====================================================================
     # 回调
     # =====================================================================
-    opt_controls = [lang_dd, slice_target_sl, slice_min_sl, slice_over_sl,
-                    slice_pieces_nb, enhance_cb, denoise_cb, denoise_sl,
-                    norm_cb, trim_cb, asr_cb, whisper_dd, min_score_sl,
-                    repeats_nb, val_ratio_sl, arch_cg, preset_dd, topk_sl,
-                    rank_cb, eval_n_sl, seed_nb]
+    opt_controls = [model_name_tb, lang_dd, slice_target_sl, slice_min_sl,
+                    slice_over_sl, slice_pieces_nb, enhance_cb, denoise_cb,
+                    denoise_sl, norm_cb, trim_cb, asr_cb, whisper_dd,
+                    score_whisper_dd,
+                    min_score_sl, repeats_nb, val_ratio_sl, arch_cg,
+                    preset_dd, topk_sl, rank_cb, eval_n_sl, cpu_workers_sl,
+                    seed_nb]
 
     assert len(opt_controls) == len(OPT_KEYS), \
         f"控件数 {len(opt_controls)} 与 OPT_KEYS {len(OPT_KEYS)} 不一致"
@@ -341,11 +389,13 @@ def render(ctx: AppContext):
     def _opts(*vals) -> OC.OneClickOptions:
         return _opts_from(dict(zip(OPT_KEYS, vals)))
 
+    @LOG.ui_guard("oneclick.on_plan")
     def on_plan(*vals):
         return plan_markdown(_opts(*vals))
 
     plan_btn.click(on_plan, inputs=opt_controls, outputs=[panel_md])
 
+    @LOG.ui_guard("oneclick.on_run")
     def on_run(files, extra_path, *vals):
         opt = _opts(*vals)
         errs = [n.message for n in opt.validate() if n.level == "error"]
@@ -381,6 +431,7 @@ def render(ctx: AppContext):
     run_btn.click(on_run, inputs=[files_in, extra_path_tb] + opt_controls,
                   outputs=[panel_md])
 
+    @LOG.ui_guard("oneclick.on_stop")
     def on_stop():
         r = runner.cancel()
         return T.tip(r["message"]) if r.get("ok") else T.warn(r["message"])

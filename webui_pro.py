@@ -66,6 +66,18 @@ def main() -> int:
 
     cfg = config_from_args(sys.argv[1:])
 
+    # 日志要在做任何实事之前就绪：启动阶段的问题同样需要留证据。
+    # 文件落在 outputs/logs/（indextts.log 全量 + error.log 只看问题），
+    # 级别可用 --log-level DEBUG 打开，界面「系统」页也能实时看与切。
+    from webui_app import logging_setup as LOG
+
+    path = LOG.setup(level=cfg.log_level, log_dir=cfg.log_dir or "",
+                     console=not cfg.quiet)
+    LOG.install_excepthooks()
+    LOG.get_logger("main").info(
+        "启动 IndexTTS-2.5 Pro · 版本 %s · 设备 %s · 低显存=%s · 日志级别 %s",
+        cfg.version, cfg.device.backend, cfg.device.low_vram, LOG.level())
+
     # 必需目录先建好，避免运行期各处 makedirs 竞争
     for d in (cfg.output_dir, cfg.tasks_dir, cfg.voice_bank_dir,
               cfg.cache_dir, os.path.join(cfg.output_dir, "lab"),
@@ -80,6 +92,7 @@ def main() -> int:
         favicon_path=_pick_favicon(),
         max_file_size="512mb",
     )
+    LOG.get_logger("main").info("WebUI 已退出；日志见 %s", path or "(控制台)")
     return 0
 
 
