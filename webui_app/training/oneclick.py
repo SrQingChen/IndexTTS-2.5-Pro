@@ -80,6 +80,40 @@ ARCH_LABELS = {"gpt": "GPT(T2S) 语气韵律", "cfm": "CFM(S2M) 音色音质"}
 
 
 # ===========================================================================
+# 引擎状态：需要 GPU 的阶段之前，把不需要的模型真的卸掉
+# ===========================================================================
+
+def ensure_engine_off(engine, tracker=None, reason: str = "") -> Dict[str, Any]:
+    """把推理引擎卸掉并把显存还给驱动。返回一份可记录的状态摘要。
+
+    **为什么必须有这一步（实测）**：应用启动会自动加载引擎（4.94 GB），进流水线
+    若不卸，它会一直占着 —— 到识别阶段再叠一个 whisper medium（1.6 GB），8 GB 卡
+    只剩几百 MB，Windows 把计算挤进共享内存，转写被**静默**拖慢 20~30 倍
+    （实测第一条 10 秒音频卡了 4 分钟以上，日志里只能看到心跳一直刷）。
+    采集切片 / 音频优化 / 语音识别三个阶段全是 CPU 的活，一个 GPU 模型都不需要。
+
+    顺序有讲究：**先放开自己的引擎要求**（`set_engine_req("none")`），否则
+    `engine.unload()` 会被 runner 的 `_busy_runner_engine_req()` 反过来挡住。
+    """
+    was = bool(getattr(engine, "loaded", False))
+    try:
+        if tracker is not None and hasattr(tracker, "set_engine_req"):
+            tracker.set_engine_req("none")
+    except Exception:
+        pass
+    err = ""
+    if was:
+        try:
+            engine.unload()
+        except Exception as e:
+            err = f"{type(e).__name__}: {e}"
+    free = GD.free_vram(reason, LOG.get_logger("oneclick"))
+    return {"was_loaded": was,
+            "now_loaded": bool(getattr(engine, "loaded", False)),
+            "error": err, "vram": free, "reason": reason}
+
+
+# ===========================================================================
 # 选项
 # ===========================================================================
 
@@ -1466,15 +1500,25 @@ def run_oneclick(engine, options: OneClickOptions,
     # ------------------------------------------------------------------
     HEARTBEAT_IDLE = 12.0
     HEARTBEAT_PERIOD = 5.0
+    INFO_PROGRESS_EVERY = 5.0     # 进度行至少间隔这么久才升到 INFO（防刷屏）
     # 先抓住调用方给的进度回调：下面会把 `progress` 这个名字重绑成包装版，
     # 而 Python 闭包捕获的是**变量** —— 不先存一份就会自己调自己，无限递归。
     _user_progress = progress
-    last = {"t": time.time(), "msg": "启动", "frac": 0.0}
+    last = {"t": time.time(), "msg": "启动", "frac": 0.0, "info_t": 0.0}
     hb_stop = threading.Event()
 
     def _progress(frac: float, msg: str) -> None:
-        last.update(t=time.time(), msg=msg, frac=float(frac))
-        log.debug("[%3.0f%%] %s", float(frac) * 100, msg)
+        now = time.time()
+        last.update(t=now, msg=msg, frac=float(frac))
+        # 进度行**限流**升到 INFO：每条都写 INFO 会在切片时刷屏（一条长音频能有
+        # 几百条），全压到 DEBUG 又会让常规级别下「整整几分钟一条日志都没有」——
+        # 那正是没法判断死活的原因。折中：最多每 INFO_PROGRESS_EVERY 秒留一条
+        # INFO，其余走 DEBUG（排查时开 DEBUG 就能拿到全量）。
+        if now - last["info_t"] >= INFO_PROGRESS_EVERY:
+            last["info_t"] = now
+            log.info("[%3.0f%%] %s", float(frac) * 100, msg)
+        else:
+            log.debug("[%3.0f%%] %s", float(frac) * 100, msg)
         if _user_progress is not None:
             _user_progress(frac, msg)
 
@@ -1522,6 +1566,32 @@ def run_oneclick(engine, options: OneClickOptions,
         except Exception:
             pass
 
+    def engine_off(reason: str) -> None:
+        """把引擎卸掉并把显存还回去（见模块级 `ensure_engine_off` 的说明）。"""
+        if progress is not None:
+            progress(last_frac(), f"[显存] 准备卸载推理引擎（{reason}）")
+        st = ensure_engine_off(engine, tracker, reason)
+        if st["error"]:
+            log.warning("卸载引擎失败（%s）：%s", reason, st["error"])
+        log.info("引擎状态：%s → 已卸载=%s · 空闲显存 %.2f GB（释放 %.2f）· %s",
+                 "已加载" if st["was_loaded"] else "未加载", not st["now_loaded"],
+                 st["vram"].get("after_gb"), st["vram"].get("freed_gb"), reason)
+        if progress is not None and st["was_loaded"]:
+            progress(last_frac(),
+                     f"[显存] 引擎已卸载，空闲显存 {st['vram'].get('after_gb')} GB")
+
+    def engine_on(reason: str) -> None:
+        """加载引擎**之前**先清一次显存（把已释放的块还给驱动）。"""
+        set_req("loaded")
+        free = GD.free_vram(f"加载引擎前（{reason}）", log)
+        if progress is not None:
+            progress(last_frac(),
+                     f"[显存] 清理完成，空闲 {free.get('after_gb')} GB，"
+                     f"开始加载引擎（{reason}）")
+
+    def last_frac() -> float:
+        return float(last.get("frac", 0.0))
+
     def done(status: str, error: str = "") -> Dict[str, Any]:
         hb_stop.set()          # 心跳必须停，否则它会在任务结束后继续写日志
         rep.ok = status == "done"
@@ -1549,6 +1619,10 @@ def run_oneclick(engine, options: OneClickOptions,
 
     def stop_checked() -> bool:
         return bool(should_stop and should_stop())
+
+    # 前三个阶段（采集切片 / 音频优化 / 语音识别）都是 CPU 的活，一个 GPU 模型
+    # 都不需要。开机自动加载的引擎会白占 4.94 GB，而识别阶段要叠一个 whisper，
+    # 8 GB 卡上就是「只剩几百 MB → 静默降速 20~30 倍」。所以进流水线先卸掉它。
 
     # ---- 选项自检 ----
     notices = options.validate()
@@ -1590,6 +1664,8 @@ def run_oneclick(engine, options: OneClickOptions,
         return done("failed",
                     "没有找到任何可用音频：请上传音频文件，"
                     "或在「服务器路径」里填一个音频文件 / 目录的路径。")
+
+    engine_off("本轮为 CPU 预处理，用不到引擎")
 
     if progress:
         progress(bands.at("ingest", 0.0),
@@ -1643,6 +1719,8 @@ def run_oneclick(engine, options: OneClickOptions,
                          "（结果与串行逐字节一致，见 tools/oneclick_probe.py）")
 
         # ---- S3 识别 ----
+        # 识别要加载 whisper，务必确认引擎是卸着的（用户可能在别的页面手动加载过）
+        engine_off("识别前确保 whisper 独占显存")
         rep.start("asr", f"whisper {options.whisper_size} 逐条转写")
         t = time.perf_counter()
         st3 = stage_asr(dataset, options, progress, should_stop, rep, bands)
@@ -1678,7 +1756,7 @@ def run_oneclick(engine, options: OneClickOptions,
         if progress:
             progress(bands.at("curate", 1.0),
                      "[特征] 加载引擎提取离线特征（训练时不再碰这些大模型）")
-        set_req("loaded")
+        engine_on("特征提取")
         if not getattr(engine, "loaded", False):
             engine.load()
         ex = FT.extract_dataset(dataset, overwrite=False, only="ready",
@@ -1745,6 +1823,7 @@ def run_oneclick(engine, options: OneClickOptions,
         rep.start("rank", "逐档位真机合成 → reward 打分 → 激活最优")
         t = time.perf_counter()
         set_req("loaded")
+        GD.free_vram("择优评测前", log)
         st7 = stage_rank(dataset, engine, st6, options, progress, should_stop,
                          rep, bands)
         rep.ranking = st7.get("ranking") or []

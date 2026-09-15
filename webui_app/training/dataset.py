@@ -593,6 +593,18 @@ def split_long(name: str, uid: str, target_sec: float = 12.0,
     if not os.path.isfile(ap):
         return {"ok": False, "error": "源音频文件不存在"}
 
+    # ---- 只解码一次，切分搜索与逐片导出都复用它 ----
+    # 不这么做的话：find_segments 解码一次，然后**每一片**再解码一次整个源文件。
+    # 实测一条长音频切 109 片花了 282 秒，绝大部分耗在这 109 次重复解码上。
+    wave = wave_sr = None
+    try:
+        _tick(0.0, f"读取音频 {os.path.basename(ap)}")
+        wave, wave_sr = AL.load_audio(ap)
+    except Exception as e:
+        return {"ok": False, "error": f"读取音频失败：{type(e).__name__}: {e}"}
+    if _stopped():
+        return {"ok": False, "stopped": True, "error": "已取消"}
+
     # ---- 找切分点（占总耗时的大头，进度 0% ~ 75%）----
     dur = AL.probe_duration(ap)
     # 窗口数随时长线性增长：1 小时音频按 1 秒 hop 就是 3600 次评分。
@@ -610,7 +622,7 @@ def split_long(name: str, uid: str, target_sec: float = 12.0,
         ap, target_sec=target_sec, min_sec=min_sec,
         max_candidates=max_pieces * 2, hop_sec=hop,
         progress=(lambda f, m: _tick(0.75 * f, m)) if progress else None,
-        should_stop=should_stop)
+        should_stop=should_stop, y=wave, sr=wave_sr)
     if _stopped():
         return {"ok": False, "stopped": True, "error": "已取消"}
     if not segs:
@@ -643,7 +655,9 @@ def split_long(name: str, uid: str, target_sec: float = 12.0,
         new_id = gen()
         out_rel = os.path.join(AUDIO_SUBDIR, f"{new_id}.wav")
         try:
-            AL.extract_segment(ap, s, os.path.join(d, out_rel))
+            # 复用上面解码好的整段波形（不传就会每片重新解码一遍整个文件）
+            AL.extract_segment(ap, s, os.path.join(d, out_rel),
+                               y=wave, sr=wave_sr)
         except Exception as e:
             fails.append(f"片段 {k + 1}: {type(e).__name__}: {e}")
             continue

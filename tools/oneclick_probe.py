@@ -928,6 +928,126 @@ def main() -> int:
                 DS.delete(nm)
 
         # =================================================================
+        head("[14] 加载模型前卸掉用不到的模型 + 清理显存")
+        # =================================================================
+        import librosa as _lb
+
+        from webui_app.training import guard as GD2
+        from webui_app.training.oneclick import ensure_engine_off
+
+        # -- (a) free_vram 的契约 --
+        fv = GD2.free_vram("probe")
+        check("free_vram 返回前后空闲量",
+              {"before_gb", "after_gb", "freed_gb", "ok"} <= set(fv), str(fv))
+        check("free_vram 不抛异常（无 CUDA 也安全）", "ok" in fv)
+
+        # -- (b) ensure_engine_off：这是「识别卡 4 分钟」那个故障的修复点 --
+        class _FakeEngine:
+            def __init__(self, loaded=True, fail=False):
+                self.loaded = loaded
+                self.fail = fail
+                self.calls = 0
+
+            def unload(self):
+                self.calls += 1
+                if self.fail:
+                    raise RuntimeError("卸载失败")
+                self.loaded = False
+
+        class _FakeTracker:
+            def __init__(self):
+                self.req = None
+
+            def set_engine_req(self, r):
+                self.req = r
+
+        e, t = _FakeEngine(loaded=True), _FakeTracker()
+        st = ensure_engine_off(e, t, "probe")
+        check("**引擎被真的卸载了**（识别阶段不再与它抢显存）",
+              st["was_loaded"] is True and st["now_loaded"] is False
+              and e.calls == 1, str({k: v for k, v in st.items() if k != "vram"}))
+        check("先放开自己的引擎要求，否则 unload 会被 runner 挡住",
+              t.req == "none", str(t.req))
+        check("返回里带显存清理结果", "vram" in st and isinstance(st["vram"], dict))
+
+        e2, t2 = _FakeEngine(loaded=False), _FakeTracker()
+        st2 = ensure_engine_off(e2, t2, "probe")
+        check("本来就没加载时不重复卸载（幂等、无副作用）",
+              e2.calls == 0 and st2["was_loaded"] is False)
+
+        e3 = _FakeEngine(loaded=True, fail=True)
+        st3 = ensure_engine_off(e3, None, "probe")
+        check("卸载失败被记进返回值而不是抛出去（流程不该因它中断）",
+              bool(st3["error"]) and "RuntimeError" in st3["error"],
+              st3["error"])
+        check("没有 tracker 时也能工作", st3["now_loaded"] is True)
+
+        # -- (c) 只解码一次：切片曾经对每片都重新解码整个源文件 --
+        # 实测：598 秒源文件切 109 片，修复前仅解码就 110 次 ≈ 163 秒，
+        # 现在整段只解码一次，全程 2 秒出头。
+        ds_one = "probe_one_decode"
+        if DS.exists(ds_one):
+            DS.delete(ds_one)
+        DS.create(ds_one, note="one-decode probe")
+        bench_src = make_long_wav(os.path.join(tmp, "bench_src.wav"),
+                                  pieces=24, body=2.6, gap=0.45)
+        uid_b = DS.import_audio(ds_one, [bench_src], copy=True,
+                                lang="ZH")["ids"][0]
+        _u = DS.get(ds_one, uid_b)
+        _src_abs = os.path.normcase(os.path.abspath(
+            _u.audio_abs(DS.dir_of(ds_one))))
+
+        _real_load = _lb.load
+        _count = {"src": 0, "other": 0}
+
+        def _counting_load(path, *a, **k):
+            key = ("src" if os.path.normcase(os.path.abspath(str(path)))
+                   == _src_abs else "other")
+            _count[key] += 1
+            return _real_load(path, *a, **k)
+
+        _lb.load = _counting_load
+        try:
+            _r = DS.split_long(ds_one, uid_b, target_sec=8.0, min_sec=4.0,
+                               max_pieces=20)
+        finally:
+            _lb.load = _real_load
+        _n = int(_r.get("created") or 0)
+        check("切片成功（对照组）", bool(_r.get("ok")) and _n >= 2,
+              f"created={_n}")
+        check(f"**源文件全程只解码 1 次**（修复前是 {1 + _n} 次）",
+              _count["src"] == 1, f"实际 {_count['src']} 次，切了 {_n} 片")
+        check("新片段各自的体检仍会解码自己（这是正常的，不是重复解码）",
+              _count["other"] >= _n, f"{_count['other']} 次 / {_n} 片")
+
+        # 直接验证两个函数的 y/sr 参数确实免掉了解码
+        _y, _sr = _lb.load(bench_src, sr=None, mono=True)
+        _seg = AL.Segment(start=0.5, end=2.5, score=90.0, snr_db=20.0,
+                          voiced_ratio=0.9, clip_ratio=0.0, rms_dbfs=-20.0)
+        _count2 = {"n": 0}
+
+        def _counting_load2(path, *a, **k):
+            _count2["n"] += 1
+            return _real_load(path, *a, **k)
+
+        _lb.load = _counting_load2
+        try:
+            AL.extract_segment(bench_src, _seg,
+                               os.path.join(tmp, "seg_out.wav"),
+                               y=_y, sr=_sr)
+            AL.find_segments(bench_src, target_sec=8.0, min_sec=4.0,
+                             max_candidates=4, hop_sec=1.0, y=_y, sr=_sr)
+        finally:
+            _lb.load = _real_load
+        check("传入 y/sr 时 extract_segment / find_segments 不再自己解码",
+              _count2["n"] == 0, f"{_count2['n']} 次")
+        check("导出的片段文件确实存在",
+              os.path.isfile(os.path.join(tmp, "seg_out.wav")))
+
+        if DS.exists(ds_one):
+            DS.delete(ds_one)
+
+        # =================================================================
         head("清理")
         # =================================================================
         for d in (ds_name, ds_small, "probe_par_seq", "probe_par_par"):
@@ -939,7 +1059,8 @@ def main() -> int:
     finally:
         for d in (ds_name, "probe_oneclick_small", "probe_oneclick_dup",
                   "probe_par_seq", "probe_par_par", "probe_slice",
-                  "probe_slice2", "probe_slice3"):
+                  "probe_slice2", "probe_slice3",
+                  "probe_one_decode"):
             try:
                 if DS.exists(d):
                     DS.delete(d)

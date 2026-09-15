@@ -262,17 +262,38 @@ class RewardScorer:
     # ------------------------------------------------------------------
     def _whisper(self):
         if self._asr is None:
+            import time
+
             import whisper
+
+            from webui_app import logging_setup as LOG
+            from webui_app.training import guard as GD
+
+            log = LOG.get_logger("reward.whisper")
             cache = os.path.join(self.model_dir, "hf_cache", "whisper")
+            # 加载前先清一次显存。看着多余，其实是实测踩出来的：8 GB 卡上推理
+            # 引擎常驻 4.94 GB，再叠 whisper medium 1.6 GB 就只剩几百 MB，
+            # Windows 把计算挤进共享内存 → **静默降速 20~30 倍**（一条 10 秒
+            # 音频的转写卡了 4 分钟以上）。清理只能归还已释放的块，所以调用方
+            # 还必须把用不到的模型真的卸掉。
+            info = GD.free_vram(f"加载 whisper-{self.opt.whisper_size} 前", log)
+            t0 = time.perf_counter()
+            log.info("加载 whisper-%s（device=%s，空闲显存 %.2f GB）",
+                     self.opt.whisper_size, self.device, info.get("after_gb"))
             try:
                 self._asr = whisper.load_model(
                     self.opt.whisper_size, device=self.device,
                     download_root=cache)
             except Exception as e:
+                log.error("whisper %s 加载失败", self.opt.whisper_size,
+                          exc_info=True)
                 raise RuntimeError(
                     f"whisper {self.opt.whisper_size} 加载失败：{e}\n"
                     f"缓存目录 {cache}。首次使用需要联网下载"
                     f"（{WHISPER_SIZES.get(self.opt.whisper_size, (0, 0))[0]:.0f}M 参数）。") from e
+            log.info("whisper-%s 就绪 · 加载 %.1fs · 之后空闲 %.2f GB",
+                     self.opt.whisper_size, time.perf_counter() - t0,
+                     self.vram_free_gb())
         return self._asr
 
     def _campplus(self):

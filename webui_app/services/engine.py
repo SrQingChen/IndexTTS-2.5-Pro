@@ -313,6 +313,16 @@ class TTSEngine:
             self.stats.error = ""
             self.stats.notes = []
 
+            # 加载前先清一次显存：只归还**已释放**的块，所以对「上一次卸载没
+            # 彻底」或「别处残留的 IPC 句柄」有帮助。实测价值在于：引擎加载
+            # 前若还留着 whisper/训练器的残影，8 GB 卡上很容易直接失败或
+            # 静默降速，而这一步几乎不花时间。
+            try:
+                from webui_app.training import guard as _GD
+                _GD.free_vram("加载引擎前", LOG.get_logger("engine"))
+            except Exception:
+                pass
+
             missing = self.audit_missing()
             if missing:
                 msg = "模型文件缺失：" + ", ".join(missing)

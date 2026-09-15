@@ -1298,6 +1298,66 @@ class VramReport:
         return "\n".join(L)
 
 
+def free_vram(tag: str = "", logger=None) -> Dict[str, Any]:
+    """尽量把显存还回去，并报告「清理前 → 清理后 → 释放了多少」。
+
+    在**每次加载模型之前**调用它 —— 理由是实测出来的：8 GB 卡上先常驻推理引擎
+    （4.94 GB）再叠一个 whisper medium（1.6 GB）就只剩几百 MB，Windows 会把计算
+    挤到共享内存，表现为**静默降速 20~30 倍**（实测一条 10 秒音频的转写卡了
+    4 分钟以上），而不是报 OOM。
+
+    三件事按顺序做：
+        gc.collect()              回收 Python 侧的引用环（模型对象常在里面）
+        torch.cuda.empty_cache()  把缓存块还给驱动
+        torch.cuda.ipc_collect()  回收其它进程遗留 IPC 句柄占用的显存
+
+    注意：`empty_cache` 只能归还**已释放**的块。若还有对象持有张量（比如引擎
+    还挂着），一点也不会少 —— 所以调用方要先把模型真的卸掉；本函数只负责把
+    已断开的引用真正还给驱动，不负责卸载模型。
+    返回 {"before_gb", "after_gb", "freed_gb", "ok", "tag"}。
+    """
+    out: Dict[str, Any] = {"before_gb": 0.0, "after_gb": 0.0,
+                           "freed_gb": 0.0, "ok": False, "tag": tag}
+    try:
+        import gc
+
+        import torch
+    except Exception:
+        return out
+
+    def _free_gb() -> float:
+        try:
+            free, _total = torch.cuda.mem_get_info(0)
+            return round(free / (1024 ** 3), 2)
+        except Exception:
+            return 0.0
+
+    try:
+        if not torch.cuda.is_available():
+            return out
+        out["before_gb"] = _free_gb()
+        gc.collect()
+        torch.cuda.empty_cache()
+        try:
+            torch.cuda.ipc_collect()
+        except Exception:
+            pass
+        out["after_gb"] = _free_gb()
+        out["freed_gb"] = round(out["after_gb"] - out["before_gb"], 2)
+        out["ok"] = True
+        if logger is not None:
+            logger.info("显存清理%s：空闲 %.2f → %.2f GB（释放 %.2f GB）",
+                        f"（{tag}）" if tag else "", out["before_gb"],
+                        out["after_gb"], out["freed_gb"])
+    except Exception as e:
+        if logger is not None:
+            try:
+                logger.warning("显存清理失败：%s: %s", type(e).__name__, e)
+            except Exception:
+                pass
+    return out
+
+
 def vram_headroom(need_gb: float = 0.0) -> VramReport:
     """查整卡显存的**真实**余量。
 

@@ -394,6 +394,8 @@ def find_segments(
     hop_sec: float = 0.5,
     progress: Optional[Callable[[float, str], None]] = None,
     should_stop: Optional[Callable[[], bool]] = None,
+    y: Optional[np.ndarray] = None,
+    sr: Optional[int] = None,
 ) -> List[Segment]:
     """滑动窗口找出评分最高的若干连续片段。
 
@@ -408,6 +410,9 @@ def find_segments(
     就是 3600 次窗口评分），所以必须能报进度、能被中断 —— 否则上层界面上
     看起来就是「点了没反应」，而这恰恰是最难区分「在工作」和「卡住了」的场景。
     被中断时返回**已经评完的那部分**候选（调用方自行决定要不要用）。
+
+    y / sr：调用方若已经解码过整段音频就传进来，省掉这里的重复解码
+    （切片时会连调这两个函数，一次解码能省下几百 MB 与数秒）。
     """
     import librosa
 
@@ -418,9 +423,10 @@ def find_segments(
     def _stopped() -> bool:
         return bool(should_stop is not None and should_stop())
 
-    # 整段解码是这里最重的一步（长音频几秒到几十秒），先报出来
-    _tick(0.0, f"读取音频 {os.path.basename(path)}")
-    y, sr = librosa.load(path, sr=None, mono=True)
+    if y is None or not sr:
+        # 整段解码是这里最重的一步（长音频几秒到几十秒），先报出来
+        _tick(0.0, f"读取音频 {os.path.basename(path)}")
+        y, sr = librosa.load(path, sr=None, mono=True)
     y = np.asarray(y, dtype=np.float32)
     dur = len(y) / sr
     if dur < min_sec:
@@ -515,13 +521,22 @@ def find_segments(
     return kept
 
 
-def extract_segment(path: str, seg: Segment, out_path: str) -> str:
-    """按 Segment 裁切并导出。"""
-    import librosa
+def extract_segment(path: str, seg: Segment, out_path: str,
+                    y: Optional[np.ndarray] = None,
+                    sr: Optional[int] = None) -> str:
+    """按 Segment 裁切并导出。
 
-    y, sr = librosa.load(path, sr=None, mono=True)
+    y / sr 可以传入**已经解码好的整段波形**。这不是可有可无的优化：不传的话
+    每导出一片就要把整个源文件重新解码一遍，而切片动辄几十上百片 ——
+    实测一条长音频切 109 片花了 282 秒，几乎全耗在这 109 次重复解码上。
+    调用方（dataset.split_long）现在只解码一次，然后逐片复用。
+    """
+    if y is None or not sr:
+        import librosa
+        y, sr = librosa.load(path, sr=None, mono=True)
+    y = np.asarray(y, dtype=np.float32)
     a, b = int(seg.start * sr), int(seg.end * sr)
-    save_audio(out_path, np.asarray(y[a:b], dtype=np.float32), sr)
+    save_audio(out_path, y[max(0, a):max(0, b)], sr)
     return out_path
 
 
