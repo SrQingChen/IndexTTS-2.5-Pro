@@ -21,6 +21,7 @@ from webui_app import theme as T
 from webui_app import widgets as W
 from webui_app.config import EMO_BIAS, EMO_SUM_LIMIT, EMO_VECTOR_LABELS
 from webui_app.context import AppContext
+from webui_app.services import audio_lab as AL
 from webui_app.services import inference as INF
 from webui_app.services import pronunciation as PR
 from webui_app import logging_setup as LOG
@@ -131,7 +132,7 @@ def _lora_state_html(eng) -> str:
         mean = None
         try:
             mod = (getattr(eng.tts, "gpt", None) if tgt == "gpt"
-                   else eng.tts.s2mel.models.get("cfm"))
+                   else GD.lora_target_module(eng, tgt))
             if mod is not None:
                 mean = float(GD.get_adapter_scale(mod).get("_mean", 1.0))
         except Exception:
@@ -285,6 +286,29 @@ def render(ctx: AppContext):
                     lora_mount_btn = gr.Button("🧬 挂载到引擎", size="sm", scale=1)
                     lora_unmount_btn = gr.Button("卸载 LoRA", size="sm", scale=1)
                 lora_state_html = gr.HTML(_lora_state_html(eng))
+
+            # ---------- 输出后处理（提亮 / 空气感） ----------
+            with gr.Column(elem_classes=["ix-section"]):
+                gr.HTML(T.section(
+                    "输出后处理", "✨",
+                    "IndexTTS2 的输出固定 <b>22050 Hz</b>（11 kHz 上限）—— 这是模型"
+                    "设计，不是处理链弄丢的。这里做的是<b>听感补偿</b>：把已有的"
+                    "清晰度抬出来、用高频自身的谐波补一点空气感，<b>不伪造细节</b>。<br>"
+                    "默认只做高通与峰值对齐；想更亮就调 presence，想要空气感再加 exciter。"))
+                polish_cb = gr.Checkbox(
+                    True, label="启用输出后处理",
+                    info="关掉则输出与模型原始结果完全一致（最保真）")
+                with gr.Row():
+                    polish_presence = gr.Slider(
+                        0.0, 6.0, 2.5, step=0.5, label="提亮 presence (dB)",
+                        info="4.5 kHz 以上平滑抬升。2~4 dB 明显更「亮」更清楚，"
+                             "超过 5 容易齿音发刺")
+                    polish_exciter = gr.Slider(
+                        0.0, 0.3, 0.08, step=0.01, label="空气感激励",
+                        info="从 5 kHz 以上生成谐波、只叠加 9 kHz 以上的部分。"
+                             "0.05~0.15 是安全区；再高会明显失真")
+                polish_md = gr.Markdown(
+                    T.hint("生成后这里会显示谱质心前后对比 —— 「亮了没有」有客观数字。"))
 
             # ---------- 文本 ----------
             with gr.Column(elem_classes=["ix-section"]):
@@ -479,9 +503,10 @@ def render(ctx: AppContext):
         v0, v1, v2, v3, v4, v5, v6, v7, emo_text, emo_rand,
         do_sample, top_p, top_k, temperature, num_beams,
         rep_pen, len_pen, max_mel,
-        # 末尾 3 个不是合成参数，而是「挂哪个 LoRA」—— 它们必须排在
-        # _collect 的 keys 之后，由 on_generate 单独解包（见下）。
+        # 末尾这几个不是合成参数：3 个「挂哪个 LoRA」+ 3 个「输出后处理」。
+        # 它们必须排在 _collect 的 keys 之后，由 on_generate 单独解包（见下）。
         lora_run_dd, lora_ckpt_dd, lora_scale_sl,
+        polish_cb, polish_presence, polish_exciter,
     ]
 
     def _collect(*vals) -> Dict[str, Any]:
@@ -546,7 +571,8 @@ def render(ctx: AppContext):
 
     @LOG.ui_guard("synthesize.on_generate", slow_sec=1.0)
     def on_generate(*vals, progress=gr.Progress(track_tqdm=False)):
-        *core, lora_run, lora_ckpt, lora_scale = vals
+        (*core, lora_run, lora_ckpt, lora_scale,
+         pol_on, pol_presence, pol_exciter) = vals
         raw = _collect(*core)
         raw["emo_control_method"] = W.emo_mode_index(raw["emo_control_method"])
         # 记下本次参数快照，供「预设管理」页的「保存当前参数」使用
@@ -563,7 +589,7 @@ def render(ctx: AppContext):
                 return (gr.update(),
                         T.err(f"<b>加载失败</b>：{e}"),
                         ctx.status_html(),
-                        _lora_state_html(eng))
+                        _lora_state_html(eng), gr.update())
 
         # 选的 LoRA 与挂的不一致就先挂上，再合成。挂不上就**中止** ——
         # 用户指定了音色却用底座出声，听起来"像"但其实是错模型，比报错更糟。
@@ -572,7 +598,7 @@ def render(ctx: AppContext):
             gr.Error(lora_note.replace("<br>", " "))
             return (gr.update(),
                     T.err(f"<b>未合成</b>：{lora_note}"),
-                    ctx.status_html(), _lora_state_html(eng))
+                    ctx.status_html(), _lora_state_html(eng), gr.update())
 
         try:
             progress(0.05, desc="准备中…")
@@ -580,12 +606,12 @@ def render(ctx: AppContext):
         except EngineError as e:
             gr.Error(str(e))
             return (gr.update(), T.err(f"<b>合成失败</b>：{e}"),
-                    ctx.status_html(), _lora_state_html(eng))
+                    ctx.status_html(), _lora_state_html(eng), gr.update())
         except Exception as e:
             gr.Error(f"{type(e).__name__}: {e}")
             return (gr.update(),
                     T.err(f"<b>合成失败</b>：{type(e).__name__}: {e}"),
-                    ctx.status_html(), _lora_state_html(eng))
+                    ctx.status_html(), _lora_state_html(eng), gr.update())
 
         kw = res["kwargs"]
         rtf = res.get("rtf")
@@ -604,10 +630,41 @@ def render(ctx: AppContext):
         if kw.get("emo_audio_prompt"):
             rows.append(("情感参考", f'`{os.path.basename(kw["emo_audio_prompt"])}`'))
 
+        # 输出后处理：**另存**一个文件，原始输出保留，方便 A/B 对比
+        pol_note = ""
+        pol_report = gr.update()
+        out_audio_value = res["path"]
+        if pol_on:
+            pol_path = os.path.join(
+                os.path.dirname(res["path"]),
+                os.path.splitext(os.path.basename(res["path"]))[0]
+                + "_polish.wav")
+            pr = AL.polish(res["path"], pol_path,
+                           presence_db=float(pol_presence or 0.0),
+                           exciter=float(pol_exciter or 0.0))
+            if pr.ok:
+                out_audio_value = pol_path
+                rows = [(k, (f"`{os.path.basename(pol_path)}`"
+                             if k == "输出文件" else v))
+                        for k, v in rows]
+                arrow = ("提亮了" if pr.centroid_after > pr.centroid_before + 30
+                         else "基本持平" if abs(pr.centroid_after
+                                             - pr.centroid_before) <= 30
+                         else "变暗了")
+                pol_note = T.tip(
+                    f"✨ 已后处理：谱质心 <b>{pr.centroid_before:.0f} → "
+                    f"{pr.centroid_after:.0f} Hz</b>（{arrow}）")
+                pol_report = gr.update(value=AL.polish_markdown(pr))
+            else:
+                pol_note = T.warn(f"后处理失败，已用原始输出：{pr.error}")
+        else:
+            pol_report = gr.update(value=T.hint(
+                "未启用输出后处理 —— 输出与模型原始结果一致（最保真）。"))
+
         info = "\n".join([
             '<div class="ix-tip">✅ <b>合成完成</b></div>',
             "| 项 | 值 |", "|---|---|",
-        ] + [f"| {a} | {b} |" for a, b in rows]) + lora_note
+        ] + [f"| {a} | {b} |" for a, b in rows]) + lora_note + pol_note
 
         if getattr(eng.tts, "low_vram", False) and len(req.text or "") > 40:
             info += T.warn(
@@ -615,11 +672,12 @@ def render(ctx: AppContext):
                 "逐块独立合成后拼接。块与块之间韵律不接续是正常现象，不是 bug。"
                 "缓解办法见「参数手册 → 显存策略 → 低显存自动分块」。")
 
-        return res["path"], info, ctx.status_html(), _lora_state_html(eng)
+        return (out_audio_value, info, ctx.status_html(),
+                _lora_state_html(eng), pol_report)
 
     gen_btn.click(
         on_generate, inputs=all_inputs,
-        outputs=[out_audio, out_info, sb, lora_state_html],
+        outputs=[out_audio, out_info, sb, lora_state_html, polish_md],
     )
 
     # ---------- LoRA 选择与挂载 ----------

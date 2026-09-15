@@ -513,3 +513,58 @@ outputs/lab/爱弥斯_seg0_1789453703_seg0_1789453727.wav       44 字节   ← 
 **另一件值得记的事**：这次日志里看到用户 14:22 的一键三连**成功跑完了**
 （968 秒 ≈ 16 分钟，产出 `爱弥斯_cfm/ckpt-e002-s000036`）—— 说明前几轮的修复
 （引擎卸载 / 只解码一次 / 不转写不可训练样本）都生效了。
+
+---
+
+## 阶段 3.12 · LoRA 挂载报错 + 音频处理升级（已完成）
+
+用户反馈两件事：「切换加载 lora 的时候报了一些错」；
+「合成出的声音不是很干净有点哑……人声里高频部分是被裁掉了吗？」
+
+### 一、LoRA 报错：`ModuleDict` 没有 `.get()`
+
+```
+AttributeError: 'ModuleDict' object has no attribute 'get'
+  File "webui_app/training/merge.py", line 93, in set_scale
+    else engine.tts.s2mel.models.get("cfm"))
+```
+
+`s2mel.models` 是 `torch.nn.ModuleDict`（不是 `dict` 子类），**挂载 CFM adapter
+且强度 ≠ 1.0** 时必炸；GPT 那一支走 `getattr(tts, "gpt")` 所以一直没暴露。
+6 处同类写法（deploy_tab / synthesize / merge / evaluate×3）全部改为
+`guard.lora_target_module()`，对 dict 与 ModuleDict 都安全。
+
+**为什么测试没发现**：`merge_probe` 的替身用的是**普通 dict**，`.get()` 在那里合法。
+替身比真实对象宽松 → 测试反而掩护了 bug。探针已改用真实的 `nn.ModuleDict`，
+并把「空 ModuleDict / 缺 key / ModuleDict 取子模块不抛」都钉成断言（25 → 29 项）。
+
+### 二、音频「发闷」的诊断（全部实测，不猜）
+
+| 检查项 | 结果 |
+|---|---|
+| 训练音频质量 | SNR 中位 **54.9 dB**（最低 34.9）、体检分中位 85 —— 干净，不是噪声问题 |
+| 增强链是否损失高频 | **不损失**：处理前后频段能量完全一致，唯一变化是重采样到模型要求的 22050 Hz |
+| CFM LoRA 是否让声音变闷 | **反而更亮**：8~11 kHz 5.27% → 5.91%，谱质心 3304 → 3562 Hz |
+| 真正的上限 | **模型输出固定 22050 Hz（Nyquist 11 kHz）** —— 上游设计，改不了 |
+
+结论：**不是处理链裁掉了高频**。但实测也确认了两个可以改进的地方，都已落地。
+
+| ID | 内容 | 状态 | 验收证据 |
+|---|---|---|---|
+| k1 | **分频段降噪**：8 kHz 以上保留原始信号（`DENOISE_KEEP_HIGH_HZ`） | `[x]` | lab_probe：降噪后 8~11 kHz 能量 40.88% → 78.74%（细节保住） |
+| k2 | **不再谎报降噪**：缺 noisereduce 时步骤写明「已跳过」 | `[x]` | lab_probe：monkeypatch 探测为 False → 步骤文案正确切换 |
+| k3 | 装上 noisereduce（阿里镜像）+ `uv sync --extra denoise` | `[x]` | pyproject 增加 extra，`uv lock` 已刷新（192 包） |
+| k4 | **前置高通 60 Hz**（去隆隆声/直流） | `[x]` | lab_probe：0-60 Hz 能量 73.53% → 0.96%，语音频段不受影响 |
+| k5 | **TPDF 抖动**（16-bit 写入前，固定种子） | `[x]` | lab_probe：确定性 + 幅度 ≤1 LSB |
+| k6 | **后置「输出提亮」**：presence + 谐波激励 + 峰值对齐 | `[x]` | lab_probe：中性档质心 3336→3356（不动），presence +3 → 3898，+激励 → 4212 |
+| k7 | 接进合成页（默认开启温和档，另存 `*_polish.wav`） | `[x]` | build_check / ui_output_check 通过；端到端实测质心 3562 → 3946 Hz |
+| k8 | 5 个新参数进手册（新分组「输出后处理（提亮）」） | `[x]` | 手册渲染通过，参数总数 83 |
+
+**自己踩到并修掉的一个坑**：激励最初用 `preemphasis`/`deemphasis` 那一对实现，
+但 `deemphasis` 是 `1/(1-0.95z⁻¹)`，直流增益 20 倍 —— 作用在**未预加重的主信号**上
+会把低频整体抬起来。实测谱质心从 3355 Hz **掉到 788 Hz**、99.98% 能量挤进 0-4 kHz，
+声音直接闷掉。改成真正的 butter 高通滤波后正常（激励只叠加 9 kHz 以上）。
+探针里加了「激励不得让谱质心大幅下降」这条断言。
+
+**没做也做不到的**：真实的 11 kHz 以上信息。模型不生成，任何后处理都变不出来 ——
+后处理只是听感补偿（EQ + 自身谐波延展），这一点在手册与 README 里都写明了。

@@ -214,8 +214,7 @@ def run_eval(engine, a: Contender, b: Optional[Contender],
     for tag in pre_attached:
         tgt = tag.split(":", 1)[0]
         try:
-            mod = (getattr(engine.tts, "gpt", None) if tgt == "gpt"
-                   else engine.tts.s2mel.models.get("cfm"))
+            mod = GD.lora_target_module(engine, tgt)
             if mod is not None:
                 pre_scales[tgt] = float(
                     GD.get_adapter_scale(mod).get("_mean", 1.0))
@@ -241,8 +240,7 @@ def run_eval(engine, a: Contender, b: Optional[Contender],
             if adir:
                 engine.attach_lora(adir, target=arch)
                 if float(c.adapter_scale) != 1.0:
-                    mod = (getattr(engine.tts, "gpt", None) if arch == "gpt"
-                           else engine.tts.s2mel.models.get("cfm"))
+                    mod = GD.lora_target_module(engine, arch)
                     if mod is not None:
                         GD.set_adapter_scale(mod, float(c.adapter_scale))
             # 每条样本对 A/B 用同一个种子：差异只来自模型，不来自采样起点。
@@ -339,8 +337,7 @@ def run_eval(engine, a: Contender, b: Optional[Contender],
                 d = _find_adapter_dir(name)
                 if d:
                     engine.attach_lora(d, target=tgt)
-                    mod = (getattr(engine.tts, "gpt", None) if tgt == "gpt"
-                           else engine.tts.s2mel.models.get("cfm"))
+                    mod = GD.lora_target_module(engine, tgt)
                     if mod is not None:
                         GD.set_adapter_scale(mod,
                                              float(pre_scales.get(tgt, 1.0)))

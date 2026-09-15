@@ -311,7 +311,7 @@ def render(ctx: AppContext):
         for t in tags:
             tgt = t.split(":", 1)[0]
             mod = (getattr(engine.tts, "gpt", None) if tgt == "gpt"
-                   else engine.tts.s2mel.models.get("cfm"))
+                   else GD.lora_target_module(engine, tgt))
             sc = GD.get_adapter_scale(mod) if mod is not None else {}
             cur = sc.get("_mean", 1.0)
             lines.append(f"- `{t}` · 当前强度 **{cur:.2f}**")

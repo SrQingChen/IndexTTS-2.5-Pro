@@ -23,6 +23,17 @@ import numpy as np
 
 from webui_app.config import OUTPUT_SAMPLE_RATE, REF_AUDIO_IDEAL
 
+# 降噪时**高频段保留原始信号**的频率下限。
+#
+# noisereduce 是宽带门限：它在所有频段一起估计噪声底，而人声的齿音、气声、
+# 咬字细节恰好集中在 7~11 kHz —— 一起压下去，听感就是「闷」「哑」「像蒙了层布」。
+# 这里把降噪结果与原始信号**按频率拼回来**：这条线以下用降噪结果（去掉嘶声、
+# 嗡声、房间底噪），以上用原始（细节一点不动）。
+#
+# 8 kHz 是经验值：高于它的能量在语音里占比很小（实测参考素材 8~11 kHz 仅约 5%），
+# 但人耳对它的有无非常敏感（决定「通透」还是「发闷」）。
+DENOISE_KEEP_HIGH_HZ = 8000.0
+
 AUDIO_EXTS = (".wav", ".flac", ".mp3", ".ogg", ".m4a", ".opus", ".aac", ".wma")
 
 
@@ -38,8 +49,8 @@ def load_audio(path: str, sr: Optional[int] = None) -> Tuple[np.ndarray, int]:
     return np.asarray(y, dtype=np.float32), orig_sr
 
 
-def save_audio(path: str, y: np.ndarray, sr: int):
-    """写 WAV。**拒绝写出 0 个采样点**。
+def save_audio(path: str, y: np.ndarray, sr: int, dither: bool = True):
+    """写 WAV（PCM_16）。**拒绝写出 0 个采样点**。
 
     没有这道闸门时，一次越界切分就会生成一个只有 44 字节文件头的 wav（能写、
     能打开、听不到任何声音），后续体检判「音频为空」，用户看到的就是
@@ -56,6 +67,15 @@ def save_audio(path: str, y: np.ndarray, sr: int):
     peak = float(np.max(np.abs(y))) if len(y) else 0.0
     if peak > 1.0:            # 防削波
         y = y / peak * 0.999
+    # 写 16 bit 前加 **TPDF 抖动**：直接取整会产生与信号相关的量化失真，
+    # 在安静段、尾音、气声处听起来像「砂砾感 / 不干净」。抖动把这些失真
+    # 变成不相关的低电平噪声，代价是极低的底噪，听感明显更干净。
+    # 固定种子 → 同样的输入永远得到同样的字节，可复现（也保证了并行/
+    # 串行输出逐字节一致的那条回归断言仍然成立）。
+    if dither:
+        lsb = 1.0 / 32768.0
+        rng = np.random.default_rng(20240915)
+        y = y + (rng.random(y.shape) - rng.random(y.shape)) * (lsb * 0.5)
     sf.write(path, y.astype(np.float32), sr, subtype="PCM_16")
     return path
 
@@ -622,6 +642,8 @@ def enhance(
     resample: bool = True,
     target_sr: int = OUTPUT_SAMPLE_RATE,
     max_sec: float = 15.0,
+    highpass_hz: float = 60.0,
+    denoise_keep_high_hz: float = DENOISE_KEEP_HIGH_HZ,
 ) -> EnhanceResult:
     """一站式增强：去 DC → 裁静音 → 降噪 → 响度归一 → 重采样 → 限长。
 
@@ -639,11 +661,20 @@ def enhance(
         y, sr = load_audio(path)
         steps = []
 
-        # 1) 去 DC 偏移
+        # 1) 去 DC 偏移 + 高通（去掉 60 Hz 以下的隆隆声/空调声/手持噪声）
         dc = float(np.mean(y))
         if abs(dc) > 1e-4:
             y = y - dc
             steps.append(f"去除 DC 偏移 {dc:+.4f}")
+        if 20.0 <= float(highpass_hz) < sr / 2 * 0.9 and len(y) > 64:
+            try:
+                from scipy.signal import butter, sosfiltfilt
+                sos = butter(2, float(highpass_hz) / (sr / 2),
+                             btype="highpass", output="sos")
+                y = np.asarray(sosfiltfilt(sos, y), dtype=np.float32)
+                steps.append(f"高通 {highpass_hz:.0f} Hz（去低频隆隆声）")
+            except Exception:
+                pass    # 高通失败不影响其它步骤
 
         # 2) 裁掉首尾静音
         if trim_silence:
@@ -652,10 +683,18 @@ def enhance(
                 steps.append(f"裁掉首尾静音 {(len(y)-len(y2))/sr:.2f}s")
                 y = y2
 
-        # 3) 降噪
+        # 3) 降噪（高频段保留原始信号，避免把齿音/气息细节一起压掉）
         if denoise and denoise_strength > 0:
-            y = _denoise(y, sr, denoise_strength)
-            steps.append(f"频谱降噪（强度 {denoise_strength:.2f}）")
+            y2, did = _denoise(y, sr, denoise_strength, denoise_keep_high_hz)
+            if did:
+                y = y2
+                steps.append(
+                    f"分频段降噪（强度 {denoise_strength:.2f}，"
+                    f"{denoise_keep_high_hz / 1000:.0f} kHz 以上保留原始细节）")
+            else:
+                # **不能谎报**：没装 noisereduce 时这一步什么都没做，
+                # 却写「频谱降噪」会让用户以为声音已经被处理过了。
+                steps.append("降噪已跳过（未安装 noisereduce，其余步骤照常）")
 
         # 4) 响度归一
         if normalize:
@@ -729,17 +768,23 @@ def denoise_note() -> str:
             "noisereduce</code>")
 
 
-def _denoise(y: np.ndarray, sr: int, strength: float) -> np.ndarray:
+
+def _denoise(y: np.ndarray, sr: int, strength: float,
+             keep_high_hz: float = DENOISE_KEEP_HIGH_HZ
+             ) -> Tuple[np.ndarray, bool]:
     """频谱门限降噪。strength 0~1 映射到 noisereduce 的 prop_decrease。
 
-    没有 noisereduce 时原样返回 —— 调用方应先问 `noisereduce_available()`
-    并把「已跳过」明确告知用户，不要让这步看起来像是做过了。
+    返回 (处理后的音频, 是否真的降噪了)。**没有 noisereduce 时原样返回且
+    第二个值为 False** —— 调用方必须把「已跳过」如实告知用户，
+    不要让这一步看起来像是做过了。
+
+    keep_high_hz 以上保留原始信号，见 DENOISE_KEEP_HIGH_HZ 的说明。
     """
     if not noisereduce_available():
-        return y
+        return y, False
     try:
         import noisereduce as nr
-        return np.asarray(
+        den = np.asarray(
             nr.reduce_noise(
                 y=y, sr=sr, prop_decrease=float(np.clip(strength, 0.0, 1.0)),
                 stationary=False, n_fft=1024, win_length=1024, hop_length=256,
@@ -749,7 +794,24 @@ def _denoise(y: np.ndarray, sr: int, strength: float) -> np.ndarray:
     except Exception:
         # 运行期失败（异常参数、NaN 输入等）不该连累整条样本的增强：
         # 原样返回，其余步骤继续。缺包的情况由上面的能力探测单独处理。
-        return y
+        return y, False
+
+    # 频带拼接：把高频细节从降噪结果里换回原始信号
+    if keep_high_hz and 0 < keep_high_hz < sr / 2 and len(den) == len(y):
+        try:
+            import librosa
+            n_fft, hop = 1024, 256
+            Sd = librosa.stft(den, n_fft=n_fft, hop_length=hop)
+            So = librosa.stft(y, n_fft=n_fft, hop_length=hop)
+            freqs = librosa.fft_frequencies(sr=sr, n_fft=n_fft)
+            hi = freqs >= float(keep_high_hz)
+            if Sd.shape == So.shape and hi.any():
+                Sd[hi] = So[hi]
+                den = librosa.istft(Sd, hop_length=hop, length=len(y))
+                den = np.asarray(den, dtype=np.float32)
+        except Exception:
+            pass          # 拼接失败就退回宽带降噪结果，不影响主流程
+    return den, True
 
 
 def _normalize(y: np.ndarray, target_dbfs: float) -> np.ndarray:
@@ -765,6 +827,183 @@ def _normalize(y: np.ndarray, target_dbfs: float) -> np.ndarray:
     if peak > limit:
         out = out * (limit / peak)
     return out.astype(np.float32)
+
+
+# ---------------------------------------------------------------------------
+# 输出后处理：给合成结果「提亮 / 加空气感」
+# ---------------------------------------------------------------------------
+
+@dataclass
+class PolishResult:
+    """输出后处理的结果。ok=False 时带 error。"""
+
+    ok: bool = False
+    path: str = ""
+    error: str = ""
+    steps: List[str] = field(default_factory=list)
+    duration: float = 0.0
+    sample_rate: int = 0
+    centroid_before: float = 0.0     # 谱质心（Hz）—— 「亮」的客观参考
+    centroid_after: float = 0.0
+    peak_before_dbfs: float = 0.0
+    peak_after_dbfs: float = 0.0
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
+def _centroid_hz(y: np.ndarray, sr: int) -> float:
+    try:
+        import librosa
+        return round(float(np.mean(
+            librosa.feature.spectral_centroid(y=y.astype(np.float32), sr=sr))), 1)
+    except Exception:
+        return 0.0
+
+
+def polish(
+    path: str,
+    out_path: str,
+    highpass_hz: float = 60.0,
+    presence_hz: float = 4500.0,
+    presence_db: float = 0.0,
+    exciter: float = 0.0,
+    exciter_from_hz: float = 5000.0,
+    target_peak_dbfs: float = -1.0,
+) -> PolishResult:
+    """对**合成输出**做听感提亮。默认中性（只做高通与峰值对齐）。
+
+    为什么需要它：IndexTTS2 的输出固定 22050 Hz，**Nyquist 11 kHz 以上不可能有
+    能量** —— 这是模型设计，不是处理链弄丢的（实测增强链前后各频段能量完全一致，
+    而且 LoRA 反而让 8~11 kHz 略多）。拿 48 kHz 的原始素材去比，听感上就会觉得
+    「发闷、不够通透」。这个函数做的**不是**伪造细节，而是两件也够实在的事：
+
+        1. **presence 提升**：4.5 kHz 以上平滑抬升若干 dB。人耳对这段（齿音、
+           咬字清晰度）最敏感，抬一点就明显更「亮」更清楚 —— 是 EQ，不是合成。
+        2. **谐波激励（可选）**：从 5 kHz 以上的成分生成谐波并混回，在 11 kHz
+           以上补出**属于这段音频自身**的泛音，缓解「高频被切断」的封闭感。
+           不引入外来素材，只是把已有高频做非线性延展。
+
+    再加上一个 60 Hz 高通（去掉合成偶发的低频隆隆声）与目标峰值归一
+    （避免削波，也避免下游播放器自行衰减）。
+
+    默认 presence_db=0、exciter=0 → **音色不变**，只做高通与峰值对齐。
+    想提亮就把 presence_db 调到 2~4 dB（先听后定），需要空气感再加 0.05~0.15 的
+    exciter。任何一项都可在合成页开关，不必重训模型。
+    """
+    res = PolishResult()
+    try:
+        y, sr = load_audio(path)
+        if len(y) == 0:
+            res.error = "音频为空"
+            return res
+        res.duration = float(len(y) / sr)
+        res.sample_rate = sr
+        res.centroid_before = _centroid_hz(y, sr)
+        res.peak_before_dbfs = float(20 * np.log10(max(float(np.max(np.abs(y))), 1e-10)))
+        steps: List[str] = []
+
+        # 1) 高通：去掉低频隆隆声。这些能量不参与听感，却会占掉动态余量、
+        #    并在峰值归一时逼着整体降电平。
+        if 20.0 <= float(highpass_hz) < sr / 2 * 0.9 and len(y) > 64:
+            try:
+                from scipy.signal import butter, sosfiltfilt
+                sos = butter(2, float(highpass_hz) / (sr / 2),
+                             btype="highpass", output="sos")
+                y = np.asarray(sosfiltfilt(sos, y), dtype=np.float32)
+                steps.append(f"高通 {highpass_hz:.0f} Hz")
+            except Exception:
+                pass
+
+        # 2) presence 提升（FFT 域平滑搁架；用 STFT 避免整段 FFT 的边缘环绕）
+        if abs(float(presence_db)) > 0.05 and 500.0 < float(presence_hz) < sr / 2:
+            try:
+                import librosa
+                n_fft, hop = 2048, 512
+                S = librosa.stft(y, n_fft=n_fft, hop_length=hop)
+                freqs = librosa.fft_frequencies(sr=sr, n_fft=n_fft)
+                # 一个倍频程的升余弦过渡：够平滑，不会在转折频率处产生可闻的"硬边"
+                f0 = float(presence_hz)
+                gain = np.ones_like(freqs)
+                lo, hi = f0 / 2.0, f0
+                ramp = np.clip((freqs - lo) / max(1e-6, (hi - lo)), 0.0, 1.0)
+                smooth = 0.5 * (1.0 - np.cos(np.pi * ramp))      # 升余弦
+                gain = 1.0 + smooth * (10 ** (float(presence_db) / 20.0) - 1.0)
+                S = S * gain[:, None]
+                y = np.asarray(librosa.istft(S, hop_length=hop, length=len(y)),
+                               dtype=np.float32)
+                steps.append(f"presence +{presence_db:.1f} dB @ {presence_hz:.0f} Hz")
+            except Exception:
+                pass
+
+        # 3) 谐波激励（可选）：只从高频成分生成，形成属于本段音频的泛音
+        amt = float(exciter)
+        if 0.0 < amt <= 1.0 and float(exciter_from_hz) < sr / 2:
+            try:
+                # 用**真正的滤波器**做，不要用 preemphasis/deemphasis 那一对：
+                # deemphasis 是 1/(1-0.95z⁻¹)，直流增益高达 20 倍。把它作用在
+                # **未预加重的主信号**上会把低频整体抬起来 —— 实测谱质心从
+                # 3355 Hz 掉到 788 Hz、99.98% 能量挤进 0-4 kHz，声音直接闷掉。
+                # （preemphasis 与 deemphasis 必须成对作用在同一路信号上。）
+                from scipy.signal import butter, sosfiltfilt
+
+                def _hp(sig, hz):
+                    sos = butter(2, hz / (sr / 2), btype="highpass", output="sos")
+                    return np.asarray(sosfiltfilt(sos, sig), dtype=np.float32)
+
+                # ① 取高频成分 ② 非线性生成谐波（去掉线性项，只留新增）
+                # ③ 只保留 8 kHz 以上的"空气"：以下已有真实内容，加了只会变糊
+                h = _hp(y, max(6000.0, float(exciter_from_hz)))
+                h = np.tanh(h * 3.0) - h
+                h = _hp(h, min(9000.0, sr / 2 * 0.85))
+                pk_h = float(np.max(np.abs(h))) or 1.0
+                h = h / pk_h * 0.25
+                # 主信号原样保留，只叠加新增的空气感
+                y = np.asarray(y + amt * h, dtype=np.float32)
+                steps.append(f"谐波激励 {amt:.2f}"
+                             f"（从 {exciter_from_hz / 1000:.0f} kHz 生成，"
+                             "只叠加 9 kHz 以上的空气感）")
+            except Exception:
+                pass
+
+        # 4) 峰值对齐（避免削波，也避免下游播放器自行衰减）
+        peak = float(np.max(np.abs(y)))
+        if peak > 0:
+            target = 10 ** (float(target_peak_dbfs) / 20.0)
+            if peak > target:
+                y = y * (target / peak)
+                steps.append(f"峰值对齐到 {target_peak_dbfs:.1f} dBFS")
+
+        res.peak_after_dbfs = float(20 * np.log10(max(float(np.max(np.abs(y))), 1e-10)))
+        save_audio(out_path, y, sr)
+        res.path = out_path
+        res.steps = steps
+        res.centroid_after = _centroid_hz(y, sr)
+        res.ok = True
+    except Exception as e:
+        res.error = f"{type(e).__name__}: {e}"
+    return res
+
+
+def polish_markdown(r: PolishResult) -> str:
+    """后处理结果的可读说明（含谱质心前后对比，方便判断「亮了没有」）。"""
+    if not r.ok:
+        return f"**后处理失败**：{r.error}"
+    L = [f"### {'✅' if r.ok else '🔴'} 输出后处理完成", ""]
+    L += ["| 指标 | 处理前 | 处理后 |", "|---|---|---|",
+          f"| 谱质心（越高越亮） | {r.centroid_before:.0f} Hz | "
+          f"**{r.centroid_after:.0f} Hz** |",
+          f"| 峰值 | {r.peak_before_dbfs:.1f} dBFS | {r.peak_after_dbfs:.1f} dBFS |",
+          f"| 时长 | {r.duration:.2f}s | {r.duration:.2f}s |", ""]
+    if r.steps:
+        L.append("**执行的处理**")
+        L += [f"{i+1}. {s}" for i, s in enumerate(r.steps)]
+    else:
+        L.append("· 未做任何改动（参数都是中性值）。")
+    L += ["", "<sub>模型输出固定 22050 Hz（11 kHz 上限），这里做的是"
+              "**听感补偿**——把已有的清晰度抬出来、给高频做自身谐波延展，"
+              "不伪造外来细节。想更亮就调 presence，想要空气感再加 exciter。</sub>"]
+    return "\n".join(L)
 
 
 def enhance_markdown(r: EnhanceResult) -> str:

@@ -1298,6 +1298,35 @@ class VramReport:
         return "\n".join(L)
 
 
+def lora_target_module(engine, target: str = "gpt"):
+    """取引擎上某个 LoRA 目标（gpt|cfm）当前挂着的模块；取不到返回 None。
+
+    **不要写成 `tts.s2mel.models.get("cfm")`。** `models` 是
+    `torch.nn.ModuleDict` —— 它不是 `dict` 的子类、**没有 `.get()`**，那行会抛
+    `AttributeError: 'ModuleDict' object has no attribute 'get'`。
+    实测症状：挂载 **CFM** adapter 且强度非 1.0 时，`set_scale` 直接炸，
+    界面上就是「加载 LoRA 出错」。（GPT 那一支走 `getattr(tts, "gpt")`，
+    所以一直没暴露出来。）
+
+    这个 bug 还能藏这么久，是因为 merge_probe 里的替身用的是**普通 dict**，
+    `.get()` 在那边完全合法 —— 替身的类型必须跟真实对象一致，否则测试
+    反而在掩护 bug。探针里已改成 `nn.ModuleDict`。
+    """
+    try:
+        tts = engine.tts
+    except Exception:
+        return None
+    if target == "gpt":
+        return getattr(tts, "gpt", None)
+    models = getattr(getattr(tts, "s2mel", None), "models", None)
+    if models is None:
+        return None
+    try:
+        return models["cfm"]
+    except Exception:
+        return None
+
+
 def free_vram(tag: str = "", logger=None) -> Dict[str, Any]:
     """尽量把显存还回去，并报告「清理前 → 清理后 → 释放了多少」。
 

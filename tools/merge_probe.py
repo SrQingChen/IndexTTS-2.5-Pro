@@ -16,6 +16,7 @@ import tempfile
 from types import SimpleNamespace
 
 import torch
+import torch.nn as nn
 
 from webui_app.training import cfm_lora as CL               # noqa: E402
 from webui_app.training import forward as FW                # noqa: E402
@@ -375,9 +376,29 @@ def main() -> int:
         got2 = GD.get_adapter_scale(pm_s)
         check("set_scale(1.0) 从名义值重算，不会累积漂移",
               abs(got2["_min"] - 1.0) < 1e-9 and abs(got2["_max"] - 1.0) < 1e-9)
-        check("cfm 目标拿不到模块时安全返回 0",
+        # 关键：替身必须用**真实类型** nn.ModuleDict。之前这里用的是普通 dict，
+        # 而 dict 有 .get()、ModuleDict 没有 —— 于是
+        # `tts.s2mel.models.get("cfm")` 这个会抛 AttributeError 的写法
+        # 在探针里一路通过，真机上却让「挂载 CFM adapter」直接失败。
+        # 替身比真实对象宽松，测试反而在掩护 bug。
+        _md_empty = nn.ModuleDict()
+        check("cfm 目标为空 ModuleDict 时安全返回 0（真实类型）",
               MG.set_scale(SimpleNamespace(tts=SimpleNamespace(
-                  s2mel=SimpleNamespace(models={"cfm": None}))), 0.5, "cfm") == 0)
+                  s2mel=SimpleNamespace(models=_md_empty))), 0.5, "cfm") == 0)
+        check("cfm 目标缺 key 时安全返回 0",
+              MG.set_scale(SimpleNamespace(tts=SimpleNamespace(
+                  s2mel=SimpleNamespace(models=nn.ModuleDict(
+                      {"other": nn.Linear(2, 2)})))), 0.5, "cfm") == 0)
+        check("**ModuleDict 上取子模块不会抛 AttributeError**"
+              "（曾经的真实故障：'ModuleDict' object has no attribute 'get'）",
+              GD.lora_target_module(SimpleNamespace(tts=SimpleNamespace(
+                  s2mel=SimpleNamespace(models=nn.ModuleDict(
+                      {"cfm": nn.Linear(2, 2)})))), "cfm") is not None)
+        check("普通 dict 也照样支持（历史调用方）",
+              GD.lora_target_module(SimpleNamespace(tts=SimpleNamespace(
+                  s2mel=SimpleNamespace(models={"cfm": "X"}))), "cfm") == "X")
+        check("引擎未加载（tts 抛异常）时返回 None 而不是崩",
+              GD.lora_target_module(SimpleNamespace(), "cfm") is None)
 
         fe = FakeEngine()
         tag = MG.mount_run(fe, "runM", scale=1.0)

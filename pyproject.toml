@@ -85,6 +85,15 @@ dependencies = [
 webui = [
   "gradio==5.45.0",
 ]
+# 参考音频降噪（可选）。**没装也能用**：增强链会在报告里写明「降噪已跳过」，
+# 其余步骤（高通 / 裁静音 / 响度归一 / 重采样）照常执行。
+# 装上之后 `_denoise` 走的是**分频段**降噪：8 kHz 以上保留原始信号，
+# 只压掉嘶声/嗡声/房间底噪 —— 整带降噪会把人声的齿音与气息一起抹掉，
+# 听感就是「闷」「哑」。
+# 安装：`uv sync --extra denoise`（或 uv pip install noisereduce）
+denoise = [
+  "noisereduce>=3.0.3",
+]
 # To install the DeepSpeed support, use `uv sync --extra deepspeed` (or `--all-extras`).
 deepspeed = [
   "deepspeed==0.17.1",

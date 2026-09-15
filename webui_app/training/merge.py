@@ -89,8 +89,7 @@ def unmount(engine, target: str = "gpt") -> None:
 def set_scale(engine, factor: float, target: str = "gpt") -> int:
     """推理期强度旋钮：0=纯底座，1=完整 LoRA，0.6~0.8=常见折中。"""
     log = LOG.get_logger("merge")
-    mod = (getattr(engine.tts, "gpt", None) if target == "gpt"
-           else engine.tts.s2mel.models.get("cfm"))
+    mod = GD.lora_target_module(engine, target)
     if mod is None:
         log.warning("设强度失败：target=%s 上没有模块（引擎未加载？）", target)
         return 0
