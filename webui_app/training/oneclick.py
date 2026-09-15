@@ -40,6 +40,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import threading
 import time
 from dataclasses import asdict, dataclass, field
@@ -77,6 +78,71 @@ STAGES: List[Tuple[str, str, float]] = [
 STAGE_TITLE = {k: t for k, t, _ in STAGES}
 
 ARCH_LABELS = {"gpt": "GPT(T2S) 语气韵律", "cfm": "CFM(S2M) 音色音质"}
+
+
+# ===========================================================================
+# 文本卫生：识别出来的「退化文本」必须挡在训练之外
+# ===========================================================================
+
+# whisper 在笑声 / 音乐 / 噪声片段上会「幻听」出固定套话，这不是内容。
+# 只收长度 ≥4 的**具体**短语，避免把正常口语里的「订阅」「关注」误伤。
+HALLUCINATION_PHRASES: Tuple[str, ...] = (
+    "请不吝点赞", "字幕由", "谢谢观看", "感谢观看", "请勿盗用",
+    "有需要字幕", "明镜与点点", "字幕组", "小铃铛",
+    "thanks for watching", "thank you for watching", "subscribe",
+    "amara.org", "mbc news",
+)
+
+_REPEAT_RUN = re.compile(r"(.){5,}")          # 同一字符连续 6 次以上
+_TEXT_PUNCT = re.compile(
+    r"[\s　`~!@#$%^&*()_\-+=\[\]{\|;:'\",.<>/?·！？…。，、；："
+    r"‘’“”（）《》〈〉【】〔〕％＃＠＆＊－＋＝｜｛｝／＼「」～￥]+")
+
+
+def degenerate_text_reason(text: str, min_chars: int = 2) -> str:
+    """判断一段（自动生成的）文本是不是退化输出。正常返回空串。
+
+    为什么需要这个闸门 —— 实测事故：一条 **11.4 秒**的音频被 whisper 转成了
+    **446 个「哈」**（不同字符数 = 1）。它的后果是双重的：
+
+      · 作为**训练文本**：等于教模型「输出一长串同一个字」；
+      · 作为**评测文本**：合成时 GPT 自回归会陷入重复循环，446 字又触发
+        低显存自动分块（每块 ≤40 字）= 12 块，一条样本要 **8~11 分钟** ——
+        6 个候选就是近一小时，整轮择优卡在这一条上。
+
+    判据（任一命中即视为退化）：
+      · 去掉空白与标点后有效字符不足；
+      · 只有一个字符（整条都是同一个字）；
+      · 最常见字符占比 ≥50%；
+      · 存在 6 个以上连续重复字符；
+      · 长文本的不同字符占比过低（重复度过高）；
+      · 命中 whisper 常见幻听套话。
+    """
+    t = str(text or "").strip()
+    if not t:
+        return "空文本"
+    core = _TEXT_PUNCT.sub("", t)
+    if len(core) < int(min_chars):
+        return f"有效字符不足 {min_chars} 个"
+    counts: Dict[str, int] = {}
+    for ch in core:
+        counts[ch] = counts.get(ch, 0) + 1
+    top_ch, top_n = max(counts.items(), key=lambda kv: kv[1])
+    if len(counts) == 1:
+        return f"整条只有「{top_ch}」一个字（{top_n} 次）"
+    if top_n / len(core) >= 0.5:
+        return f"「{top_ch}」一个字占了 {top_n / len(core):.0%}（{top_n}/{len(core)}）"
+    if _REPEAT_RUN.search(core):
+        return "存在 6 个以上连续重复字符"
+    if len(core) >= 8 and len(counts) / len(core) < 0.15:
+        return f"重复度过高（不同字符仅 {len(counts)}/{len(core)}）"
+    # 短语要拿**原文**比：core 已把空格也去掉了，英文短语会被拼成一串
+    # （"thanks for watching" → "thanksforwatching"）而匹配不上。
+    low = t.lower()
+    for phr in HALLUCINATION_PHRASES:
+        if phr in low:
+            return f"命中 whisper 常见幻听套话「{phr}」"
+    return ""
 
 
 # ===========================================================================
@@ -866,7 +932,7 @@ def stage_asr(dataset: str, opt: OneClickOptions,
     cb = _sub(progress, bands, "asr", "识别")
     items = DS.load_meta(dataset)
     out = {"total": len(items), "transcribed": 0, "empty": 0, "failed": 0,
-           "kept_existing": 0, "whisper": opt.whisper_size}
+           "degenerate": 0, "kept_existing": 0, "whisper": opt.whisper_size}
 
     if not opt.asr:
         out["skipped"] = True
@@ -935,6 +1001,22 @@ def stage_asr(dataset: str, opt: OneClickOptions,
                 out["empty"] += 1
                 touched[u.id] = {"note": (u.note + " | ASR 无输出").strip(" |")}
                 continue
+            # 退化文本（整条一个字的重复、幻听套话…）不能进训练集：它既会教坏
+            # 模型，又会在评测里把合成拖成几分钟。见 degenerate_text_reason
+            # 的说明（实测那条 446 个「哈」）。
+            bad = degenerate_text_reason(txt)
+            if bad:
+                out["degenerate"] += 1
+                out.setdefault("degenerate_ids", []).append(u.id)
+                # asr_text 留档便于复核，但 text 留空 → 后续筛选会剔除它
+                touched[u.id] = {
+                    "asr_text": txt, "text": "",
+                    "asr_model": f"whisper-{opt.whisper_size}",
+                    "note": ((u.note + " | ") if u.note else "")
+                            + f"ASR 输出异常：{bad}（已剔除）"}
+                log.info("丢弃退化转写 %s：%s · 原文前 40 字：%r",
+                         u.id, bad, txt[:40])
+                continue
             touched[u.id] = {"text": txt, "asr_text": txt,
                              "asr_model": f"whisper-{opt.whisper_size}"}
             out["transcribed"] += 1
@@ -989,6 +1071,16 @@ def stage_curate(dataset: str, opt: OneClickOptions, progress=None,
     drop: Dict[str, str] = {}
     seen_text: Dict[str, int] = {}
     for u in items:
+        # 退化文本先判：ASR 标记过的按标记给原因，其余按内容判（这样即使
+        # 是别人给的、或早期数据集里的退化文本也拦得住）
+        if "ASR 输出异常" in (u.note or ""):
+            drop[u.id] = "ASR 输出异常（退化文本）"
+            continue
+        if u.status == "ready":
+            bad = degenerate_text_reason(u.text)
+            if bad:
+                drop[u.id] = f"文本异常：{bad}"
+                continue
         if u.status != "ready":
             drop[u.id] = f"状态 {u.status}"
             continue
@@ -1382,6 +1474,9 @@ def stage_rank(dataset: str, engine, training: Dict[str, Any],
     if not getattr(engine, "loaded", False):
         cb(0.02, "加载引擎用于评测…")
         engine.load()
+    # 引擎加载完再清一次：它会申请一批峰值显存，把已释放的块还给驱动，后面
+    # 加载打分模型（whisper）时余量更宽松（实测能多挤出几百 MB）
+    GD.free_vram("引擎加载后、加载打分模型前", LOG.get_logger("oneclick.rank"))
 
     st = DS.stats(dataset)
     scored: List[Dict[str, Any]] = []
@@ -1437,6 +1532,12 @@ def stage_rank(dataset: str, engine, training: Dict[str, Any],
                 seed=int(opt.seed),
                 whisper_size=str(opt.score_whisper_size),
                 language=RW.asr_language(opt.lang),
+                # 优先挑**短**样本：合成长度由文本决定，一条超长文本能把单个
+                # 候选的评测从十几秒拖到十几分钟（实测踩过）
+                pick="short",
+                # 合成预算再收一档（600 帧 ≈ 24 秒）：短样本本来用不到这么多，
+                # 它只在模型陷入重复循环时充当刹车，压低最坏情况
+                max_mel_tokens=600,
             )
             try:
                 a = EV.Contender(name=f"{run}:{ck}", run=run, checkpoint=ck)
@@ -1776,6 +1877,8 @@ def run_oneclick(engine, options: OneClickOptions,
                    seconds=time.perf_counter() - t,
                    skipped_untrainable=st3.get("skipped_untrainable"),
                    skipped_untrainable_ids=st3.get("skipped_untrainable_ids"),
+                   degenerate=st3.get("degenerate"),
+                   degenerate_ids=st3.get("degenerate_ids"),
                    whisper=st3.get("whisper"), prompt=st3.get("prompt"),
                    transcribed=st3.get("transcribed"),
                    empty=st3.get("empty"), failed=st3.get("failed"),
@@ -1783,6 +1886,13 @@ def run_oneclick(engine, options: OneClickOptions,
                    vram_after_gb=st3.get("vram_after_gb"),
                    freed_gb=st3.get("freed_gb"),
                    loaded_after_unload=st3.get("loaded_after_unload"))
+        if st3.get("degenerate"):
+            rep.add_note(
+                f"识别阶段丢弃了 {st3['degenerate']} 条**退化文本**"
+                f"（整条同一个字重复 / whisper 幻听套话等）："
+                f"{', '.join((st3.get('degenerate_ids') or [])[:5])}"
+                "。这类文本既会教坏模型，又会在评测里把合成拖成几分钟"
+                "（实测那条 446 个「哈」让 6 个候选的评测多花近一小时）。")
         if st3.get("skipped_untrainable"):
             rep.add_note(
                 f"识别阶段跳过了 {st3['skipped_untrainable']} 条**不可训练**的样本"

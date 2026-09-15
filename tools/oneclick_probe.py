@@ -1162,6 +1162,152 @@ def main() -> int:
             DS.delete(ds_asr)
 
         # =================================================================
+        head("[16] 退化文本过滤 + 择优优先选短样本")
+        # =================================================================
+        # 来源是一起真实事故：一条 11.4 秒的音频被 whisper 转成 **446 个「哈」**。
+        # 后果是双重的 —— 它成了训练文本（教模型输出一长串同一个字），
+        # 又让择优评测里每个候选都要 8~11 分钟（446 字触发低显存自动分块 = 12 块，
+        # 每块都可能撞上重复循环），6 个候选近一小时。
+        from webui_app.training import evaluate as EV2
+
+        D = OC.degenerate_text_reason
+        for txt, bad, why in [
+            ("哈" * 446, True, "**用户遇到的那条**（446 个「哈」）"),
+            ("。" * 30, True, "整条标点、没有有效字符"),
+            ("好好好好好好", True, "整条只有同一个字"),
+            ("哈哈哈哈这是好", True, "单字占多数（57%）"),
+            ("啊啊啊，这是正常句子，只是重复了几个语气词", False,
+             "语气词重复但主体是正常句子（**不该误伤**）"),
+            ("", True, "空文本"),
+            ("a", True, "有效字符太少"),
+            ("请不吝点赞 订阅 转发 打赏", True, "whisper 中文幻听套话"),
+            ("Thanks for watching!", True, "whisper 英文幻听套话"),
+            ("今天天气不错，我们一起去公园散步吧，听说湖边的花都开了。", False,
+             "正常长句"),
+            ("哈哈,工作狂,我就知道你会这么说。阿列夫一,要解决他的问题,不会太容易。",
+             False, "数据集里的真实样本（含「哈哈」但不该误伤）"),
+            ("结果四人小队变成二人小队了呢,哈哈,我应该不算。", False,
+             "另一条真实样本"),
+            ("IndexTTS can clone a voice from just a few seconds.", False,
+             "正常英文"),
+        ]:
+            check(f"退化判定：{why}", bool(D(txt)) is bad,
+                  f"{D(txt) or '正常'}")
+
+        # -- 识别阶段：退化输出不许写成训练文本 --
+        ds_dg = "probe_degenerate"
+        for nm in (ds_dg,):
+            if DS.exists(nm):
+                DS.delete(nm)
+        DS.create(ds_dg, note="degenerate probe")
+        _srcs = [make_wav(os.path.join(tmp, f"dg{i}.wav"), 4.0, seed=200 + i)
+                 for i in range(4)]
+        _imp2 = DS.import_audio(ds_dg, _srcs, copy=True, lang="ZH")
+        _uids = list(_imp2["ids"])
+        _bad_id = _uids[1]
+
+        class _DegenScorer:
+            def __init__(self, opt=None, model_dir=None):
+                pass
+
+            def resolve_prompt(self):
+                return "以下是普通话的句子。"
+
+            def vram_free_gb(self):
+                return 6.9
+
+            def is_loaded(self):
+                return False
+
+            def unload(self):
+                pass
+
+            def transcribe(self, path):
+                if os.path.basename(path) == _bad_id + ".wav":
+                    return "哈" * 446
+                return f"这是 {os.path.basename(path)} 的正常转写"
+
+        _real2 = RW2.RewardScorer
+        RW2.RewardScorer = _DegenScorer
+        try:
+            _st_dg = OC.stage_asr(ds_dg, OC.OneClickOptions(), progress=None)
+        finally:
+            RW2.RewardScorer = _real2
+
+        check("**退化转写被丢弃**（不计入 transcribed）",
+              _st_dg.get("degenerate") == 1
+              and _st_dg.get("degenerate_ids") == [_bad_id],
+              f"degenerate={_st_dg.get('degenerate')} "
+              f"ids={_st_dg.get('degenerate_ids')}")
+        check("其余样本照常转写", int(_st_dg.get("transcribed") or 0) == 3,
+              str(_st_dg.get("transcribed")))
+        _u_bad = DS.get(ds_dg, _bad_id)
+        check("退化样本的 text 留空（所以进不了训练）",
+              not (_u_bad.text or "").strip(), repr(_u_bad.text)[:30])
+        check("退化样本的 asr_text 留档（便于复核）",
+              "哈" in (_u_bad.asr_text or ""), (_u_bad.asr_text or "")[:20])
+        check("退化样本被标注原因", "ASR 输出异常" in (_u_bad.note or ""),
+              (_u_bad.note or "")[:60])
+
+        # -- 筛选阶段：第二道防线也要拦得住（含「别人给的」退化文本）--
+        _st_cur = OC.stage_curate(ds_dg, OC.OneClickOptions(max_text_repeats=0),
+                                  progress=None)
+        check("筛选阶段把退化样本剔除（原因说得明白）",
+              "ASR" in str(_st_cur.get("dropped")),
+              str(_st_cur.get("dropped")))
+        _left = [u for u in DS.load_meta(ds_dg)
+                 if not D(u.text) and u.status == "ready"]
+        check("留下的样本文本都正常",
+              all(not D(u.text) for u in _left) and len(_left) == 3,
+              f"{len(_left)} 条")
+
+        # 手写/导入的退化文本（没走 ASR 那条路）也要拦得住
+        _u2 = DS.get(ds_dg, _uids[2])
+        DS.update(ds_dg, _u2.id, text="。。" * 20)
+        DS.refresh_all(ds_dg, require_features=False)
+        _st_cur2 = OC.stage_curate(ds_dg, OC.OneClickOptions(max_text_repeats=0),
+                                   progress=None)
+        check("非 ASR 来源的退化文本也被拦下（内容判定）",
+              "文本异常" in str(_st_cur2.get("dropped")),
+              str(_st_cur2.get("dropped")))
+
+        if DS.exists(ds_dg):
+            DS.delete(ds_dg)
+
+        # -- 择优选样本：short 策略优先挑短文本 --
+        check("EvalOptions 默认仍是 first（评测页行为不变）",
+              EV2.EvalOptions().pick == "first", EV2.EvalOptions().pick)
+        check("pick 取值受校验",
+              any("pick" in n.message for n in
+                  EV2.EvalOptions(pick="nope").validate()
+                  if n.level == "error"))
+
+        ds_pick = "probe_pick"
+        if DS.exists(ds_pick):
+            DS.delete(ds_pick)
+        DS.create(ds_pick, note="pick probe")
+        _p_srcs = [make_wav(os.path.join(tmp, f"pk{i}.wav"), 3.0, seed=300 + i)
+                   for i in range(4)]
+        _p_imp = DS.import_audio(ds_pick, _p_srcs, copy=True, lang="ZH")
+        _texts = ["短", "中等长度的句子大概这样", "很长很长" * 12, "中等长度的一句"]
+        DS.apply_fields(ds_pick, {uid: {"text": t}
+                                  for uid, t in zip(_p_imp["ids"], _texts)})
+        DS.refresh_all(ds_pick, require_features=False)
+        _ready_pick = [u for u in DS.load_meta(ds_pick) if u.status == "ready"]
+        _want = sorted(_ready_pick, key=lambda u: (
+            len(u.text), float(u.duration or 0)))[:2]
+        _expect = sorted(len(t) for t in _texts)[:2]
+        check("short 策略排在最前的就是文本最短的",
+              [len(u.text) for u in _want] == _expect,
+              f"{[len(u.text) for u in _want]} vs 期望 {_expect}")
+        check("最长的那条不会被选中（单条评测时长因此可控）",
+              len(_texts[2]) > 40
+              and all(len(u.text) < 40 for u in _want),
+              f"最长 {len(_texts[2])} 字")
+        if DS.exists(ds_pick):
+            DS.delete(ds_pick)
+
+        # =================================================================
         head("清理")
         # =================================================================
         for d in (ds_name, ds_small, "probe_par_seq", "probe_par_par"):
@@ -1174,7 +1320,8 @@ def main() -> int:
         for d in (ds_name, "probe_oneclick_small", "probe_oneclick_dup",
                   "probe_par_seq", "probe_par_par", "probe_slice",
                   "probe_slice2", "probe_slice3",
-                  "probe_one_decode", "probe_asr_skip"):
+                  "probe_one_decode", "probe_asr_skip",
+                  "probe_degenerate", "probe_pick"):
             try:
                 if DS.exists(d):
                     DS.delete(d)

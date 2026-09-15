@@ -65,6 +65,13 @@ class EvalOptions:
     dataset: str = ""
     out_dir: str = ""            # 空 = outputs/eval/<时间戳>
     n_samples: int = 0           # 0 = 全部 ready 样本
+    # 选样本策略：
+    #   "first"  按数据集顺序取前 n 条（评测页的原有行为）
+    #   "short"  优先取**文本最短**的样本 —— 一键三连的择优用这个。
+    #            合成长度由文本决定，一条超长文本会让单个候选的评测从十几秒
+    #            变成十几分钟（实测遇到 446 字的退化文本：一条 8~11 分钟，
+    #            6 个候选近一小时）。择优只要一个可比的信号，不需要长样本。
+    pick: str = "first"
     seed: int = 42
     # 共同推理参数（A/B 一致，保证差异只来自模型）
     temperature: float = 0.9
@@ -94,6 +101,8 @@ class EvalOptions:
             err(f"数据集 `{self.dataset}` 不存在")
         if int(self.n_samples) < 0:
             err("n_samples 不能为负")
+        if str(self.pick or "first") not in ("first", "short"):
+            err(f"pick={self.pick!r} 不认识（可选 first / short）")
         if not 0.0 < float(self.temperature) <= 2.0:
             err(f"temperature={self.temperature} 超出 (0, 2]")
         if float(self.wer_weight) < 0 or float(self.sim_weight) <= 0:
@@ -164,6 +173,10 @@ def run_eval(engine, a: Contender, b: Optional[Contender],
     if not items:
         out["errors"].append(f"`{opts.dataset}` 里没有带文本的 ready 样本")
         return out
+    if str(opts.pick or "first") == "short":
+        # 文本越短合成越快、越不容易触发重复循环；同样长度时取音频短的
+        items = sorted(items, key=lambda u: (
+            len((u.text or "").strip()), float(u.duration or 0.0)))
     if opts.n_samples > 0:
         items = items[:int(opts.n_samples)]
 
