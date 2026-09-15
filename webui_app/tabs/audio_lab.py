@@ -16,6 +16,7 @@ from typing import Any, Dict, List, Optional
 
 import gradio as gr
 
+from webui_app import logging_setup as LOG
 from webui_app import theme as T
 from webui_app.config import OUTPUT_SAMPLE_RATE, REF_AUDIO_IDEAL
 from webui_app.context import AppContext
@@ -208,13 +209,18 @@ def render(ctx: AppContext):
 
     use_path_btn.click(on_use_path, inputs=[src_path], outputs=[src_audio])
 
+    @LOG.ui_guard("lab.on_analyze", slow_sec=2.0)
     def on_analyze(audio_val, path_val):
         p = _resolve_source(audio_val, path_val)
         if not p:
             return "_请先上传音频或填写有效路径。_", gr.update()
         rep = AL.analyze(p)
         if not rep.ok:
+            LOG.get_logger("lab").warning("体检失败：%s · %s", p, rep.error)
             return f"**分析失败**：{rep.error}", gr.update()
+        LOG.get_logger("lab").info(
+            "体检：%s · %.2fs · 评分 %.1f（%s）· SNR %.1f dB",
+            p, rep.duration, rep.score, rep.grade, rep.snr_db)
         return AL.report_markdown(rep), gr.update(value=rep.path)
 
     analyze_btn.click(on_analyze, inputs=[src_audio, src_path],
@@ -222,45 +228,64 @@ def render(ctx: AppContext):
 
     # ---------- 切片 ----------
     seg_state = gr.State([])
+    # 候选片段是**按哪个音频**扫出来的。必须记住它，否则「设为主素材」之后
+    # src_audio 换成了短片段、而 seg_state 里还是长音频的秒数偏移，再点一次
+    # 就会按越界范围去切 → 切出 0 个采样点（实测症状：44 字节的空 wav）。
+    seg_source = gr.State("")
 
+    @LOG.ui_guard("lab.on_find_segments", slow_sec=2.0)
     def on_find_segments(audio_val, path_val, target, minsec):
         p = _resolve_source(audio_val, path_val)
         if not p:
-            return "_请先上传音频。_", gr.update(choices=[], value=None), []
+            return ("_请先上传音频。_", gr.update(choices=[], value=None), [], "")
         segs = AL.find_segments(p, target_sec=float(target), min_sec=float(minsec))
         choices = [
             f"#{i}  {s.start:.2f}s~{s.end:.2f}s  评分{s.score:.1f}  "
             f"SNR{s.snr_db:.0f}dB  语音{s.voiced_ratio*100:.0f}%"
             for i, s in enumerate(segs)
         ]
+        LOG.get_logger("lab").info(
+            "扫描候选片段：%s · 目标 %.1fs/最短 %.1fs → %d 个候选",
+            p, float(target), float(minsec), len(segs))
         return (AL.segments_markdown(segs),
                 gr.update(choices=choices, value=choices[0] if choices else None),
-                segs)
+                segs, p)
 
     find_seg_btn.click(on_find_segments,
                        inputs=[src_audio, src_path, seg_target, seg_min],
-                       outputs=[seg_table_md, seg_pick, seg_state])
+                       outputs=[seg_table_md, seg_pick, seg_state, seg_source])
+
+    # 换了主素材，之前扫的候选偏移就全部作废 —— 立刻清掉，避免用旧偏移去切
+    def on_src_changed(audio_val):
+        LOG.get_logger("lab").info("主素材已更换：%s（候选片段作废）", audio_val)
+        return (gr.update(choices=[], value=None), [],
+                "_主素材已更换，候选片段已作废，请重新「扫描候选片段」。_", "")
+
+    src_audio.change(on_src_changed, inputs=[src_audio],
+                     outputs=[seg_pick, seg_state, seg_table_md, seg_source])
 
     # 选中片段后只控制导出按钮的可用态；预览在导出后才给出
     seg_pick.change(lambda c: gr.update(interactive=bool(c)),
                     inputs=[seg_pick], outputs=[seg_export_btn])
 
-    def on_seg_export(choice, segs, audio_val, path_val):
-        p = _resolve_source(audio_val, path_val)
-        if not p:
-            gr.Error("请先上传音频")
-            return gr.update(), gr.update()
+    def _export_segment(choice, segs, scan_src, audio_val, path_val):
+        """把选中的候选片段导出成一个 wav。返回 (输出的路径, 错误文案)。
+
+        **切片一律针对「扫描时那个音频」**，而不是当前 src_audio：设为主素材之后
+        src_audio 会变成短片段，此时再按长音频的秒数偏移去切就会越界
+        （实测产出 44 字节的空 wav）。所以这里优先用扫描来源。
+        """
+        p = str(scan_src or "").strip() or _resolve_source(audio_val, path_val)
+        if not p or not os.path.isfile(p):
+            return None, "源音频不在了（可能被移动或删除），请重新选择。"
         if not choice or not segs:
-            gr.Error("请先扫描候选片段并选择一个")
-            return gr.update(), gr.update()
+            return None, "请先「扫描候选片段」并选择一个。"
         try:
             i = int(choice.split("#")[1].split()[0])
         except (ValueError, IndexError):
-            gr.Error("无法解析所选片段")
-            return gr.update(), gr.update()
+            return None, "无法解析所选片段，请重新扫描。"
         if i >= len(segs):
-            gr.Error("片段索引越界，请重新扫描")
-            return gr.update(), gr.update()
+            return None, "这个片段不在当前候选列表里（可能刚换过素材），请重新扫描。"
 
         seg = segs[i]
         os.makedirs(WORK_DIR, exist_ok=True)
@@ -269,30 +294,75 @@ def render(ctx: AppContext):
         try:
             AL.extract_segment(p, seg, out)
         except Exception as e:
-            gr.Error(f"导出失败：{type(e).__name__}: {e}")
-            return gr.update(), gr.update()
+            LOG.get_logger("lab").error(
+                "导出片段失败：%s #%d %.2f~%.2fs ← %s",
+                p, i, seg.start, seg.end, e, exc_info=True)
+            return None, f"导出失败：{e}"
+        if not os.path.isfile(out) or os.path.getsize(out) < 1024:
+            return None, (f"导出的文件异常（{os.path.getsize(out) if os.path.isfile(out) else 0} "
+                          "字节），请重新扫描后再试。")
+        LOG.get_logger("lab").info(
+            "导出片段：%s #%d %.2f~%.2fs → %s（%.1f KB）",
+            p, i, seg.start, seg.end, out, os.path.getsize(out) / 1024)
+        return out, ""
 
-        gr.Info(f"已导出片段 #{i}（{seg.start:.2f}s ~ {seg.end:.2f}s）")
-        return gr.update(value=out), gr.update(value=out)
+    @LOG.ui_guard("lab.on_seg_export", slow_sec=2.0)
+    def on_seg_export(choice, segs, scan_src, audio_val, path_val):
+        out, err = _export_segment(choice, segs, scan_src, audio_val, path_val)
+        if err:
+            gr.Error(err)
+            return gr.update(), gr.update()
+        return (gr.update(value=out), gr.update(value=out))
 
     seg_export_btn.click(on_seg_export,
-                         inputs=[seg_pick, seg_state, src_audio, src_path],
+                         inputs=[seg_pick, seg_state, seg_source,
+                                 src_audio, src_path],
                          outputs=[seg_audio, src_audio])
 
-    def on_seg_as_src(choice, segs, audio_val, path_val):
-        """导出片段并直接设为主素材（一步到位）。"""
-        a, b = on_seg_export(choice, segs, audio_val, path_val)
-        return a, b, "_已把切片设为主要处理对象，可继续做增强。_"
+    @LOG.ui_guard("lab.on_seg_as_src", slow_sec=2.0)
+    def on_seg_as_src(choice, segs, scan_src, audio_val, path_val):
+        """导出片段 → 设为主素材 → 顺手体检它（这样能直接接着做增强与入库）。"""
+        # 失败分支也必须返回**全部 6 个**输出，否则 Gradio 会在运行时抛
+        # 「didn't return enough output values」（tools/ui_output_check.py 会拦）。
+        def _fail(msg: str):
+            gr.Error(msg)
+            return (gr.update(), gr.update(), T.err(msg),
+                    gr.update(), segs, scan_src)
+
+        out, err = _export_segment(choice, segs, scan_src, audio_val, path_val)
+        if err:
+            return _fail(f"<b>设为主素材失败</b>：{err}")
+
+        rep = AL.analyze(out)
+        if not rep.ok or rep.duration <= 0:
+            return _fail(f"<b>切出来的片段无法使用</b>："
+                         f"{rep.error or '时长为 0'}")
+
+        LOG.get_logger("lab").info(
+            "设为主素材：%s（%.2fs · 评分 %.1f %s）",
+            out, rep.duration, rep.score, rep.grade)
+        head = T.tip(
+            f"✅ 已把片段设为主素材：<code>{os.path.basename(out)}</code> · "
+            f"{rep.duration:.2f}s · 评分 <b>{rep.score}</b>（{rep.grade}）。"
+            "下面是它的体检报告，可直接接着做「③ 增强处理」或「④ 存入音色库」。")
+        # 候选片段作废：主素材已经换成这个短片段，旧偏移不再适用
+        body = head + "\n\n" + AL.report_markdown(rep)
+        return (gr.update(value=out), gr.update(value=out), body,
+                gr.update(choices=[], value=None), [], "")
 
     seg_as_src_btn.click(on_seg_as_src,
-                         inputs=[seg_pick, seg_state, src_audio, src_path],
-                         outputs=[seg_audio, src_audio, report_md])
+                         inputs=[seg_pick, seg_state, seg_source,
+                                 src_audio, src_path],
+                         outputs=[seg_audio, src_audio, report_md,
+                                  seg_pick, seg_state, seg_source])
 
     # ---------- 增强 ----------
+    @LOG.ui_guard("lab.on_enhance", slow_sec=3.0)
     def on_enhance(audio_val, path_val, denoise, dstr, norm, ndb,
                    trim, tdb, resample, rsr, limit):
         p = _resolve_source(audio_val, path_val)
         if not p:
+            LOG.get_logger("lab").warning("增强：没有可处理的音频")
             return gr.update(), gr.update(), "_请先上传音频或选择一个切片。_"
 
         os.makedirs(WORK_DIR, exist_ok=True)
@@ -307,7 +377,13 @@ def render(ctx: AppContext):
             max_sec=float(limit),
         )
         if not res.ok:
+            LOG.get_logger("lab").error("增强失败：%s · %s", p, res.error)
             return gr.update(), gr.update(), T.err(f"<b>处理失败</b>：{res.error}")
+        LOG.get_logger("lab").info(
+            "增强：%s → %s（%.2fs · 评分 %s → %s · %d 步）",
+            p, res.path, res.duration,
+            (res.before or {}).get("score"), (res.after or {}).get("score"),
+            len(res.steps or []))
 
         b = res.before or {}
         a = res.after or {}
@@ -323,6 +399,7 @@ def render(ctx: AppContext):
     compare_btn.click(on_enhance, inputs=enh_inputs, outputs=enh_outputs)
 
     # ---------- 入库 ----------
+    @LOG.ui_guard("lab.on_save", slow_sec=2.0)
     def on_save(name, lang, tags, note, use_enhanced, audio_val, path_val, enh_val):
         key = (name or "").strip()
         if not key:
@@ -339,7 +416,13 @@ def render(ctx: AppContext):
                 lang=lang or "ZH",
             )
         except Exception as ex:
+            LOG.get_logger("lab").error("入库失败：%s ← %s",
+                                        key, src, exc_info=True)
             return T.err(f"入库失败：{type(ex).__name__}: {ex}")
+        LOG.get_logger("lab").info(
+            "入库：%s ← %s（%.2fs · 评分 %s %s · 源=%s）",
+            key, src, e.duration, e.score, e.grade,
+            "增强结果" if use_enhanced else "原始素材")
 
         badge = {"优秀": "🟢", "良好": "🟢", "可用": "🟡",
                  "勉强": "🟠", "不建议使用": "🔴"}.get(e.grade, "·")
@@ -366,6 +449,7 @@ def render(ctx: AppContext):
     save_src_btn.click(_make_saver(False), inputs=bank_inputs, outputs=[save_out])
 
     # ---------- 音色库管理 ----------
+    @LOG.ui_guard("lab.on_bank_reload")
     def on_bank_reload():
         entries = voice_bank.list_voices()
         return (gr.update(choices=[""] + [e.name for e in entries]),
@@ -381,6 +465,7 @@ def render(ctx: AppContext):
 
     bank_dd.change(on_bank_select, inputs=[bank_dd], outputs=[bank_detail, bank_preview])
 
+    @LOG.ui_guard("lab.on_bank_delete")
     def on_bank_delete(name):
         if not name:
             gr.Warning("请先选择要删除的音色")
@@ -413,6 +498,7 @@ def render(ctx: AppContext):
     bank_reanalyze.click(on_bank_reanalyze, inputs=[bank_dd],
                          outputs=[bank_table, bank_detail])
 
+    @LOG.ui_guard("lab.on_import_examples", slow_sec=5.0)
     def on_import_examples():
         """把 examples/ 下的官方示例音频批量入库，方便直接对比。"""
         ex_dir = os.path.join(os.path.dirname(os.path.dirname(

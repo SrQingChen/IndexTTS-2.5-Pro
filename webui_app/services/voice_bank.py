@@ -150,6 +150,15 @@ def add(
 
     if analyze_audio:
         rep = AL.analyze(dst)
+        if not rep.ok:
+            # 体检都过不了的音频（空文件、损坏文件）不该进库：留着只会在合成页
+            # 被选中然后推理失败，比当场报错难查得多。顺手把刚复制的文件删掉。
+            try:
+                if os.path.abspath(dst) != os.path.abspath(audio_path):
+                    os.remove(dst)
+            except OSError:
+                pass
+            raise ValueError(f"这个音频无法入库：{rep.error or '体检未通过'}")
         entry.report = rep.to_dict()
         entry.score = rep.score
         entry.grade = rep.grade

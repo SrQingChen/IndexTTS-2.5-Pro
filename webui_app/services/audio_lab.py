@@ -39,8 +39,19 @@ def load_audio(path: str, sr: Optional[int] = None) -> Tuple[np.ndarray, int]:
 
 
 def save_audio(path: str, y: np.ndarray, sr: int):
+    """写 WAV。**拒绝写出 0 个采样点**。
+
+    没有这道闸门时，一次越界切分就会生成一个只有 44 字节文件头的 wav（能写、
+    能打开、听不到任何声音），后续体检判「音频为空」，用户看到的就是
+    「点了没反应 / 存不进库」—— 排查起来毫无线索。宁可在这里直接抛。
+    """
     import soundfile as sf
 
+    y = np.asarray(y, dtype=np.float32)
+    if y.size == 0:
+        raise ValueError(
+            "拒绝写出空音频（0 个采样点）：那只会得到一个只有文件头的 wav。"
+            "请检查切分范围是否越界、或上游是否传入了空数组。")
     os.makedirs(os.path.dirname(os.path.abspath(path)) or ".", exist_ok=True)
     peak = float(np.max(np.abs(y))) if len(y) else 0.0
     if peak > 1.0:            # 防削波
@@ -535,8 +546,25 @@ def extract_segment(path: str, seg: Segment, out_path: str,
         import librosa
         y, sr = librosa.load(path, sr=None, mono=True)
     y = np.asarray(y, dtype=np.float32)
-    a, b = int(seg.start * sr), int(seg.end * sr)
-    save_audio(out_path, y[max(0, a):max(0, b)], sr)
+    dur = len(y) / sr if sr else 0.0
+    # 端点超出音频长度（超出取整容差）说明这些秒数**不是这个文件的偏移**。
+    # 必须报错而不是 clamp：clamp 之后往往还剩几秒音频，于是会静默产出一段
+    # 「位置不对」的音频 —— 不出声、不报错，比直接失败更难查。
+    tol = 0.05
+    if dur <= 0 or seg.start > dur + tol or seg.end > dur + tol:
+        raise ValueError(
+            f"切分范围 {seg.start:.2f}~{seg.end:.2f}s 超出音频长度 {dur:.2f}s —— "
+            "这些秒数是按**另一个**音频算出来的偏移。最常见的情况是：主素材已经"
+            "换成了切出来的短片段，而候选片段还是按原长音频扫描的。"
+            "请重新扫描候选片段。")
+    a = max(0, int(seg.start * sr))
+    b = min(len(y), int(seg.end * sr))
+    piece = y[a:b]
+    if len(piece) < max(1, int(0.05 * sr)):
+        raise ValueError(
+            f"切出的片段只有 {len(piece) / sr:.3f}s（{seg.start:.2f}~"
+            f"{seg.end:.2f}s），太短了。请检查候选片段与音频是否匹配。")
+    save_audio(out_path, piece, sr)
     return out_path
 
 
