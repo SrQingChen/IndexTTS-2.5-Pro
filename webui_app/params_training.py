@@ -52,7 +52,7 @@ def build(reg: Callable[[Any], Any], P: Any) -> None:
 
     reg(P(
         key="oc_slice_over_sec", group="oneclick", label="超过多少秒就切片",
-        kind="slider", default=20.0, minimum=5.0, maximum=60.0, step=1.0,
+        kind="slider", default=20.0, minimum=5.0, maximum=20.0, step=1.0,
         unit="秒",
         summary="判定「长音频」的阈值，默认 20 秒 = 训练可接受的最长样本。",
         info=f"超过它的音频会被自动切成 8~15 秒的片段；默认 20 秒与 "

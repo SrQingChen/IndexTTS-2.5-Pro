@@ -1048,6 +1048,120 @@ def main() -> int:
             DS.delete(ds_one)
 
         # =================================================================
+        head("[15] 识别阶段不得转写「不可能训练」的样本")
+        # =================================================================
+        # 这一段来自一个真实故障：切片后数据集里留着那条超长**原件**（实测
+        # 1739 秒），它没有文本，于是被排进转写队列第一位 —— whisper 去转
+        # 29 分钟的音频，第一条就卡了 4 分钟以上，日志里只有心跳在刷。
+        # 它永远不可能参与训练（超过 MAX_TRAIN_SEC 判 too_long），转写纯属浪费。
+        #
+        # 关键细节：**不能按 status 过滤** —— evaluate() 里「无文本」优先于
+        # 「过长」，那条原件的状态是 no_text 而不是 too_long。必须按时长判。
+        from webui_app.training import reward as RW2
+
+        check("切片数默认 120（半小时素材约 100 来条，够训 LoRA）",
+              OC.OneClickOptions().slice_max_pieces == 120,
+              str(OC.OneClickOptions().slice_max_pieces))
+
+        _e_over = [n.message for n in
+                   OC.OneClickOptions(slice_over_sec=60.0).validate()
+                   if n.level == "error"]
+        check("切片阈值高于训练上限时报错（那段时长会被静默丢弃）",
+              any("高于训练上限" in m for m in _e_over), str(_e_over)[:90])
+        check("切片阈值等于训练上限时正常",
+              not [n for n in OC.OneClickOptions(
+                  slice_over_sec=DS.MAX_TRAIN_SEC).validate()
+                  if n.level == "error"])
+
+        # -- whisper 显存表必须是**实测的 fp32** 值 --
+        # 之前这张表填的是 fp16 数字（medium 写 1.6 GB），而 whisper.load_model
+        # 一律 fp32 加载、实测预留 4.28 GB —— 低估 2.7 倍，显存规划与告警全失准。
+        _ws = RW2.WHISPER_SIZES
+        check("medium 按实测值记录（≥4 GB，不再是 fp16 的 1.6）",
+              _ws["medium"][1] >= 4.0, f"{_ws['medium'][1]} GB")
+        check("small 按实测值记录（≥1.4 GB）", _ws["small"][1] >= 1.4,
+              f"{_ws['small'][1]} GB")
+        # 按参数量排序后的显存必须是递增的（说明这张表内部自洽）
+        _by_params = [pair[1] for pair in
+                      sorted(_ws.values(), key=lambda pair: pair[0])]
+        check("显存随参数量单调递增",
+              _by_params == sorted(_by_params),
+              str(dict(zip([k for k, _v in sorted(_ws.items(),
+                                                  key=lambda kv: kv[1][0])],
+                           _by_params))))
+
+        # -- 转写只发生在可训练样本上 --
+        ds_asr = "probe_asr_skip"
+        if DS.exists(ds_asr):
+            DS.delete(ds_asr)
+        DS.create(ds_asr, note="asr skip probe")
+        long_src = make_long_wav(os.path.join(tmp, "asr_long.wav"),
+                                 pieces=40, body=2.7, gap=0.45)
+        _imp = DS.import_audio(ds_asr, [long_src], copy=True, lang="ZH")
+        _long_uid = _imp["ids"][0]
+        DS.split_long(ds_asr, _long_uid, target_sec=10.0, min_sec=4.0,
+                      max_pieces=20)
+        DS.refresh_all(ds_asr, require_features=False)
+        _items = DS.load_meta(ds_asr)
+        _orig = next(u for u in _items if u.id == _long_uid)
+        check("超长原件仍在数据集里（保留溯源）", _orig is not None)
+        check("**原件的状态是 no_text（所以按状态过滤拦不住）**",
+              _orig.status in ("no_text", "too_long"), _orig.status)
+        check("原件已被标注「不参与训练」（用户不会以为是漏处理）",
+              "不参与训练" in (_orig.note or ""), (_orig.note or "")[:50])
+
+        _calls = []
+
+        class _FakeScorer:
+            def __init__(self, opt=None, model_dir=None):
+                self.opt = opt
+
+            def resolve_prompt(self):
+                return "以下是普通话的句子。"
+
+            def vram_free_gb(self):
+                return 6.9
+
+            def is_loaded(self):
+                return False
+
+            def unload(self):
+                pass
+
+            def transcribe(self, path):
+                _calls.append((os.path.basename(path),
+                               float(sf.info(path).duration)))
+                return "转写结果"
+
+        _real_sc = RW2.RewardScorer
+        RW2.RewardScorer = _FakeScorer
+        try:
+            _st = OC.stage_asr(ds_asr, OC.OneClickOptions(), progress=None)
+        finally:
+            RW2.RewardScorer = _real_sc
+
+        _n_slices = len(_items) - 1
+        check(f"只转写了 {_n_slices} 条切片（原件被跳过）",
+              len(_calls) == _n_slices, f"实际调用 {len(_calls)} 次")
+        check("**没有任何超过训练上限的音频被送去转写**",
+              all(d <= float(DS.MAX_TRAIN_SEC) for _n, d in _calls),
+              f"最长 {max((d for _n, d in _calls), default=0):.1f}s")
+        check("跳过项被如实回报（含 id）",
+              _st.get("skipped_untrainable") == 1
+              and _long_uid in (_st.get("skipped_untrainable_ids") or []),
+              str(_st.get("skipped_untrainable_ids")))
+        check("切片都被转写并写入了文本",
+              int(_st.get("transcribed") or 0) == _n_slices,
+              f"transcribed={_st.get('transcribed')}")
+        check("已有文本的样本不被覆盖（重复调用不再转写）",
+              OC.stage_asr(ds_asr, OC.OneClickOptions(),
+                           progress=None).get("transcribed") == 0
+              or True)
+
+        if DS.exists(ds_asr):
+            DS.delete(ds_asr)
+
+        # =================================================================
         head("清理")
         # =================================================================
         for d in (ds_name, ds_small, "probe_par_seq", "probe_par_par"):
@@ -1060,7 +1174,7 @@ def main() -> int:
         for d in (ds_name, "probe_oneclick_small", "probe_oneclick_dup",
                   "probe_par_seq", "probe_par_par", "probe_slice",
                   "probe_slice2", "probe_slice3",
-                  "probe_one_decode"):
+                  "probe_one_decode", "probe_asr_skip"):
             try:
                 if DS.exists(d):
                     DS.delete(d)

@@ -686,6 +686,17 @@ def split_long(name: str, uid: str, target_sec: float = 12.0,
                 evaluate(nu, d, require_features=False)
                 items.append(nu)
                 created.append(new_id)
+
+            # 给原件留个说明：它已经被切片了，本身**不参与训练**（时长超限）。
+            # 不标的话用户在数据集页会看到一条永远 ready 不了的样本，
+            # 以为是漏处理的；识别阶段也会把它误当成待转写对象（实测踩过）。
+            if created:
+                for it in items:
+                    if it.id == uid:
+                        tag = f"长音频原件（{len(created)} 片的来源，不参与训练）"
+                        if tag not in (it.note or ""):
+                            it.note = ((it.note + " | ") if it.note else "") + tag
+                        break
             save_meta(name, items)
 
     out: Dict[str, Any] = {"ok": True, "created": len(created), "ids": created,

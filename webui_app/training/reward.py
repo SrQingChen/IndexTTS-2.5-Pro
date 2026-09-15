@@ -40,14 +40,29 @@ __all__ = ["RewardOptions", "RewardScorer", "normalize_text", "cer",
 
 # whisper 档位 → (参数量 M, 显存 fp16 GB)。写死在这里是为了让 validate
 # 能在下载之前就告诉用户「这一档要多大」。
+# whisper 档位 → (参数量 M, **实际显存 GB**)。
+#
+# 这里的显存是**实测值**，不是按 fp16 估的：`openai-whisper` 的
+# `load_model()` 没有 dtype 参数，**一律以 fp32 加载**（实测 medium 的权重 dtype
+# 就是 torch.float32），加上 PyTorch 缓存分配器的预留，真实占用约为
+# 「参数量 × 4 字节 × 1.5」。此前这个表填的是 fp16 数字，把 medium 写成 1.6 GB
+# 而实际要 4.28 GB —— **低估 2.7 倍**，直接导致显存规划与告警都失准。
+#
+# 实测（RTX 4060 Laptop 8 GB，torch 2.8）：
+#     base(72M)   allocated 0.27 / reserved 0.42 GB
+#     small(241M) allocated 0.90 / reserved 1.46 GB
+#     medium(762M) allocated 2.85 / reserved 4.28 GB
 WHISPER_SIZES: Dict[str, Tuple[float, float]] = {
-    "tiny": (39, 0.10), "base": (74, 0.20), "small": (244, 0.55),
-    "medium": (769, 1.60), "large-v3": (1550, 3.20), "turbo": (809, 1.70),
+    "tiny": (39, 0.23), "base": (74, 0.42), "small": (244, 1.46),
+    "medium": (769, 4.28), "large-v3": (1550, 7.70), "turbo": (809, 4.50),
 }
 # 默认档位从 small 升到 medium —— small 在中文上会把「西莲」写成「西蓮」、
 # 长句还容易糊成一片，当训练文本用会直接教坏模型（它会照着错字学发音）。
-# medium 参数量约 3.2 倍，中文准确率提升明显；ASR 阶段引擎是卸载状态，
-# 1.6 GB 完全放得下。
+# medium 参数量约 3.2 倍，中文准确率提升明显。
+#
+# 但要注意它的真实占用是 4.28 GB：与推理引擎（4.94 GB）**不可能共存**于 8 GB 卡，
+# 所以一键三连在识别前会显式把引擎卸掉（见 oneclick.ensure_engine_off）。
+# 显存更紧就往 small（1.46 GB）退一档。
 DEFAULT_WHISPER = "medium"
 
 # 语言 → whisper 的 initial_prompt。
@@ -151,8 +166,12 @@ class RewardOptions:
             err(f"whisper_size={self.whisper_size!r} 不在 {tuple(WHISPER_SIZES)}")
         p, v = WHISPER_SIZES.get(self.whisper_size, (0, 0))
         if p >= 700:
-            warn(f"whisper {self.whisper_size} 要 {v:.1f} GB 显存，"
-                 "8GB 卡与引擎共存会溢出（WDDM 下是静默降速，不是 OOM）")
+            warn(f"whisper {self.whisper_size} 实测要 {v:.2f} GB 显存"
+                 "（openai-whisper 一律 fp32 加载，`.half()` 在这个版本上会因"
+                 "LayerNorm 强制转 float 而报错，所以省不下来）。它与推理引擎"
+                 "（4.94 GB）在 8 GB 卡上无法共存 —— 一键三连会在识别前自动"
+                 f"卸掉引擎；若显存仍紧，把识别模型降到 small"
+                 f"（{WHISPER_SIZES['small'][1]:.2f} GB）。")
         w1, w2 = float(self.wer_weight), float(self.sim_weight)
         if w1 < 0 or w2 < 0 or (w1 + w2) <= 0:
             err(f"权重必须是正数且不全为零：wer={w1} sim={w2}")

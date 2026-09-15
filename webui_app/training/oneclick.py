@@ -133,7 +133,9 @@ class OneClickOptions:
     slice_over_sec: float = DS.MAX_TRAIN_SEC   # 20s：超过就不算「可直接训练」
     slice_target_sec: float = 12.0             # 每片目标时长
     slice_min_sec: float = 4.0                 # 太短的片段不要
-    slice_max_pieces: int = 60                 # 单条长音频最多切几片
+    # 单条长音频最多切几片。默认 120：半小时素材按 10~12 秒一片大约就是
+    # 100 来条，正好落在「样本数够训 LoRA」的量级上（下限是 20 条）。
+    slice_max_pieces: int = 120
 
     # ---- S2 优化 ----
     enhance: bool = True              # 关掉则只做体检、不改音频
@@ -213,6 +215,14 @@ class OneClickOptions:
             err(f"lang={self.lang} 不支持（可选 ZH/EN/JA/AR/ES）")
         if float(self.slice_over_sec) < float(self.slice_min_sec):
             err("slice_over_sec 不能小于 slice_min_sec")
+        if float(self.slice_over_sec) > float(DS.MAX_TRAIN_SEC):
+            # 超过训练上限的样本一律判 too_long。如果切片阈值也设这么高，
+            # MAX_TRAIN_SEC~slice_over_sec 之间的样本既不会被切、也不能训练，
+            # 会在筛选阶段被**静默丢掉**。
+            err(f"slice_over_sec={self.slice_over_sec:g} 高于训练上限 "
+                f"{DS.MAX_TRAIN_SEC:g} 秒：{DS.MAX_TRAIN_SEC:g}~"
+                f"{self.slice_over_sec:g} 秒的样本既不会被切片也不能训练，"
+                f"会被静默丢弃。请把它设为 ≤ {DS.MAX_TRAIN_SEC:g} 秒。")
         if not 1.0 <= float(self.slice_target_sec) <= DS.MAX_TRAIN_SEC:
             err(f"slice_target_sec 应在 1~{DS.MAX_TRAIN_SEC} 秒之间"
                 "（超过 20s 的样本不参与训练，切了也白切）")
@@ -846,8 +856,13 @@ def stage_asr(dataset: str, opt: OneClickOptions,
 
     长音频在 S1 已切片，所以这里是「一片转一段」—— 文本与音频天然配对，
     这就是全流程的对齐环节。已有 text 的样本不覆盖（尊重人工校对）。
+
+    **只转写能成为训练数据的样本**：切片后数据集里还留着那条超长原件
+    （它永远判 too_long、不可能参与训练），把它送去 whisper 就是白白让
+    转写卡几分钟。这类样本会被跳过并计入 `skipped_untrainable`。
     """
     bands = bands or _Bands(STAGES)
+    log = LOG.get_logger("oneclick.asr")
     cb = _sub(progress, bands, "asr", "识别")
     items = DS.load_meta(dataset)
     out = {"total": len(items), "transcribed": 0, "empty": 0, "failed": 0,
@@ -858,10 +873,39 @@ def stage_asr(dataset: str, opt: OneClickOptions,
         cb(1.0, "已关闭语音识别")
         return out
 
-    todo = [u for u in items if not str(u.text or "").strip()]
-    out["kept_existing"] = len(items) - len(todo)
+    # ---- 只给**能成为训练数据**的样本转写 ----
+    # 这一条是实测踩出来的大坑：切片后数据集里还留着那条超长的**原件**
+    # （1739 秒），它没有文本，于是被排进转写队列的**第一位** —— whisper 去转
+    # 29 分钟的音频，第一条就卡了 4 分钟以上（日志里只有心跳在刷）。
+    # 而它永远不可能参与训练（超过 MAX_TRAIN_SEC 一律判 too_long），
+    # 转写它是纯粹的浪费。
+    #
+    # 注意**不能按 status 过滤**：`evaluate()` 里「无文本」优先于「过长」，
+    # 这条原件的状态是 no_text 而不是 too_long。所以按时长判，不按状态判。
+    lo, hi = float(DS.MIN_SEC), float(DS.MAX_TRAIN_SEC)
+    trainable, untrainable = [], []
+    for u in items:
+        if str(u.text or "").strip():
+            continue                     # 已有文本（人工校对过的不覆盖）
+        d = float(u.duration or 0.0)
+        if d <= 0 or (lo <= d <= hi):
+            trainable.append(u)          # 时长未知的也照转（信息不足，不擅自跳过）
+        else:
+            untrainable.append((u, d))
+
+    todo = trainable
+    out["kept_existing"] = len(items) - len(todo) - len(untrainable)
+    out["skipped_untrainable"] = len(untrainable)
+    out["skipped_untrainable_ids"] = [u.id for u, _d in untrainable]
+    if untrainable:
+        worst = max(d for _u, d in untrainable)
+        cb(0.005, f"跳过 {len(untrainable)} 条不可训练的样本"
+                  f"（最长 {worst:.0f} 秒，超过 {hi:.0f} 秒上限，转写也没用）")
+        log.info("识别阶段跳过不可训练样本 %d 条（最长 %.0f 秒）：%s",
+                 len(untrainable), worst,
+                 ", ".join(f"{u.id}({d:.0f}s)" for u, d in untrainable[:5]))
     if not todo:
-        cb(1.0, "全部样本都已有文本，跳过识别")
+        cb(1.0, "没有需要转写的样本，跳过识别")
         return out
 
     sc = RW.RewardScorer(
@@ -1726,7 +1770,12 @@ def run_oneclick(engine, options: OneClickOptions,
         st3 = stage_asr(dataset, options, progress, should_stop, rep, bands)
         rep.finish("asr",
                    f"转写 {st3['transcribed']} 条（无输出 {st3['empty']} · "
-                   f"失败 {st3['failed']}）", seconds=time.perf_counter() - t,
+                   f"失败 {st3['failed']}）"
+                   + (f" · 跳过 {st3['skipped_untrainable']} 条不可训练样本"
+                      if st3.get("skipped_untrainable") else ""),
+                   seconds=time.perf_counter() - t,
+                   skipped_untrainable=st3.get("skipped_untrainable"),
+                   skipped_untrainable_ids=st3.get("skipped_untrainable_ids"),
                    whisper=st3.get("whisper"), prompt=st3.get("prompt"),
                    transcribed=st3.get("transcribed"),
                    empty=st3.get("empty"), failed=st3.get("failed"),
@@ -1734,6 +1783,13 @@ def run_oneclick(engine, options: OneClickOptions,
                    vram_after_gb=st3.get("vram_after_gb"),
                    freed_gb=st3.get("freed_gb"),
                    loaded_after_unload=st3.get("loaded_after_unload"))
+        if st3.get("skipped_untrainable"):
+            rep.add_note(
+                f"识别阶段跳过了 {st3['skipped_untrainable']} 条**不可训练**的样本"
+                "（超过 20 秒上限，或短于 1 秒）："
+                f"{', '.join((st3.get('skipped_untrainable_ids') or [])[:5])}"
+                "。它们多半是长音频**原件**——切片已经产出可用片段，"
+                "原件本身不参与训练，转写它纯属浪费（实测会让识别卡几分钟）。")
         if st3.get("stopped"):
             rep.mark("asr", "skipped")
             return done("stopped", "用户在识别阶段停止")

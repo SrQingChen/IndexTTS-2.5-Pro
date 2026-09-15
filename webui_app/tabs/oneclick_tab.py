@@ -243,7 +243,8 @@ def render(ctx: AppContext):
                 with gr.Column(elem_classes=["ix-section"]):
                     gr.HTML(T.section("切片（只对长音频生效）", "✂️", ""))
                     slice_over_sl = gr.Slider(
-                        5.0, 60.0, value=float(DS.MAX_TRAIN_SEC), step=1.0,
+                        5.0, float(DS.MAX_TRAIN_SEC),
+                        value=float(DS.MAX_TRAIN_SEC), step=1.0,
                         label="超过多少秒就切片",
                         info=f"默认 {DS.MAX_TRAIN_SEC:g}s = 训练可接受的最长样本，"
                              "更长的样本体检直接判 too_long、永远不参与训练")
@@ -255,8 +256,9 @@ def render(ctx: AppContext):
                         1.0, 10.0, value=4.0, step=0.5, label="最短片段（秒）",
                         info="短于它的片段直接丢掉（不足以体现音色）")
                     slice_pieces_nb = gr.Number(
-                        60, label="单条长音频最多切几片", precision=0,
-                        info="防止一条超长音频切出几千片把训练拖垮")
+                        120, label="单条长音频最多切几片", precision=0,
+                        info="默认 120：半小时素材按 10~12 秒一片大约 100 来条，"
+                             "正好够训 LoRA（下限 20 条）。设太小会白白浪费素材")
 
                 with gr.Column(elem_classes=["ix-section"]):
                     gr.HTML(T.section("音频优化", "🧹",
