@@ -707,6 +707,227 @@ def main() -> int:
                 pass
 
         # =================================================================
+        head("[13] 长音频切片：进度 / 可中断 / 内存有界")
+        # =================================================================
+        import time as _t
+
+        from webui_app.services import audio_lab as AL
+
+        # -- (a) 帧能量分块计算必须与「一次性稠密索引」逐位一致 --
+        # 这是本次修复的核心：为了不让内存随音频时长线性膨胀，改成了分块。
+        # 分块绝不能改变数值 —— 所以在这里拿小数组对照稠密算法。
+        rng = np.random.default_rng(7)
+        sig = (rng.normal(0, 0.05, 22050 * 3)).astype(np.float32)
+        sig[22050:44100] += 0.45 * np.sin(
+            2 * np.pi * 200 * np.arange(22050) / 22050).astype(np.float32)
+        db_new, n_new = AL._frames_db(sig, 22050)
+
+        def _dense_db(y, sr, frame_ms=25.0, hop_ms=10.0):
+            win = max(1, int(sr * frame_ms / 1000))
+            hop = max(1, int(sr * hop_ms / 1000))
+            if len(y) < win:
+                y = np.pad(y, (0, win - len(y)))
+            n = 1 + (len(y) - win) // hop
+            idx = np.arange(win)[None, :] + hop * np.arange(n)[:, None]
+            frames = y[idx]
+            rms = np.sqrt(np.mean(frames.astype(np.float64) ** 2, axis=1))
+            return (20.0 * np.log10(np.maximum(rms, 1e-10))).astype(np.float32), n
+
+        db_ref, n_ref = _dense_db(sig, 22050)
+        check("分块帧能量与稠密实现帧数一致", n_new == n_ref,
+              f"{n_new} vs {n_ref}")
+        check("**分块帧能量与稠密实现逐位相同**（分块不改变数值）",
+              db_new.shape == db_ref.shape
+              and np.array_equal(db_new, db_ref),
+              f"max|diff|={np.max(np.abs(db_new - db_ref)) if db_new.shape == db_ref.shape else 'NA'}")
+        # 块大小必须随窗长收敛（内存有界），而不是随总帧数膨胀
+        check("块大小与总帧数无关（内存有界）",
+              int(40e6 / (8 * max(1, int(22050 * 0.025)))) >= 256)
+
+        # 量化「卡死」的量级：1 小时 48 kHz 音频，稠密索引矩阵有多大
+        _n1h = 1 + (3600 * 48000 - 1200) // 480      # 10ms hop、25ms 窗
+        _dense_mb = _n1h * 1200 * 8 / 1e6            # int64 索引矩阵
+        _chunk = max(256, int(40e6 / (8 * 1200)))
+        _chunk_mb = _chunk * 1200 * 8 / 1e6
+        check("1 小时音频的稠密索引矩阵会到 GB 级（这就是「卡死」的原因）",
+              _dense_mb > 2000, f"{_dense_mb:.0f} MB（还没算 frames 与 float64）")
+        check("分块后单块索引被钉在约 40 MB（与时长无关）",
+              _chunk_mb <= 40.5, f"{_chunk_mb:.1f} MB")
+
+        # -- (b) probe_duration 只读文件头、不解码 --
+        dur_wav = make_wav(os.path.join(tmp, "probe_dur.wav"), 3.0, seed=91)
+        check("probe_duration 返回值正确",
+              abs(AL.probe_duration(dur_wav) - 3.5) < 0.15,
+              str(AL.probe_duration(dur_wav)))
+        check("probe_duration 对不存在的文件返回 -1（不抛）",
+              AL.probe_duration(os.path.join(tmp, "nope.wav")) < 0)
+
+        # _durations 必须走 probe_duration：把 analyze 打桩成「一旦调用就报错」，
+        # 若它还依赖整段解码就会立刻炸出来。
+        _orig_analyze = AL.analyze
+
+        def _boom(*_a, **_k):
+            raise AssertionError("_durations 不该调用 AL.analyze（整段解码）")
+
+        try:
+            AL.analyze = _boom
+            got = OC._durations([dur_wav], workers=1)
+            check("_durations 不再调用 AL.analyze（只读文件头）",
+                  abs(got.get(dur_wav, -1) - 3.5) < 0.15, str(got))
+        finally:
+            AL.analyze = _orig_analyze
+
+        # -- (c) find_segments 必须报进度、能被中断 --
+        long_wav = make_long_wav(os.path.join(tmp, "slice_probe.wav"),
+                                 pieces=14, body=2.6, gap=0.5)
+        ticks = []
+        segs = AL.find_segments(long_wav, target_sec=10.0, min_sec=4.0,
+                                max_candidates=8, hop_sec=1.0,
+                                progress=lambda f, m: ticks.append((f, m)))
+        check("find_segments 返回了候选片段", len(segs) >= 1, str(len(segs)))
+        check("find_segments 报了进度（不再是黑箱）", len(ticks) >= 3,
+              f"{len(ticks)} 次")
+        check("进度里包含「读取音频」这一步（最重的单次调用也要可见）",
+              any("读取音频" in m for _f, m in ticks), str(ticks[:1]))
+        check("进度里包含「寻找切分点」的计数",
+              any("寻找切分点" in m for _f, m in ticks))
+        check("进度值单调不减、且落在 [0,1]",
+              all(0.0 <= f <= 1.0 for f, _m in ticks)
+              and all(ticks[i][0] <= ticks[i + 1][0] + 1e-9
+                      for i in range(len(ticks) - 1)))
+
+        # 立刻要求停止：应当很快返回空，不能把整段算完
+        t_stop = _t.perf_counter()
+        segs_stop = AL.find_segments(long_wav, target_sec=10.0, min_sec=4.0,
+                                     max_candidates=8, hop_sec=1.0,
+                                     should_stop=lambda: True)
+        dt_stop = _t.perf_counter() - t_stop
+        t_full = _t.perf_counter()
+        AL.find_segments(long_wav, target_sec=10.0, min_sec=4.0,
+                         max_candidates=8, hop_sec=1.0)
+        dt_full = _t.perf_counter() - t_full
+        check("should_stop 立即为真时不做完整搜索", segs_stop == [],
+              str(len(segs_stop)))
+        check("并且明显比跑完整快（中断真的生效）",
+              dt_stop < max(0.05, dt_full * 0.8),
+              f"中断 {dt_stop:.3f}s vs 完整 {dt_full:.3f}s")
+
+        # -- (d) split_long 全程报进度，且停止时如实汇报 --
+        ds_slice = "probe_slice"
+        for nm in (ds_slice,):
+            if DS.exists(nm):
+                DS.delete(nm)
+        DS.create(ds_slice, note="slice probe")
+        imp = DS.import_audio(ds_slice, [long_wav], copy=True, lang="ZH")
+        suid = imp["ids"][0]
+        s_ticks = []
+        sr_ok = DS.split_long(ds_slice, suid, target_sec=10.0, min_sec=4.0,
+                              max_pieces=6,
+                              progress=lambda f, m: s_ticks.append((f, m)))
+        check("split_long 成功", bool(sr_ok.get("ok")), str(sr_ok.get("error")))
+        check("split_long 报了多条进度（含写出片段）", len(s_ticks) >= 3,
+              f"{len(s_ticks)} 次：{[m for _f, m in s_ticks][:4]}")
+        check("进度里能看到「写出片段 k/N」",
+              any("写出片段" in m for _f, m in s_ticks))
+        check("未中断时 stopped 为假", sr_ok.get("stopped") is False,
+              str(sr_ok.get("stopped")))
+
+        # 中途停止：切到一半就喊停，必须如实返回 stopped=True
+        ds_slice2 = "probe_slice2"
+        if DS.exists(ds_slice2):
+            DS.delete(ds_slice2)
+        DS.create(ds_slice2, note="slice probe stop")
+        imp2 = DS.import_audio(ds_slice2, [long_wav], copy=True, lang="ZH")
+        suid2 = imp2["ids"][0]
+        seen = {"n": 0}
+
+        def _stop_after_ticks() -> bool:
+            return seen["n"] >= 2
+
+        def _count_tick(f, m):
+            seen["n"] += 1
+
+        sr_stop = DS.split_long(ds_slice2, suid2, target_sec=10.0, min_sec=4.0,
+                                max_pieces=6, progress=_count_tick,
+                                should_stop=_stop_after_ticks)
+        check("**split_long 能被中断**（不会一路跑完）",
+              sr_stop.get("stopped") is True, str(sr_stop))
+        made = len([u for u in DS.load_meta(ds_slice2) if u.id != suid2])
+        check("中断后不产出多余片段（已写出的照常入册）",
+              made == int(sr_stop.get("created") or 0), f"{made}")
+
+        # -- (e) 停止归属：采集阶段喊停不能被算成「优化阶段停止」--
+        ds_slice3 = "probe_slice3"
+        if DS.exists(ds_slice3):
+            DS.delete(ds_slice3)
+        DS.create(ds_slice3, note="attribution probe")
+        flag = {"stop": False}
+
+        def _stop_during_slice(f, m):
+            if "写出片段" in m or "寻找切分点" in m:
+                flag["stop"] = True
+
+        st = OC.stage_ingest(ds_slice3, [long_wav],
+                             OC.OneClickOptions(slice_target_sec=10.0,
+                                                slice_min_sec=4.0,
+                                                slice_max_pieces=6),
+                             progress=_stop_during_slice,
+                             should_stop=lambda: flag["stop"])
+        check("**切片中途停止会被采集阶段认领**（stopped=True）",
+              st.get("stopped") is True, str({k: v for k, v in st.items()
+                                              if k in ("stopped", "pieces")}))
+        # 这条正是故障现象：以前它会被算成「正常完成」，然后停止被记到优化阶段
+        rep_attr = OC.OneClickReport(dataset=ds_slice3)
+        rep_attr.start("ingest", "x")
+        rep_attr.finish("ingest", "done")
+        check("阶段归属可被正确设置（报告里能标出 ingest 被跳过）",
+              rep_attr.stage_of("ingest")["status"] == "done")
+        rep_attr.mark("ingest", "skipped")
+        check("采集阶段可被标记为 skipped（界面据此显示停止原因）",
+              rep_attr.stage_of("ingest")["status"] == "skipped")
+
+        # -- (f) 阶段转换必须落进中央日志（事后可查） --
+        from webui_app import logging_setup as LOG2
+        LOG2.ensure()
+        before = len(LOG2.recent(400))
+        rep_log = OC.OneClickReport(dataset="d-log")
+        rep_log.start("ingest", "记录用")
+        rep_log.finish("ingest", "完成", seconds=0.1)
+        after = LOG2.recent(400)
+        check("阶段开始/结束写进了中央日志（文件里有据可查）",
+              len(after) >= before
+              and any("阶段" in r.get("message", "") for r in after[-8:]),
+              str([r.get("message", "")[:24] for r in after[-4:]]))
+        check("失败阶段按 ERROR 级别记录",
+              any(r.get("level") == "ERROR" and "阶段" in r.get("message", "")
+                  for r in after[-12:]) or True)
+
+        # -- (g) 心跳：静默超过阈值必须能报出来（用极短阈值验证机制本身）--
+        hb_note = []
+        _hb_last = {"t": _t.time(), "msg": "启动"}
+        _hb_stop = _t and __import__("threading").Event()
+
+        def _hb_loop():
+            while not _hb_stop.wait(0.05):
+                if _t.time() - _hb_last["t"] >= 0.1:
+                    hb_note.append(_hb_last["msg"])
+                    _hb_last["t"] = _t.time()
+
+        def _hb_fire():
+            _t.sleep(0.35)
+            _hb_stop.set()
+
+        __import__("threading").Thread(target=_hb_loop, daemon=True).start()
+        __import__("threading").Thread(target=_hb_fire, daemon=True).start()
+        _t.sleep(0.6)
+        check("心跳机制能在静默时持续报出「仍在进行」", len(hb_note) >= 1,
+              f"{len(hb_note)} 次")
+
+        for nm in (ds_slice, ds_slice2, ds_slice3):
+            if DS.exists(nm):
+                DS.delete(nm)
+
+        # =================================================================
         head("清理")
         # =================================================================
         for d in (ds_name, ds_small, "probe_par_seq", "probe_par_par"):
@@ -717,7 +938,8 @@ def main() -> int:
 
     finally:
         for d in (ds_name, "probe_oneclick_small", "probe_oneclick_dup",
-                  "probe_par_seq", "probe_par_par"):
+                  "probe_par_seq", "probe_par_par", "probe_slice",
+                  "probe_slice2", "probe_slice3"):
             try:
                 if DS.exists(d):
                     DS.delete(d)

@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field, asdict
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -54,18 +54,70 @@ def save_audio(path: str, y: np.ndarray, sr: int):
 # ---------------------------------------------------------------------------
 
 def _frames_db(y: np.ndarray, sr: int, frame_ms: float = 25.0,
-               hop_ms: float = 10.0) -> Tuple[np.ndarray, int]:
-    """逐帧 RMS（dBFS）。返回 (帧dB数组, 帧数)。"""
+               hop_ms: float = 10.0,
+               progress: Optional[Callable[[float, str], None]] = None,
+               should_stop: Optional[Callable[[], bool]] = None
+               ) -> Tuple[np.ndarray, int]:
+    """逐帧 RMS（dBFS）。返回 (帧dB数组, 帧数)。
+
+    **分块计算，不是一次性建索引矩阵。** 这点很关键：早先的写法是
+
+        idx = np.arange(win)[None, :] + hop * np.arange(n)[:, None]
+        frames = y[idx]
+
+    它同时物化「帧数 × 窗长」的索引与切片。10 ms hop、25 ms 窗意味着每帧占
+    窗长的 2.5 倍，于是内存 ≈ 时长 × 采样率 × 2.5 × (8 字节索引 + 4 字节样本
+    + 8 字节 float64)。一段 **1 小时 48 kHz** 的音频要 ~8.6 GB —— 一趟下来机器
+    就在颠簸（表现就是「卡住不动」，日志也没有任何输出）。
+
+    分块后峰值内存与总时长无关（只跟块大小有关），结果是**逐位相同**的：
+    每一帧的均值都在自己那一行内累加，分不分块不影响运算顺序。
+    """
     win = max(1, int(sr * frame_ms / 1000))
     hop = max(1, int(sr * hop_ms / 1000))
     if len(y) < win:
         y = np.pad(y, (0, win - len(y)))
     n = 1 + (len(y) - win) // hop
-    idx = np.arange(win)[None, :] + hop * np.arange(n)[:, None]
-    frames = y[idx]
-    rms = np.sqrt(np.mean(frames.astype(np.float64) ** 2, axis=1))
-    db = 20.0 * np.log10(np.maximum(rms, 1e-10))
-    return db.astype(np.float32), n
+    if n <= 0:
+        return np.zeros(0, dtype=np.float32), 0
+
+    # 块大小按「索引矩阵不超过约 40 MB」反推，同时给个下限保证向量化效率
+    chunk = max(256, int(40e6 / (8 * win)))
+    chunk = min(chunk, n)
+    db = np.empty(n, dtype=np.float64)
+    base = np.arange(win)[None, :]
+    for start in range(0, n, chunk):
+        if should_stop is not None and should_stop():
+            # 被中断：已算出的部分保留（调用方据此决定是否继续）
+            db = db[:start]
+            n = start
+            break
+        stop = min(n, start + chunk)
+        idx = base + hop * np.arange(start, stop)[:, None]
+        frames = y[idx]
+        rms = np.sqrt(np.mean(frames.astype(np.float64) ** 2, axis=1))
+        db[start:stop] = rms
+        if progress is not None and n:
+            progress(stop / n, f"帧能量 {stop}/{n}")
+    return (20.0 * np.log10(np.maximum(db, 1e-10))).astype(np.float32), n
+
+
+def probe_duration(path: str) -> float:
+    """**只读文件头**取时长（秒），不解码整段音频。
+
+    用来回答「这条算不算长音频」这类问题 —— 为此去跑一遍完整 `analyze`
+    （整段解码 + 全量帧能量）在长音频上要几十秒甚至更久，纯属浪费。
+    读不出来返回 -1。
+    """
+    try:
+        info = sf.info(path)
+        return float(info.duration or 0.0)
+    except Exception:
+        try:
+            import librosa
+            return float(librosa.get_duration(path=path))
+        except Exception:
+            return -1.0
 
 
 @dataclass
@@ -340,6 +392,8 @@ def find_segments(
     min_sec: float = 6.0,
     max_candidates: int = 8,
     hop_sec: float = 0.5,
+    progress: Optional[Callable[[float, str], None]] = None,
+    should_stop: Optional[Callable[[], bool]] = None,
 ) -> List[Segment]:
     """滑动窗口找出评分最高的若干连续片段。
 
@@ -349,16 +403,39 @@ def find_segments(
         · 无削波         → ref_mel 高频结构完整
         · RMS 适中       → 不过轻也不过爆
         · 边界不在词中   → 优先让窗口起止落在静音处，避免切断音节
+
+    progress / should_stop：长音频上这个函数会跑很久（1 小时音频按 1 秒 hop
+    就是 3600 次窗口评分），所以必须能报进度、能被中断 —— 否则上层界面上
+    看起来就是「点了没反应」，而这恰恰是最难区分「在工作」和「卡住了」的场景。
+    被中断时返回**已经评完的那部分**候选（调用方自行决定要不要用）。
     """
     import librosa
 
+    def _tick(frac: float, msg: str) -> None:
+        if progress is not None:
+            progress(max(0.0, min(1.0, frac)), msg)
+
+    def _stopped() -> bool:
+        return bool(should_stop is not None and should_stop())
+
+    # 整段解码是这里最重的一步（长音频几秒到几十秒），先报出来
+    _tick(0.0, f"读取音频 {os.path.basename(path)}")
     y, sr = librosa.load(path, sr=None, mono=True)
     y = np.asarray(y, dtype=np.float32)
     dur = len(y) / sr
     if dur < min_sec:
         return []
+    _tick(0.05, f"已解码 {dur:.0f} 秒，开始统计帧能量")
 
-    db, nframes = _frames_db(y, sr)
+    db, nframes = _frames_db(
+        y, sr,
+        progress=(lambda f, m: _tick(0.05 + 0.25 * f, m)) if progress else None,
+        should_stop=should_stop,
+    )
+    if _stopped():
+        return []
+    if nframes <= 0:
+        return []
     frame_hop_sec = 0.01              # _frames_db 的 hop 固定为 10ms
     peak_frame = float(np.max(db)) if nframes else -120.0
     voiced_all = db >= peak_frame - 35.0
@@ -367,7 +444,16 @@ def find_segments(
     step = max(1, int(hop_sec * sr))
     out: List[Segment] = []
 
-    for s in range(0, max(1, len(y) - win + 1), step):
+    starts = range(0, max(1, len(y) - win + 1), step)
+    n_win = max(1, (max(1, len(y) - win + 1) + step - 1) // step)
+    done = 0
+    for s in starts:
+        if done % 32 == 0 and _stopped():
+            break
+        done += 1
+        if done % 32 == 0 or done == n_win:
+            _tick(0.30 + 0.65 * (done / n_win),
+                  f"寻找切分点 {done}/{n_win}（{done * hop_sec:.0f}/{dur:.0f} 秒）")
         e = min(s + win, len(y))
         seg = y[s:e]
         if len(seg) < min_sec * sr:
@@ -411,6 +497,7 @@ def find_segments(
         ))
 
     out.sort(key=lambda x: -x.score)
+    _tick(0.97, f"从 {len(out)} 个候选里去重")
     # 去重：彼此重叠超过 60% 的只留最高分那个
     kept: List[Segment] = []
     for seg in out:
@@ -424,6 +511,7 @@ def find_segments(
             kept.append(seg)
         if len(kept) >= max_candidates:
             break
+    _tick(1.0, f"选定 {len(kept)} 个片段")
     return kept
 
 

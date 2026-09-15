@@ -552,7 +552,10 @@ def import_audio(name: str, paths: Sequence[str], copy: bool = True,
 
 def split_long(name: str, uid: str, target_sec: float = 12.0,
                min_sec: float = 4.0, max_pieces: int = 12,
-               text: str = "") -> Dict[str, Any]:
+               text: str = "",
+               progress: Optional[Callable[[float, str], None]] = None,
+               should_stop: Optional[Callable[[], bool]] = None
+               ) -> Dict[str, Any]:
     """把一条过长的样本切成多条。
 
     复用「参考音频工作台」的 find_segments —— 它按语音占比/信噪比/削波/响度
@@ -565,8 +568,20 @@ def split_long(name: str, uid: str, target_sec: float = 12.0,
     并发：切片是慢 IO（每个片段都要解码+重采样+写文件），所以**文件写出放在
     锁外**，只在最后入册时加锁重读 meta —— 否则用户在 UI 里补文本会被
     这里最后那次 save 用旧快照覆盖掉（import_audio 用的是同一套 staged 模式）。
+
+    progress / should_stop：长音频上这个函数会跑几分钟（整段解码 → 全量帧能量
+    → 逐窗口评分 → 逐片写盘），所以全程报进度、随时可中断。没有这两样的时候
+    界面上就是「点了没反应」，用户既不知道在干活还是卡死，按了停止也要等很久
+    才生效 —— 这是实测踩到的问题。
     """
     from webui_app.services import audio_lab as AL
+
+    def _tick(frac: float, msg: str) -> None:
+        if progress is not None:
+            progress(max(0.0, min(1.0, frac)), msg)
+
+    def _stopped() -> bool:
+        return bool(should_stop is not None and should_stop())
 
     d = dir_of(name)
     with _META_LOCK:
@@ -578,8 +593,26 @@ def split_long(name: str, uid: str, target_sec: float = 12.0,
     if not os.path.isfile(ap):
         return {"ok": False, "error": "源音频文件不存在"}
 
-    segs = AL.find_segments(ap, target_sec=target_sec, min_sec=min_sec,
-                            max_candidates=max_pieces * 2, hop_sec=1.0)
+    # ---- 找切分点（占总耗时的大头，进度 0% ~ 75%）----
+    dur = AL.probe_duration(ap)
+    # 窗口数随时长线性增长：1 小时音频按 1 秒 hop 就是 3600 次评分。
+    # 对超长音频适度放大 hop，把搜索次数收敛到一个可控量级 —— 仍然是从
+    # 实际音频上采样候选，只是采样点稀疏一点；拿到的片段依旧按同一套
+    # 语音占比/信噪比/响度评分排序，且最终只保留 max_pieces 个不重叠片段。
+    hop = 1.0
+    if dur > 0:
+        hop = float(max(1.0, dur / 1800.0))
+    if hop > 1.0:
+        _tick(0.0, f"音频 {dur:.0f} 秒偏长，切分搜索步长放大到 {hop:.1f} 秒"
+                   f"（约 {int(dur / hop)} 次评分）")
+
+    segs = AL.find_segments(
+        ap, target_sec=target_sec, min_sec=min_sec,
+        max_candidates=max_pieces * 2, hop_sec=hop,
+        progress=(lambda f, m: _tick(0.75 * f, m)) if progress else None,
+        should_stop=should_stop)
+    if _stopped():
+        return {"ok": False, "stopped": True, "error": "已取消"}
     if not segs:
         return {"ok": False, "error": "找不到合适的切分点（音频可能太短或全是静音）"}
 
@@ -594,11 +627,19 @@ def split_long(name: str, uid: str, target_sec: float = 12.0,
         if len(picked) >= max_pieces:
             break
 
-    # ---- 锁外：切片文件写盘（慢）----
+    # ---- 锁外：切片文件写盘（慢，进度 75% ~ 100%）----
     gen = _next_id(items)
     staged: List[Tuple[str, str, int, Any]] = []     # (uid, rel, 片号, seg)
     fails: List[str] = []
+    n_pick = max(1, len(picked))
     for k, s in enumerate(picked):
+        if _stopped():
+            # 已经把文件写出来的片段照常入册（不浪费已完成的 IO），
+            # 但明确告诉调用方「这是被中断的残缺结果」。
+            break
+        _tick(0.75 + 0.25 * (k / n_pick),
+              f"写出片段 {k + 1}/{len(picked)}"
+              f"（{s.start:.1f}~{s.end:.1f}s，评分 {s.score:.0f}）")
         new_id = gen()
         out_rel = os.path.join(AUDIO_SUBDIR, f"{new_id}.wav")
         try:
@@ -634,11 +675,14 @@ def split_long(name: str, uid: str, target_sec: float = 12.0,
             save_meta(name, items)
 
     out: Dict[str, Any] = {"ok": True, "created": len(created), "ids": created,
+                           "stopped": _stopped(),
                            "segments": [(round(s.start, 2), round(s.end, 2),
                                          round(s.score, 1))
-                                        for s in picked]}
+                                        for s in picked[:len(created)]]}
     if fails:
         out["failed"] = fails
+    _tick(1.0, f"切出 {len(created)} 片"
+               + ("（已中断）" if out["stopped"] else ""))
     return out
 
 

@@ -40,10 +40,12 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 import time
 from dataclasses import asdict, dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
+from webui_app import logging_setup as LOG
 from webui_app.config import OUTPUT_SAMPLE_RATE, PROJECT_ROOT
 from webui_app.services import audio_lab as AL
 from webui_app.training import cfm_lora as CL
@@ -275,11 +277,24 @@ class OneClickReport:
     best: Dict[str, Any] = field(default_factory=dict)
     notes: List[str] = field(default_factory=list)
     error: str = ""
+    # 阶段开始/结束时回调 (status, title)，供上层同步 runner.phase 等
+    phase_cb: Optional[Callable[[str, str], None]] = None
+
+    def _notify(self, status: str, title: str) -> None:
+        if self.phase_cb is not None:
+            try:
+                self.phase_cb(status, title)
+            except Exception:
+                pass
 
     def start(self, key: str, detail: str = "") -> None:
-        self.stages.append({"key": key, "title": STAGE_TITLE.get(key, key),
-                            "detail": detail, "status": "running",
-                            "seconds": 0.0, "info": {}})
+        title = STAGE_TITLE.get(key, key)
+        self.stages.append({"key": key, "title": title, "detail": detail,
+                            "status": "running", "seconds": 0.0, "info": {}})
+        # 阶段转换写进**文件日志**：界面上的进度只在内存里，进程一退就没了，
+        # 而「一键三连卡在哪一步」这类问题往往是事后才回头查的。
+        self._central().info("阶段开始 · %s · %s", title, detail or "")
+        self._notify("start", title)
 
     def finish(self, key: str, detail: str = "", status: str = "done",
                seconds: float = 0.0, **info: Any) -> None:
@@ -287,6 +302,16 @@ class OneClickReport:
             if s["key"] == key:
                 s.update(detail=detail or s["detail"], status=status,
                          seconds=round(seconds, 1), info=info)
+                from webui_app import logging_setup as LOG
+                lv = {"done": LOG.logging.INFO, "skipped": LOG.logging.WARNING,
+                      "failed": LOG.logging.ERROR,
+                      "stopped": LOG.logging.WARNING}.get(status,
+                                                          LOG.logging.INFO)
+                label = {"done": "完成", "skipped": "跳过", "failed": "失败",
+                         "stopped": "已停止"}.get(status, status)
+                self._central().log(lv, "阶段%s · %s · 用时 %.1fs · %s",
+                                    label, s["title"], seconds, detail or "")
+                self._notify(status, s["title"])
                 return
 
     def mark(self, key: str, status: str) -> None:
@@ -294,6 +319,19 @@ class OneClickReport:
             if s["key"] == key:
                 s["status"] = status
                 return
+
+    def running(self) -> Dict[str, Any]:
+        """当前正在跑的阶段。心跳与失败归因都用它 —— 没有它的话，
+        界面只会说「任务失败」，看不出是在哪一步卡住的。"""
+        for s in reversed(self.stages):
+            if s.get("status") == "running":
+                return s
+        return {}
+
+    @staticmethod
+    def _central():
+        from webui_app import logging_setup as LOG
+        return LOG.get_logger("oneclick")
 
     def add_note(self, msg: str) -> None:
         self.notes.append(msg)
@@ -511,23 +549,28 @@ def collect_inputs(paths: Sequence[str], extra_path: str = "",
     return {"files": files, "missing": missing, "skipped": skipped}
 
 
-def _durations(paths: Sequence[str], workers: int = 1) -> Dict[str, float]:
+def _durations(paths: Sequence[str], workers: int = 1, progress=None,
+               should_stop=None) -> Dict[str, float]:
     """批量取时长；读不出来的记为 -1。
 
-    解码 + 帧能量统计是纯 CPU 的独立计算，走并行没副作用（每条只读自己的文件）。
+    这里只用得上「这条算不算长音频」，所以走 `AL.probe_duration`（只读文件头）。
+    原先用 `AL.analyze` 会做**整段解码 + 全量帧能量**，对一段一小时长的音频
+    白等几十秒到几分钟，而且和后面 find_segments 的那次解码完全重复。
     """
     uniq = list(dict.fromkeys(paths))
     if not uniq:
         return {}
 
     def _one(p: str) -> float:
-        try:
-            return float(AL.analyze(p).duration or 0.0)
-        except Exception:
-            return -1.0
+        d = AL.probe_duration(p)
+        return float(d) if d is not None and d >= 0 else -1.0
 
-    out = PL.map_parallel(_one, uniq, workers=workers)
-    return {p: (out.items[i] if out.items[i] is not None else -1.0)
+    n = max(1, len(uniq))
+    outcome = PL.map_parallel(
+        _one, uniq, workers=workers, should_stop=should_stop,
+        on_done=(lambda i, _r: progress((i + 1) / n, f"读取时长 {i + 1}/{n}"))
+        if progress else None)
+    return {p: (outcome.items[i] if outcome.items[i] is not None else -1.0)
             for i, p in enumerate(uniq)}
 
 
@@ -555,9 +598,12 @@ def stage_ingest(dataset: str, files: Sequence[str], opt: OneClickOptions,
 
     # ---- 找出需要切片的长音频 ----
     items = {u.id: u for u in DS.load_meta(dataset)}
+    cb(0.62, "读取音频时长（只读文件头，不解码）")
     dur = _durations([items[i].audio_abs(DS.dir_of(dataset))
                       for i in added if i in items],
-                     workers=PL.default_workers(len(added), opt.cpu_workers))
+                     workers=PL.default_workers(len(added), opt.cpu_workers),
+                     progress=lambda f, m: cb(0.62 + 0.03 * f, m),
+                     should_stop=should_stop)
     long_uids = []
     for uid in added:
         u = items.get(uid)
@@ -567,27 +613,51 @@ def stage_ingest(dataset: str, files: Sequence[str], opt: OneClickOptions,
         if d > float(opt.slice_over_sec):
             long_uids.append(uid)
 
+    if long_uids:
+        longest = max((dur.get(items[i].audio_abs(DS.dir_of(dataset)), 0.0)
+                       for i in long_uids if i in items), default=0.0)
+        cb(0.65, f"{len(long_uids)} 条长音频需要切片（最长 {longest:.0f} 秒）")
+
     # ---- 逐条切片（split_long 自己管锁，且会把长原件留成 too_long 不参与训练）----
+    # 切片是整条流水线里最慢的**单点**：整段解码 → 全量帧能量 → 逐窗口评分 →
+    # 逐片写盘。所以这里把进度回调一路传进去（子进度映射到 65%~100%），
+    # 并且把 should_stop 也传进去 —— 否则按了停止要等它整条跑完才生效，
+    # 而用户看到的就是「没日志、停不下来」。
     pieces = 0
     total = max(1, len(long_uids))
     for i, uid in enumerate(long_uids):
         if should_stop and should_stop():
             result["stopped"] = True
             break
-        cb(0.6 + 0.4 * (i / total), f"切片 {i + 1}/{len(long_uids)} · {uid}")
-        sr = DS.split_long(dataset, uid,
-                           target_sec=float(opt.slice_target_sec),
-                           min_sec=float(opt.slice_min_sec),
-                           max_pieces=int(opt.slice_max_pieces))
+        cb(0.65 + 0.35 * (i / total),
+           f"切片 {i + 1}/{len(long_uids)} · {uid}（长音频，需要一点时间）")
+        sr = DS.split_long(
+            dataset, uid,
+            target_sec=float(opt.slice_target_sec),
+            min_sec=float(opt.slice_min_sec),
+            max_pieces=int(opt.slice_max_pieces),
+            progress=(lambda f, m, _i=i: cb(
+                0.65 + 0.35 * ((_i + f) / total), m)) if progress else None,
+            should_stop=should_stop)
         if sr.get("ok"):
             pieces += int(sr.get("created") or 0)
+        elif sr.get("stopped"):
+            result["stopped"] = True
+            break
         else:
             result.setdefault("slice_errors", []).append(
                 f"{uid}: {sr.get('error', '未知错误')}")
 
+    # 再查一次：停止请求可能是在**最后一条**切片的过程中发出的，
+    # 那时循环已经不会再迭代，不补这一下就会被算成「采集阶段正常完成」，
+    # 于是停止被归因到下一个阶段（实测出现过「在优化阶段停止」的误导）。
+    if not result.get("stopped") and should_stop and should_stop():
+        result["stopped"] = True
+
     result["sliced"] = len(long_uids)
     result["pieces"] = pieces
-    cb(1.0, f"导入 {result['added']} 条，切出 {pieces} 片")
+    cb(1.0, f"导入 {result['added']} 条，切出 {pieces} 片"
+            + ("（已中断）" if result.get("stopped") else ""))
     if report is not None:
         report.inputs = dict(result)
     return result
@@ -1381,6 +1451,60 @@ def run_oneclick(engine, options: OneClickOptions,
     t0 = time.perf_counter()
     bands = _Bands(STAGES)
     rep = OneClickReport(started_at=t0, options=options.to_dict())
+    log = LOG.get_logger("oneclick")
+
+    # ------------------------------------------------------------------
+    # 持续可观测性：进度落盘 + 心跳
+    #
+    # 之前只有「阶段完成」才会在界面上留一行，而切片这种**单点几步跑几分钟**
+    # 的工序中间什么都看不到 —— 用户没法区分「在工作」和「卡死了」，
+    # 事后翻文件日志也只有任务的开始和结束两条。所以：
+    #   · 每条进度都写进文件日志（DEBUG 级，不刷屏的级别下也能按需打开）；
+    #   · 一条**心跳线程**：只要超过 HEARTBEAT_IDLE 秒没有新进度，
+    #     就按 INFO 报一次「仍在进行 + 当前阶段 + 已静默多久 + 最后一条进度」。
+    #     静默本身就是信息 —— 它能把「长音频在算」和「真的卡住」分开。
+    # ------------------------------------------------------------------
+    HEARTBEAT_IDLE = 12.0
+    HEARTBEAT_PERIOD = 5.0
+    # 先抓住调用方给的进度回调：下面会把 `progress` 这个名字重绑成包装版，
+    # 而 Python 闭包捕获的是**变量** —— 不先存一份就会自己调自己，无限递归。
+    _user_progress = progress
+    last = {"t": time.time(), "msg": "启动", "frac": 0.0}
+    hb_stop = threading.Event()
+
+    def _progress(frac: float, msg: str) -> None:
+        last.update(t=time.time(), msg=msg, frac=float(frac))
+        log.debug("[%3.0f%%] %s", float(frac) * 100, msg)
+        if _user_progress is not None:
+            _user_progress(frac, msg)
+
+    def _heartbeat() -> None:
+        while not hb_stop.wait(HEARTBEAT_PERIOD):
+            idle = time.time() - last["t"]
+            if idle < HEARTBEAT_IDLE:
+                continue
+            cur = rep.running()
+            log.info("…仍在进行 · 阶段「%s」· 已静默 %.0f 秒 · 最后进度：%s",
+                     cur.get("title", "启动"), idle, last["msg"])
+            if _user_progress is not None:
+                # 让界面上那行进度也动一下，否则看起来像死了
+                _user_progress(last["frac"],
+                               f"仍在进行（{cur.get('title', '')}）· "
+                               f"最后进度：{last['msg']}")
+
+    def _phase_cb(status: str, title: str) -> None:
+        # 让 runner 也记下当前阶段：任务失败时它会把这一项打进日志，
+        # 归因到具体阶段而不是一句「未知」。
+        try:
+            if tracker is not None:
+                tracker.phase = title if status == "start" else ""
+        except Exception:
+            pass
+
+    rep.phase_cb = _phase_cb
+    progress = _progress          # 之后所有阶段都用包装版（落盘 + 心跳）
+    threading.Thread(target=_heartbeat, daemon=True,
+                     name="oneclick-heartbeat").start()
 
     def set_req(req: str) -> None:
         """告诉 runner「本流水线此刻需要引擎处于什么状态」。
@@ -1399,6 +1523,7 @@ def run_oneclick(engine, options: OneClickOptions,
             pass
 
     def done(status: str, error: str = "") -> Dict[str, Any]:
+        hb_stop.set()          # 心跳必须停，否则它会在任务结束后继续写日志
         rep.ok = status == "done"
         rep.error = error
         rep.seconds = round(time.perf_counter() - t0, 1)
