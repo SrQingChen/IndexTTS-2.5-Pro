@@ -48,6 +48,8 @@ TAB_SPECS: List[Tuple[str, str, str, str]] = [
     ("deploy", "🏁 评测/部署",  "webui_app.tabs.deploy_tab", "A/B · 挂载强度 · 合并 · 泛化保护"),
     ("model",  "📥 模型",       "webui_app.tabs.models",     "审计 · 镜像下载 · 实时进度"),
     ("sys",    "🖥 系统",       "webui_app.tabs.system",     "显存 · 环境体检 · 日志 · 维护"),
+    ("cleanup","🧹 清理",       "webui_app.tabs.cleanup_tab",
+     "产物盘点 · 分类明细 · 确认弹窗 · 安全删除"),
     ("manual", "📖 手册",       "webui_app.tabs.manual",     "架构原理 · 全部参数 · 配方 · 排查"),
 ]
 

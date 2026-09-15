@@ -57,6 +57,7 @@ TABS = [
     ("sys", "10_system", "系统"),
     ("manual", "11_manual", "手册"),
     ("oneclick", "12_oneclick", "一键三连"),
+    ("cleanup", "13_cleanup", "清理"),
 ]
 
 CHROME_CANDIDATES = [
@@ -211,7 +212,7 @@ WAIT_JS = """
 
 
 async def capture(url: str, out_dir: str, width: int, height: int,
-                  keep_browser: bool = False) -> int:
+                  keep_browser: bool = False, only: str = "") -> int:
     browser = find_browser()
     port = 9333
     profile = os.path.join(os.environ.get("TEMP", "."), "_ui_shot_profile")
@@ -234,6 +235,8 @@ async def capture(url: str, out_dir: str, width: int, height: int,
 
         ws_url = wait_for_page(port, url)
 
+        # --only：按标签文本模糊过滤（新增页签验收时只截一张，不重刷全部）
+        tabs = [t for t in TABS if (not only) or (only in t[2])]
         got = 0
         async with CDP(ws_url) as cdp:
             await cdp.call("Page.enable")
@@ -244,8 +247,8 @@ async def capture(url: str, out_dir: str, width: int, height: int,
             await cdp.call("Page.navigate", {"url": url})
             await asyncio.sleep(6.0)         # 等 Gradio 首屏渲染
 
-            for i, (tab_id, fname, label) in enumerate(TABS):
-                if i > 0:
+            for i, (tab_id, fname, label) in enumerate(tabs):
+                if i > 0 or only:            # only 模式首屏停在合成页，同样要点
                     res = await cdp.js(CLICK_JS % json.dumps(label))
                     try:
                         r = json.loads(res) if res else {}
@@ -278,9 +281,9 @@ async def capture(url: str, out_dir: str, width: int, height: int,
                       f"（{size_kb:.0f} KB，当前选中：{active}）")
                 got += 1
 
-        # 顺带把首屏单独存一份 overview（README 顶部用）
+        # 顺带把首屏单独存一份 overview（README 顶部用；--only 模式不覆盖）
         first = os.path.join(out_dir, f"{TABS[0][1]}.png")
-        if os.path.isfile(first):
+        if not only and os.path.isfile(first):
             shutil.copy2(first, os.path.join(out_dir, "00_overview.png"))
         print(f"  完成：{got} 张 → {out_dir}")
         return got
@@ -304,6 +307,9 @@ def main() -> int:
     ap.add_argument("--height", type=int, default=1050)
     ap.add_argument("--keep-browser", action="store_true",
                     help="截图后不关浏览器（调试用）")
+    ap.add_argument("--only", default="",
+                    help="只截标签文本包含该串的 Tab（如 --only 清理），"
+                         "用于新增页签的单独验收")
     a = ap.parse_args()
 
     # 先确认界面活着，省得让用户对着超时发呆
@@ -317,7 +323,7 @@ def main() -> int:
         return 2
     print(f"✓ 界面在线（HTTP {code}）：{a.url}")
     n = asyncio.run(capture(a.url, a.out, a.width, a.height,
-                            a.keep_browser))
+                            a.keep_browser, a.only))
     return 0 if n else 1
 
 
