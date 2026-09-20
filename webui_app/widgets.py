@@ -78,6 +78,10 @@ def make_component(
     if kind == "audio":
         kw.pop("value", None)
         kw.pop("interactive", None)
+        # 调用方显式给了值（参数记忆恢复上传音频）就带上；
+        # 默认路径保持原行为（不带 value，控件为空）。
+        if value != "__default__" and value:
+            kw["value"] = value
         return gr.Audio(
             type="filepath", sources=["upload", "microphone"],
             elem_classes=["ix-audio-compact"] + (elem_classes or []), **kw,

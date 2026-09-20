@@ -24,12 +24,24 @@ from webui_app.context import AppContext
 from webui_app.services import audio_lab as AL
 from webui_app.services import inference as INF
 from webui_app.services import pronunciation as PR
+from webui_app.services import synth_state as SS
 from webui_app import logging_setup as LOG
 from webui_app.services import voice_bank
 from webui_app.services.engine import EngineError
 from webui_app.training import guard as GD
 from webui_app.training import merge as MG
 from webui_app.training import runs as RN
+
+# 配置档直接复用官方预设系统（与「💾 预设」页 / 官方 webui.py 完全互通）
+try:
+    from indextts.utils.presets import (delete_preset, list_presets, load_preset,
+                                        safe_preset_name, save_preset)
+except Exception:      # pragma: no cover - 官方模块缺失时的降级
+    list_presets = lambda: []           # noqa: E731
+    load_preset = lambda n: None        # noqa: E731
+    save_preset = None                  # type: ignore[assignment]
+    delete_preset = lambda n: False     # noqa: E731
+    safe_preset_name = lambda n: n      # noqa: E731
 
 # ---------------------------------------------------------------------------
 # LoRA 挂载区的辅助函数（模块级：不依赖 ctx，便于单独测试）
@@ -163,6 +175,14 @@ EXAMPLE_TEXTS = [
 ]
 
 
+def _prof_choices() -> List[str]:
+    """配置档下拉的选项（官方预设目录）。"""
+    try:
+        return [""] + list_presets()
+    except Exception:
+        return [""]
+
+
 # ---------------------------------------------------------------------------
 # 纯函数：情感向量归一化（与官方 normalize_emo_vec 完全一致，但不需要引擎）
 # ---------------------------------------------------------------------------
@@ -231,6 +251,62 @@ def render(ctx: AppContext):
     eng = ctx.engine
     sb = ctx.component("statusbar")     # 顶栏状态条，由 app.py 预先注册
 
+    # ------------------------------------------------------------------
+    # 参数记忆：把上次的值直接作为控件初始值。
+    # 恢复走「渲染时初始值」而不是页面加载事件回填 —— render() 每个进程
+    # 只跑一次，首屏 payload 就是正确的，无闪烁、无事件竞态。
+    # ------------------------------------------------------------------
+    _st_payload = SS.load_state()
+    _remember = SS.remember_enabled(_st_payload)
+    ST: Dict[str, Any] = _st_payload.get("values", {}) if _remember else {}
+    _st_prompt = _st_payload.get("prompt_audio") if _remember else None
+    _st_emo_audio = _st_payload.get("emo_audio") if _remember else None
+
+    def _v(key: str):
+        """带记忆的初始值；没有记忆时回退注册表默认值。"""
+        return ST[key] if key in ST else "__default__"
+
+    # 选择类的值要做「仍在合法集合内」校验，否则下拉框会显示非法值
+    _bank_names = voice_bank.names()
+    _st_voice = ST.get("voice_name") if ST.get("voice_name") in _bank_names else ""
+    _st_lang = ST.get("lang") if ST.get("lang") in cfg.languages else "__default__"
+    _lora_values = [v for _l, v in _lora_run_choices()]
+    _st_lora_run = ST.get("lora_run") if ST.get("lora_run") in _lora_values else ""
+    _st_lora_ckpt = ("best" if not _st_lora_run else
+                     (ST.get("lora_ckpt")
+                      if ST.get("lora_ckpt") in _lora_ckpt_choices(_st_lora_run)
+                      else "best"))
+    _st_emo_label = (ST.get("emo_mode_label")
+                     if ST.get("emo_mode_label") in W.EMO_MODE_LABELS
+                     else "__default__")
+    # 恢复的模式决定各情感分组的初始可见性（与 on_emo_mode 的联动一致）
+    _st_mode = (W.emo_mode_index(_st_emo_label)
+                if _st_emo_label != "__default__" else 0)
+
+    if _st_payload and _remember:
+        _mem_note = (f"已恢复上次参数（{len(ST)} 项 · 保存于 "
+                     f"{SS.saved_at_text(_st_payload)}）"
+                     + ("" if _st_payload.get("prompt_audio")
+                        or not ST.get("voice_name")
+                        else "；上次的参考音频文件已失效，请重新选择"))
+        _mem_init = (f'<span class="ix-chip"><span class="ix-dot ok"></span>'
+                     f'参数记忆 · {_mem_note}</span>')
+    elif _st_payload:
+        _mem_init = ('<span class="ix-chip"><span class="ix-dot warn"></span>'
+                     '参数记忆 · 已关闭（重启后不恢复）</span>')
+    else:
+        _mem_init = ('<span class="ix-chip"><span class="ix-dot idle"></span>'
+                     '参数记忆 · 尚无记录</span>')
+
+    # 共享快照在渲染期就用「恢复值」播种：否则重启后用户什么都没动就点
+    # 「存为配置档」时，快照还是空的，会把默认值当成当前参数存进档里。
+    ctx.shared["syn_live_values"] = dict(ST)
+    ctx.shared["syn_live_values"].update({
+        "prompt_audio": _st_prompt, "emo_audio": _st_emo_audio,
+        "_remember": _remember,
+    })
+    ctx.shared["_remember_flag"] = _remember
+
     with gr.Row(equal_height=False):
         # =================================================================
         # 左栏
@@ -244,7 +320,7 @@ def render(ctx: AppContext):
                                   "w2v-BERT 情感特征、ref_mel 声学模板 —— 音色的全部来源。"))
                 with gr.Row():
                     voice_dd = gr.Dropdown(
-                        choices=[""] + voice_bank.names(), value="",
+                        choices=[""] + _bank_names, value=_st_voice,
                         label="从音色库载入", scale=3,
                         info="在「参考音频工作台」体检并增强后入库的素材",
                         allow_custom_value=False,
@@ -252,7 +328,8 @@ def render(ctx: AppContext):
                     voice_reload_btn = gr.Button("↻", scale=0, variant="secondary",
                                                  size="sm")
                     voice_refresh_btn = gr.Button("刷新列表", scale=1, size="sm")
-                prompt_audio = W.make_component("spk_audio_prompt", label="")
+                prompt_audio = W.make_component("spk_audio_prompt", label="",
+                                                value=_st_prompt)
                 with gr.Row():
                     voice_detail_btn = gr.Button("查看该音色体检报告", size="sm", scale=1)
                     to_lab_btn = gr.Button("→ 送去工作台优化", size="sm", scale=1)
@@ -268,7 +345,7 @@ def render(ctx: AppContext):
                     "挂上之后照常点「生成」即可，参数不必改。"))
                 with gr.Row():
                     lora_run_dd = gr.Dropdown(
-                        choices=_lora_run_choices(), value="",
+                        choices=_lora_run_choices(), value=_st_lora_run,
                         label="训练记录（run）", scale=3,
                         allow_custom_value=False,
                         info="只列出已经产出 adapter 的记录")
@@ -276,11 +353,13 @@ def render(ctx: AppContext):
                                                 variant="secondary", size="sm")
                 with gr.Row():
                     lora_ckpt_dd = gr.Dropdown(
-                        choices=["best"], value="best", label="档位", scale=1,
+                        choices=_lora_ckpt_choices(_st_lora_run),
+                        value=_st_lora_ckpt, label="档位", scale=1,
                         info="best = 该 run 表现最好的一档；"
                              "具名档位来自 checkpoints 保险库")
                     lora_scale_sl = gr.Slider(
-                        0.0, 1.5, value=1.0, step=0.05, label="强度", scale=2,
+                        0.0, 1.5, value=float(ST.get("lora_scale", 1.0)),
+                        step=0.05, label="强度", scale=2,
                         info="推理期实时生效，不用重训")
                 with gr.Row():
                     lora_mount_btn = gr.Button("🧬 挂载到引擎", size="sm", scale=1)
@@ -296,15 +375,17 @@ def render(ctx: AppContext):
                     "清晰度抬出来、用高频自身的谐波补一点空气感，<b>不伪造细节</b>。<br>"
                     "默认只做高通与峰值对齐；想更亮就调 presence，想要空气感再加 exciter。"))
                 polish_cb = gr.Checkbox(
-                    True, label="启用输出后处理",
+                    bool(ST.get("polish_on", True)), label="启用输出后处理",
                     info="关掉则输出与模型原始结果完全一致（最保真）")
                 with gr.Row():
                     polish_presence = gr.Slider(
-                        0.0, 6.0, 2.5, step=0.5, label="提亮 presence (dB)",
+                        0.0, 6.0, float(ST.get("polish_presence", 2.5)),
+                        step=0.5, label="提亮 presence (dB)",
                         info="4.5 kHz 以上平滑抬升。2~4 dB 明显更「亮」更清楚，"
                              "超过 5 容易齿音发刺")
                     polish_exciter = gr.Slider(
-                        0.0, 0.3, 0.08, step=0.01, label="空气感激励",
+                        0.0, 0.3, float(ST.get("polish_exciter", 0.08)),
+                        step=0.01, label="空气感激励",
                         info="从 5 kHz 以上生成谐波、只叠加 9 kHz 以上的部分。"
                              "0.05~0.15 是安全区；再高会明显失真")
                 polish_md = gr.Markdown(
@@ -318,13 +399,15 @@ def render(ctx: AppContext):
                 text_in = W.make_component("text", value="", placeholder="请输入要合成的文本…")
                 with gr.Row():
                     if cfg.is_v25:
-                        lang_dd = W.make_component("lang", scale=1)
+                        lang_dd = W.make_component("lang", scale=1, value=_st_lang)
                     else:
                         lang_dd = gr.State(value=None)
-                    dur_sl = W.make_component("duration_factor", scale=2)
-                    seed_n = W.make_component("seed", scale=1)
+                    dur_sl = W.make_component("duration_factor", scale=2,
+                                              value=_v("duration_factor"))
+                    seed_n = W.make_component("seed", scale=1, value=_v("seed"))
                 with gr.Row():
-                    tn_cb = W.make_component("text_normalization", scale=1)
+                    tn_cb = W.make_component("text_normalization", scale=1,
+                                             value=_v("text_normalization"))
                     token_stat = gr.HTML("")
 
                 # ---------- 读音纠正 ----------
@@ -372,8 +455,10 @@ def render(ctx: AppContext):
                         wrap=True, elem_classes=["ix-table"],
                     )
                     seg_note = gr.HTML("")
-                seg_sl = W.make_component("max_text_tokens_per_segment")
-                sil_sl = W.make_component("interval_silence")
+                seg_sl = W.make_component("max_text_tokens_per_segment",
+                                          value=_v("max_text_tokens_per_segment"))
+                sil_sl = W.make_component("interval_silence",
+                                          value=_v("interval_silence"))
 
             # ---------- 情感控制 ----------
             with gr.Column(elem_classes=["ix-section"]):
@@ -381,44 +466,65 @@ def render(ctx: AppContext):
                                   "情感只注入 GPT(T2S)，完全不进 CFM(S2M) —— "
                                   "这就是「音色-情感解耦」：改情感不动音色。"))
                 emo_mode = W.make_component("emo_control_method",
-                                            value=W.EMO_MODE_LABELS[0])
-                emo_hint = gr.HTML("")
+                                            value=_st_emo_label
+                                            if _st_emo_label != "__default__"
+                                            else W.EMO_MODE_LABELS[0])
+                _MODE_HINTS_BOOT = [
+                    T.tip("<b>模式 0</b>：情感跟随音色参考音频自身。音色还原度最高，最稳的默认值。"
+                          "此模式下「情感权重」滑块<b>无效</b>（代码里 emo_alpha 被强制为 1.0）。"),
+                    T.hint("<b>模式 1</b>：音色与情感分别指定。「情感权重」是<b>线性插值系数</b>："
+                           "<code>out = base + alpha*(emo - base)</code>，0=完全用音色音频自身情感，"
+                           "1=完全用情感参考音频情感。推荐 0.6~0.8。"),
+                    T.hint("<b>模式 2</b>：手动指定 8 维向量。「情感权重」此时是<b>向量缩放系数</b>，"
+                           "等比缩放 8 个值。此模式<b>不能</b>叠加情感参考音频（代码会强制清空它）。"),
+                    T.warn("<b>模式 3 · 实验功能</b>：用自然语言描述情绪，由 QwenEmotion(Qwen3-0.6B) "
+                           "转成 8 维向量。官方建议情感权重设 <b>0.6 或更低</b>。"
+                           "本 UI 采用<b>串行执行</b>：挂载 → 算向量 → 立即卸载 → 再走模式 2 的路径，"
+                           "避免与主推理抢显存（实测峰值 6.26GB / 8GB）。"),
+                ]
+                emo_hint = gr.HTML(_MODE_HINTS_BOOT[_st_mode])
 
-                with gr.Group(visible=False) as g_emo_audio:
-                    emo_audio = W.make_component("emo_audio_prompt")
+                with gr.Group(visible=_st_mode == 1) as g_emo_audio:
+                    emo_audio = W.make_component("emo_audio_prompt",
+                                                 value=_st_emo_audio)
 
-                with gr.Group(visible=False) as g_emo_vec:
+                with gr.Group(visible=_st_mode == 2) as g_emo_vec:
                     gr.HTML('<div class="ix-hint">顺序固定为 '
                             '[喜, 怒, 哀, 惧, 厌恶, 低落, 惊喜, 平静]。'
                             '每维有内置偏置系数，且 8 维总和超过 0.8 会被静默压缩。</div>')
                     with gr.Row(elem_classes=["ix-emo-grid"]):
                         with gr.Column():
-                            v0 = W.make_component("emo_vec_0")
-                            v1 = W.make_component("emo_vec_1")
-                            v2 = W.make_component("emo_vec_2")
-                            v3 = W.make_component("emo_vec_3")
+                            v0 = W.make_component("emo_vec_0", value=_v("emo_vec_0"))
+                            v1 = W.make_component("emo_vec_1", value=_v("emo_vec_1"))
+                            v2 = W.make_component("emo_vec_2", value=_v("emo_vec_2"))
+                            v3 = W.make_component("emo_vec_3", value=_v("emo_vec_3"))
                         with gr.Column():
-                            v4 = W.make_component("emo_vec_4")
-                            v5 = W.make_component("emo_vec_5")
-                            v6 = W.make_component("emo_vec_6")
-                            v7 = W.make_component("emo_vec_7")
-                    vec_meter = gr.HTML(vec_meter_html([0.0] * 8))
+                            v4 = W.make_component("emo_vec_4", value=_v("emo_vec_4"))
+                            v5 = W.make_component("emo_vec_5", value=_v("emo_vec_5"))
+                            v6 = W.make_component("emo_vec_6", value=_v("emo_vec_6"))
+                            v7 = W.make_component("emo_vec_7", value=_v("emo_vec_7"))
+                    vec_meter = gr.HTML(
+                        vec_meter_html([float(ST.get(f"emo_vec_{i}", 0.0) or 0.0)
+                                        for i in range(8)]))
                     with gr.Row():
                         vec_zero_btn = gr.Button("全部归零", size="sm", scale=1)
                         vec_rand_btn = gr.Button("随机一组", size="sm", scale=1)
 
-                with gr.Group(visible=False) as g_emo_text:
+                with gr.Group(visible=_st_mode == 3) as g_emo_text:
                     emo_text = W.make_component(
-                        "emo_text", placeholder="例如：委屈巴巴 / 危险在悄悄逼近")
+                        "emo_text", value=_v("emo_text"),
+                        placeholder="例如：委屈巴巴 / 危险在悄悄逼近")
                     with gr.Row():
                         emo_probe_btn = gr.Button("预览情感向量（不合成）", size="sm", scale=2)
                         emo_cache_btn = gr.Button("清空向量缓存", size="sm", scale=1)
                     emo_probe_out = gr.HTML("")
 
-                with gr.Row(visible=False) as g_emo_alpha:
-                    emo_alpha = W.make_component("emo_alpha", scale=3)
-                with gr.Row(visible=False) as g_emo_rand:
-                    emo_rand = W.make_component("use_random", scale=1)
+                with gr.Row(visible=_st_mode in (1, 2, 3)) as g_emo_alpha:
+                    emo_alpha = W.make_component("emo_alpha", scale=3,
+                                                 value=_v("emo_alpha"))
+                with gr.Row(visible=_st_mode in (2, 3)) as g_emo_rand:
+                    emo_rand = W.make_component("use_random", scale=1,
+                                                value=_v("use_random"))
 
             # ---------- 生成 ----------
             with gr.Column(elem_classes=["ix-section"]):
@@ -440,16 +546,21 @@ def render(ctx: AppContext):
                     "<b>内容</b>和<b>韵律</b>，所以这里调的是「读得对不对、节奏自不自然」，"
                     "不是音色。"))
                 with gr.Row():
-                    do_sample = W.make_component("do_sample", scale=1)
-                    temperature = W.make_component("temperature", scale=2)
+                    do_sample = W.make_component("do_sample", scale=1,
+                                                 value=_v("do_sample"))
+                    temperature = W.make_component("temperature", scale=2,
+                                                   value=_v("temperature"))
                 with gr.Row():
-                    top_p = W.make_component("top_p", scale=1)
-                    top_k = W.make_component("top_k", scale=1)
-                num_beams = W.make_component("num_beams")
+                    top_p = W.make_component("top_p", scale=1, value=_v("top_p"))
+                    top_k = W.make_component("top_k", scale=1, value=_v("top_k"))
+                num_beams = W.make_component("num_beams", value=_v("num_beams"))
                 with gr.Row():
-                    rep_pen = W.make_component("repetition_penalty", scale=1)
-                    len_pen = W.make_component("length_penalty", scale=1)
-                max_mel = W.make_component("max_mel_tokens")
+                    rep_pen = W.make_component("repetition_penalty", scale=1,
+                                               value=_v("repetition_penalty"))
+                    len_pen = W.make_component("length_penalty", scale=1,
+                                               value=_v("length_penalty"))
+                max_mel = W.make_component("max_mel_tokens",
+                                           value=_v("max_mel_tokens"))
                 gr.HTML(T.warn(
                     "<b>repetition_penalty=10.0 不是笔误。</b>常规 LLM 用 1.0~1.3，"
                     "但 TTS 的语义 token 天然会连续重复（长元音、静音 token 52）。"
@@ -492,6 +603,40 @@ def render(ctx: AppContext):
                     "官方 <code>examples/</code> 下的示例音频可用「音色库」页一键导入。"
                     "注意 <code>voice_01.wav</code> 实测只有 <b>2.44 秒</b>，"
                     "低于 3 秒的最低推荐值 —— 用它做参考音频，音色稳定性会打折。"))
+
+            # ---------- 参数记忆与配置档 ----------
+            with gr.Accordion("💾 参数记忆与配置档", open=True):
+                gr.HTML(T.hint(
+                    "本页参数改动<b>自动记住</b>，重启后自动恢复（含上传的参考音频副本）。"
+                    "合成文本不记忆 —— 那是内容不是配置。"))
+                mem_status = gr.HTML(_mem_init)
+                with gr.Row():
+                    remember_cb = gr.Checkbox(
+                        _remember, label="记住参数改动（重启后恢复）", scale=2)
+                    forget_btn = gr.Button("🧹 清除记忆并恢复默认", size="sm",
+                                           scale=1)
+                gr.HTML(T.hint(
+                    "<b>配置档</b> = 命名的参数快照，存于 "
+                    "<code>outputs/presets/&lt;名称&gt;/</code>，"
+                    "与「💾 预设」页及官方 <code>webui.py</code> 完全互通。"))
+                with gr.Row():
+                    prof_dd = gr.Dropdown(
+                        choices=_prof_choices(), value="", label="配置档",
+                        scale=3, allow_custom_value=False,
+                        elem_id="ix-profile-dd")
+                    prof_reload_btn = gr.Button("↻", scale=0, size="sm",
+                                                variant="secondary")
+                prof_name = gr.Textbox(
+                    label="存为配置档（名称）", scale=2,
+                    placeholder="例如：主播A-温暖-慢速")
+                with gr.Row():
+                    prof_save_btn = gr.Button("💾 存为配置档", size="sm", scale=1,
+                                              variant="primary")
+                    prof_apply_btn = gr.Button("⬆️ 应用配置档", size="sm", scale=1)
+                    prof_del_btn = gr.Button("🗑 删除", size="sm", scale=0,
+                                             variant="stop")
+                prof_out = gr.HTML("")
+                prof_armed = gr.State("")     # 删除两步确认的布防状态
 
     # =====================================================================
     # 回调
@@ -803,9 +948,12 @@ def render(ctx: AppContext):
         c.change(on_vec_change, inputs=vec_components, outputs=[vec_meter])
 
     def on_vec_zero():
-        return [gr.update(value=0.0) for _ in range(8)] + [vec_meter_html([0.0] * 8)]
+        patch = {f"emo_vec_{i}": 0.0 for i in range(8)}
+        return ([gr.update(value=0.0) for _ in range(8)]
+                + [vec_meter_html([0.0] * 8), _persist_patch(patch)])
 
-    vec_zero_btn.click(on_vec_zero, inputs=[], outputs=vec_components + [vec_meter])
+    vec_zero_btn.click(on_vec_zero, inputs=[],
+                       outputs=vec_components + [vec_meter, mem_status])
 
     def on_vec_rand():
         import random
@@ -813,9 +961,12 @@ def render(ctx: AppContext):
         vec = [0.0] * 8
         for i in random.sample(range(8), k=random.choice([1, 2])):
             vec[i] = round(random.uniform(0.3, 0.9), 2)
-        return [gr.update(value=x) for x in vec] + [vec_meter_html(vec)]
+        patch = {f"emo_vec_{i}": vec[i] for i in range(8)}
+        return ([gr.update(value=x) for x in vec]
+                + [vec_meter_html(vec), _persist_patch(patch)])
 
-    vec_rand_btn.click(on_vec_rand, inputs=[], outputs=vec_components + [vec_meter])
+    vec_rand_btn.click(on_vec_rand, inputs=[],
+                       outputs=vec_components + [vec_meter, mem_status])
 
     # ---------- 模式 3 预览 ----------
     def on_emo_probe(emo_text_val, text_val, dev):
@@ -991,10 +1142,10 @@ def render(ctx: AppContext):
     # ---------- 音色库联动 ----------
     def on_voice_select(name):
         if not name:
-            return gr.update(), ""
+            return gr.update(), "", gr.update()
         e = voice_bank.get(name)
         if e is None:
-            return gr.update(), T.err(f"音色 `{name}` 不存在")
+            return gr.update(), T.err(f"音色 `{name}` 不存在"), gr.update()
         badge = {"优秀": "🟢", "良好": "🟢", "可用": "🟡",
                  "勉强": "🟠", "不建议使用": "🔴"}.get(e.grade, "·")
         html = (
@@ -1005,10 +1156,12 @@ def render(ctx: AppContext):
             + "</div>")
         if e.report and e.report.get("issues"):
             html += T.warn("体检遗留问题：" + "；".join(e.report["issues"][:2]))
-        return gr.update(value=e.audio_path), html
+        # 选择音色会程序化设置参考音频（不触发 change），记忆在这里补
+        mem = _persist_patch({"voice_name": name, "prompt_audio": e.audio_path})
+        return gr.update(value=e.audio_path), html, mem
 
     voice_dd.change(on_voice_select, inputs=[voice_dd],
-                    outputs=[prompt_audio, voice_info])
+                    outputs=[prompt_audio, voice_info, mem_status])
 
     def on_voice_reload():
         return gr.update(choices=[""] + voice_bank.names())
@@ -1059,11 +1212,15 @@ def render(ctx: AppContext):
                        "8GB 卡上请留意 OOM。",
         }[which]
         gr.Info(note[:60])
-        return ups
+        # 快速档按钮程序化设置 8 个采样控件（不触发 change），记忆在这里补
+        return ups + [_persist_patch(dict(d))]
 
-    preset_fast.click(lambda: apply_preset("fast"), inputs=[], outputs=sampling_components)
-    preset_bal.click(lambda: apply_preset("balanced"), inputs=[], outputs=sampling_components)
-    preset_hq.click(lambda: apply_preset("quality"), inputs=[], outputs=sampling_components)
+    preset_fast.click(lambda: apply_preset("fast"), inputs=[],
+                      outputs=sampling_components + [mem_status])
+    preset_bal.click(lambda: apply_preset("balanced"), inputs=[],
+                     outputs=sampling_components + [mem_status])
+    preset_hq.click(lambda: apply_preset("quality"), inputs=[],
+                    outputs=sampling_components + [mem_status])
 
     # ---------- 引擎控制 ----------
     def engine_html():
@@ -1133,13 +1290,319 @@ def render(ctx: AppContext):
     # ---------- 示例 ----------
     def on_example(choice):
         if not choice:
-            return gr.update(), gr.update()
+            return gr.update(), gr.update(), gr.update()
         idx = [f"{t}｜{lang}" for t, _x, lang in EXAMPLE_TEXTS].index(choice)
         _t, text, lang = EXAMPLE_TEXTS[idx]
-        return gr.update(value=text), gr.update(value=lang) if cfg.is_v25 else gr.update()
+        # 示例会改 lang，而 gr.update 不触发 change 事件，记忆要在这里补
+        mem = _persist_patch({"lang": lang}) if cfg.is_v25 else gr.update()
+        return (gr.update(value=text),
+                gr.update(value=lang) if cfg.is_v25 else gr.update(), mem)
 
     ex_dd.change(on_example, inputs=[ex_dd],
-                 outputs=[text_in, lang_dd] if cfg.is_v25 else [text_in, text_in])
+                 outputs=([text_in, lang_dd, mem_status] if cfg.is_v25
+                          else [text_in, text_in, mem_status]))
+
+    # =====================================================================
+    # 参数记忆：任何改动自动落盘（重启后由 render 开头恢复）
+    # =====================================================================
+    # remember_cb 也在这份列表里：拨动开关本身就是一次「改动」。
+    remember_comps = [
+        voice_dd, prompt_audio, lang_dd, dur_sl, seed_n, tn_cb,
+        seg_sl, sil_sl, emo_mode, emo_audio, emo_alpha,
+        v0, v1, v2, v3, v4, v5, v6, v7, emo_text, emo_rand,
+        do_sample, temperature, top_p, top_k, num_beams,
+        rep_pen, len_pen, max_mel,
+        lora_run_dd, lora_ckpt_dd, lora_scale_sl,
+        polish_cb, polish_presence, polish_exciter, remember_cb,
+    ]
+
+    def _live_snapshot(*vals) -> Dict[str, Any]:
+        """remember_comps 的当前值 → 语义键字典（含音频路径与记忆开关）。"""
+        (voice_name, pa, lang, dur, seed, tn, seg, sil, emo_lab, ea, alpha,
+         vv0, vv1, vv2, vv3, vv4, vv5, vv6, vv7, etxt, erand,
+         dsamp, temp, topp, topk, beams, rpen, lpen, mmel,
+         lrun, lckpt, lscale, pon, ppre, pexc, remember_on) = vals
+        return {
+            "voice_name": voice_name or "",
+            "prompt_audio": pa, "emo_audio": ea,
+            "lang": lang, "duration_factor": dur, "seed": seed,
+            "text_normalization": tn,
+            "max_text_tokens_per_segment": seg, "interval_silence": sil,
+            "emo_mode_label": emo_lab,
+            "emo_mode_index": W.emo_mode_index(emo_lab),
+            "emo_alpha": alpha,
+            "emo_vec_0": vv0, "emo_vec_1": vv1, "emo_vec_2": vv2,
+            "emo_vec_3": vv3, "emo_vec_4": vv4, "emo_vec_5": vv5,
+            "emo_vec_6": vv6, "emo_vec_7": vv7,
+            "emo_text": etxt, "use_random": erand,
+            "do_sample": dsamp, "temperature": temp, "top_p": topp,
+            "top_k": topk, "num_beams": beams, "repetition_penalty": rpen,
+            "length_penalty": lpen, "max_mel_tokens": mmel,
+            "lora_run": lrun or "", "lora_ckpt": lckpt or "best",
+            "lora_scale": lscale, "polish_on": pon,
+            "polish_presence": ppre, "polish_exciter": pexc,
+            "_remember": bool(remember_on),
+        }
+
+    # 「清除记忆」重置 34 个控件会触发一轮 change 回声；两秒内不落盘，
+    # 否则刚清掉的记忆立刻被（默认值）写回，界面上看起来像「清除不掉」。
+    _suppress_save_until = {"t": 0.0}
+
+    def _persist(live: Dict[str, Any]) -> Any:
+        """写共享快照 + 按开关落盘。返回记忆状态行的 gr.update。"""
+        ctx.shared["syn_live_values"] = dict(live)
+        remember = bool(live.get("_remember", True))
+        prev_flag = bool(ctx.shared.get("_remember_flag", True))
+        ctx.shared["_remember_flag"] = remember
+
+        if not remember:
+            # 关掉开关这个动作本身要落盘一次（否则重启后开关自己变回开），
+            # 之后的参数改动不再写。
+            if prev_flag:
+                SS.save_state(
+                    {k: v for k, v in live.items()
+                     if k not in ("prompt_audio", "emo_audio")},
+                    prompt_audio=live.get("prompt_audio"),
+                    emo_audio=live.get("emo_audio"))
+            return gr.update(
+                value='<span class="ix-chip"><span class="ix-dot warn"></span>'
+                      '参数记忆 · 已关闭（重启后不恢复）</span>')
+
+        if time.time() < _suppress_save_until["t"]:
+            return gr.update()          # 清除记忆后的重置回声，保持「已清除」显示
+
+        ok = SS.save_state(
+            {k: v for k, v in live.items()
+             if k not in ("prompt_audio", "emo_audio")},
+            prompt_audio=live.get("prompt_audio"),
+            emo_audio=live.get("emo_audio"))
+        if ok:
+            return gr.update(
+                value='<span class="ix-chip"><span class="ix-dot ok"></span>'
+                      f'参数记忆 · 已记住（{time.strftime("%H:%M:%S")}）</span>')
+        return gr.update(
+            value='<span class="ix-chip"><span class="ix-dot err"></span>'
+                  '参数记忆 · 写入失败（目录只读？）</span>')
+
+    def _persist_patch(patch: Dict[str, Any]) -> Any:
+        """程序化设置控件的回调用这个补一次落盘。
+
+        gr.update 设值**不会**触发 change 事件（音色库选择 / 示例 / 快速档 /
+        配置档应用都是程序化设值），所以它们的手动补一条；先与最近快照合并，
+        保证不把其它字段的记忆冲掉。
+        """
+        live = dict(ctx.shared.get("syn_live_values") or {})
+        live.update(patch)
+        live.setdefault("_remember", _remember)
+        return _persist(live)
+
+    @LOG.ui_guard("synthesize.on_param_change")
+    def on_param_change(*vals):
+        return _persist(_live_snapshot(*vals))
+
+    # 单条依赖挂 35 个触发器：任何一个控件变化都整表落盘。
+    # show_progress="hidden"：这是高频事件，不能每次拖完滑杆都闪加载动画。
+    gr.on(triggers=[c.change for c in remember_comps],
+          fn=on_param_change, inputs=remember_comps, outputs=[mem_status],
+          show_progress="hidden")
+
+    # ---------- 清除记忆并恢复默认 ----------
+    reset_targets = [
+        prompt_audio, emo_mode, emo_audio, lang_dd, dur_sl,
+        emo_alpha, emo_rand, emo_text,
+        v0, v1, v2, v3, v4, v5, v6, v7,
+        do_sample, temperature, top_p, top_k, num_beams,
+        rep_pen, len_pen, max_mel, seg_sl,
+        sil_sl, seed_n, tn_cb, voice_dd,
+        lora_run_dd, lora_ckpt_dd, lora_scale_sl,
+        polish_cb, polish_presence, polish_exciter,
+    ]
+
+    @LOG.ui_guard("synthesize.on_forget")
+    def on_forget():
+        SS.forget()
+        ctx.shared["syn_live_values"] = {}
+        ctx.shared["_remember_flag"] = True
+        _suppress_save_until["t"] = time.time() + 2.0
+        gr.Info("已清除参数记忆，界面已恢复默认值")
+        ups = [
+            gr.update(value=None),                        # 参考音频
+            gr.update(value=W.EMO_MODE_LABELS[0]),        # 情感模式
+            gr.update(value=None),                        # 情感参考音频
+            gr.update(value=P.get("lang").default if cfg.is_v25 else None),
+            gr.update(value=float(P.get("duration_factor").default)),
+            gr.update(value=float(P.get("emo_alpha").default)),
+            gr.update(value=bool(P.get("use_random").default)),
+            gr.update(value=P.get("emo_text").default or ""),
+            *[gr.update(value=float(P.get(f"emo_vec_{i}").default))
+              for i in range(8)],
+            gr.update(value=bool(P.get("do_sample").default)),
+            gr.update(value=float(P.get("temperature").default)),
+            gr.update(value=float(P.get("top_p").default)),
+            gr.update(value=int(P.get("top_k").default)),
+            gr.update(value=int(P.get("num_beams").default)),
+            gr.update(value=float(P.get("repetition_penalty").default)),
+            gr.update(value=float(P.get("length_penalty").default)),
+            gr.update(value=int(P.get("max_mel_tokens").default)),
+            gr.update(value=int(P.get("max_text_tokens_per_segment").default)),
+            gr.update(value=int(P.get("interval_silence").default)),
+            gr.update(value=P.get("seed").default),
+            gr.update(value=bool(P.get("text_normalization").default)),
+            gr.update(value=""),                          # 音色库下拉
+            gr.update(value=""),                          # LoRA run
+            gr.update(value="best"),                      # LoRA 档位
+            gr.update(value=1.0),                         # LoRA 强度
+            gr.update(value=True),                        # 后处理开关
+            gr.update(value=2.5),                         # presence
+            gr.update(value=0.08),                        # exciter
+        ]
+        assert len(ups) == len(reset_targets)
+        mem = gr.update(
+            value='<span class="ix-chip"><span class="ix-dot idle"></span>'
+                  '参数记忆 · 已清除，回到默认</span>')
+        return [mem] + ups
+
+    forget_btn.click(on_forget, inputs=[],
+                     outputs=[mem_status] + reset_targets)
+
+    # ---------- 配置档（官方预设系统，与「💾 预设」页互通） ----------
+    def on_prof_reload():
+        return gr.update(choices=_prof_choices())
+
+    prof_reload_btn.click(on_prof_reload, inputs=[], outputs=[prof_dd])
+
+    @LOG.ui_guard("synthesize.on_prof_save")
+    def on_prof_save(name):
+        """把当前参数存为命名配置档（官方 preset 格式，音频复制入档）。"""
+        name = (name or "").strip()
+        if not name:
+            gr.Warning("请先填写配置档名称")
+            return gr.update(), T.err("名称不能为空。")
+        if save_preset is None:
+            return gr.update(), T.err("官方 presets 模块不可用，无法保存。")
+        live = dict(ctx.shared.get("syn_live_values") or {})
+        data = SS.live_to_preset_data(live)
+        try:
+            save_preset(name, data,
+                        prompt_audio=live.get("prompt_audio"),
+                        emo_audio=live.get("emo_audio"))
+        except Exception as e:
+            return gr.update(), T.err(f"保存失败：{type(e).__name__}: {e}")
+        final = safe_preset_name(name)
+        gr.Info(f"已保存配置档「{final}」")
+        msg = T.tip(f"✅ 配置档 <b>{final}</b> 已保存"
+                    + ("（名称中的非法字符已清洗）" if final != name else "")
+                    + "，在「💾 预设」页能看到同一份。")
+        return gr.update(choices=_prof_choices(), value=final), msg
+
+    prof_save_btn.click(on_prof_save, inputs=[prof_name],
+                        outputs=[prof_dd, prof_out])
+
+    # 应用目标与「预设页 → 应用到合成页」的 25 个严格同序（见 render 末尾登记）
+    prof_apply_targets = [
+        prompt_audio, emo_mode, emo_audio, lang_dd, dur_sl,
+        emo_alpha, emo_rand, emo_text,
+        v0, v1, v2, v3, v4, v5, v6, v7,
+        do_sample, temperature, top_p, top_k, num_beams,
+        rep_pen, len_pen, max_mel, seg_sl,
+    ]
+
+    @LOG.ui_guard("synthesize.on_prof_apply")
+    def on_prof_apply(name):
+        if not name:
+            gr.Warning("请先选择一个配置档")
+            return [gr.update()] * 25 + [gr.update()]
+        data = load_preset(name)
+        if data is None:
+            gr.Error(f"配置档 {name} 不存在")
+            return [gr.update()] * 25 + [gr.update()]
+
+        adv = data.get("advanced_params") or {}
+
+        def val(k, dflt):
+            v = adv.get(k, data.get(k))
+            return dflt if v is None else v
+
+        mode = max(0, min(3, int(data.get("emo_control_method", 0) or 0)))
+        vec = list(data.get("emo_vector") or [0.0] * 8)
+        vec = (vec + [0.0] * 8)[:8]
+        pa = data.get("prompt_audio")
+        if pa and not os.path.isfile(pa):
+            gr.Warning("配置档里的音色参考音频已丢失，跳过该项")
+            pa = None
+        ea = data.get("emo_audio")
+        if ea and not os.path.isfile(ea):
+            gr.Warning("配置档里的情感参考音频已丢失，跳过该项")
+            ea = None
+
+        patch = {
+            "prompt_audio": pa, "emo_audio": ea,
+            "emo_mode_label": W.EMO_MODE_LABELS[mode],
+            "emo_mode_index": mode,
+            "emo_alpha": float(val("emo_alpha", 0.65)),
+            "use_random": bool(val("use_random", False)),
+            "emo_text": data.get("emo_text", "") or "",
+            "lang": val("lang", "ZH"),
+            "duration_factor": float(val("duration_factor", 1.0)),
+            "do_sample": bool(val("do_sample", True)),
+            "temperature": float(val("temperature", 0.8)),
+            "top_p": float(val("top_p", 0.8)),
+            "top_k": int(val("top_k", 30)),
+            "num_beams": int(val("num_beams", 3)),
+            "repetition_penalty": float(val("repetition_penalty", 10.0)),
+            "length_penalty": float(val("length_penalty", 0.0)),
+            "max_mel_tokens": int(val("max_mel_tokens", 1500)),
+            "max_text_tokens_per_segment":
+                int(val("max_text_tokens_per_segment", 120)),
+        }
+        for i in range(8):
+            patch[f"emo_vec_{i}"] = float(vec[i])
+
+        ups = [
+            gr.update(value=pa),
+            gr.update(value=W.EMO_MODE_LABELS[mode]),
+            gr.update(value=ea),
+            gr.update(value=val("lang", "ZH") if cfg.is_v25 else None),
+            gr.update(value=float(val("duration_factor", 1.0))),
+            gr.update(value=float(val("emo_alpha", 0.65))),
+            gr.update(value=bool(val("use_random", False))),
+            gr.update(value=data.get("emo_text", "") or ""),
+        ] + [gr.update(value=float(x)) for x in vec] + [
+            gr.update(value=bool(val("do_sample", True))),
+            gr.update(value=float(val("temperature", 0.8))),
+            gr.update(value=float(val("top_p", 0.8))),
+            gr.update(value=int(val("top_k", 30))),
+            gr.update(value=int(val("num_beams", 3))),
+            gr.update(value=float(val("repetition_penalty", 10.0))),
+            gr.update(value=float(val("length_penalty", 0.0))),
+            gr.update(value=int(val("max_mel_tokens", 1500))),
+            gr.update(value=int(val("max_text_tokens_per_segment", 120))),
+        ]
+        gr.Info(f"已应用配置档「{name}」")
+        return ups + [_persist_patch(patch)]
+
+    prof_apply_btn.click(on_prof_apply, inputs=[prof_dd],
+                         outputs=prof_apply_targets + [mem_status])
+
+    def on_prof_delete(name, armed):
+        """两步确认：第一次点击只布防，第二次才真删。"""
+        if not name:
+            gr.Warning("请先选择配置档")
+            return "", gr.update(), gr.update()
+        if armed != name:
+            gr.Warning(f"再点一次「🗑 删除」确认删除「{name}」")
+            return (name,
+                    T.warn(f"将删除配置档 <b>{name}</b> —— 再点一次确认。"),
+                    gr.update())
+        if delete_preset(name):
+            gr.Info(f"已删除配置档「{name}」")
+            msg = T.tip(f"✅ 已删除 <b>{name}</b>")
+        else:
+            msg = T.err(f"删除失败：{name} 不存在")
+        return "", msg, gr.update(choices=_prof_choices(), value="")
+
+    prof_del_btn.click(on_prof_delete, inputs=[prof_dd, prof_armed],
+                       outputs=[prof_armed, prof_out, prof_dd])
 
     # ---------- 页面加载 ----------
     # 不在这里绑定 demo.load（Tab 拿不到 Blocks 对象），
@@ -1148,7 +1611,8 @@ def render(ctx: AppContext):
         return (engine_html(), ctx.status_html(),
                 gr.update(choices=[""] + voice_bank.names()),
                 gr.update(choices=_lora_run_choices()),
-                _lora_state_html(eng))
+                _lora_state_html(eng),
+                gr.update(choices=_prof_choices()))
 
     # 登记「预设可写入的控件」有序列表，供「预设管理」Tab 的
     # 「应用到合成页」按钮使用。顺序必须与 presets.on_apply 返回的
@@ -1170,7 +1634,8 @@ def render(ctx: AppContext):
     # Gradio 服务端无法主动读控件值，所以在 on_generate 里顺带写入。
     return {
         "page_load": (on_page_load,
-                      [engine_state, sb, voice_dd, lora_run_dd, lora_state_html]),
+                      [engine_state, sb, voice_dd, lora_run_dd, lora_state_html,
+                       prof_dd]),
         "components": {
             "prompt_audio": prompt_audio,
             "text": text_in,
@@ -1181,5 +1646,6 @@ def render(ctx: AppContext):
             "engine_state": engine_state,
             "lora_run": lora_run_dd,
             "lora_state": lora_state_html,
+            "mem_status": mem_status,
         },
     }
