@@ -48,6 +48,8 @@ def render(ctx: AppContext):
                     label="原始音频", type="filepath",
                     sources=["upload", "microphone"],
                     elem_classes=["ix-audio-compact"],
+                    elem_id="ix-lab-src",
+                    show_download_button=True,
                 )
                 src_path = gr.Textbox(
                     label="或直接填服务器上的文件路径",
@@ -61,7 +63,8 @@ def render(ctx: AppContext):
             with gr.Column(elem_classes=["ix-section"]):
                 gr.HTML(T.section("② 智能切片", "✂️",
                                   "滑动窗口找出评分最高的连续片段。评分综合语音占比、"
-                                  "信噪比、削波、响度，并优先让边界落在停顿处以免切断音节。"))
+                                  "信噪比、削波、响度，并优先让边界落在停顿处以免切断音节。"
+                                  "选中候选即自动试听；试听与导出都<b>不会</b>替换主素材。"))
                 with gr.Row():
                     seg_target = gr.Slider(
                         4.0, 15.0, 12.0, step=0.5, label="目标片段时长",
@@ -74,12 +77,19 @@ def render(ctx: AppContext):
                 find_seg_btn = gr.Button("🔍 扫描候选片段")
                 seg_table_md = gr.Markdown("_尚未扫描。_")
                 seg_pick = gr.Dropdown(
-                    choices=[], value=None, label="选择要导出的片段",
-                    info="评分最高的是 #0，但内容/情绪是否合适请自己试听判断",
+                    choices=[], value=None, label="候选片段（选中即自动试听）",
+                    info="评分最高的是 #0，但内容/情绪是否合适请逐个试听判断；"
+                         "主素材与候选列表不会因试听而被替换",
+                    elem_id="ix-lab-seg-pick",
                 )
-                seg_audio = gr.Audio(label="片段预览", type="filepath")
+                seg_audio = gr.Audio(
+                    label="片段预览（随上方选择自动加载）", type="filepath",
+                    elem_classes=["ix-audio-compact"],
+                    elem_id="ix-lab-seg-preview",
+                    show_download_button=True,
+                )
                 with gr.Row():
-                    seg_export_btn = gr.Button("导出该片段", size="sm", scale=1)
+                    seg_export_btn = gr.Button("📤 导出该片段", size="sm", scale=1)
                     seg_as_src_btn = gr.Button("设为主素材", size="sm", scale=1)
 
         # =================================================================
@@ -122,9 +132,10 @@ def render(ctx: AppContext):
                 with gr.Row():
                     enhance_btn = gr.Button("✨ 执行增强", variant="primary", scale=2)
                     compare_btn = gr.Button("对比试听", scale=1, size="sm")
-                enh_audio = gr.Audio(label="处理后音频", type="filepath")
+                enh_audio = gr.Audio(label="处理后音频", type="filepath",
+                                     show_download_button=True)
                 orig_audio = gr.Audio(label="处理前音频（对比用）", type="filepath",
-                                      visible=False)
+                                      visible=False, show_download_button=True)
                 enhance_md = gr.Markdown("")
 
             with gr.Column(elem_classes=["ix-section"]):
@@ -166,7 +177,8 @@ def render(ctx: AppContext):
             bank_import_ex = gr.Button("导入官方示例音频", scale=1, size="sm")
         bank_table = gr.Markdown(voice_bank.table_markdown())
         bank_detail = gr.Markdown("_选择一个音色查看详情_")
-        bank_preview = gr.Audio(label="试听", type="filepath", visible=False)
+        bank_preview = gr.Audio(label="试听", type="filepath", visible=False,
+                                show_download_button=True)
 
     gr.HTML(T.section("为什么这一步比训练更重要", "💡", ""))
     gr.HTML(
@@ -213,18 +225,18 @@ def render(ctx: AppContext):
     def on_analyze(audio_val, path_val):
         p = _resolve_source(audio_val, path_val)
         if not p:
-            return "_请先上传音频或填写有效路径。_", gr.update()
+            return "_请先上传音频或填写有效路径。_"
         rep = AL.analyze(p)
         if not rep.ok:
             LOG.get_logger("lab").warning("体检失败：%s · %s", p, rep.error)
-            return f"**分析失败**：{rep.error}", gr.update()
+            return f"**分析失败**：{rep.error}"
         LOG.get_logger("lab").info(
             "体检：%s · %.2fs · 评分 %.1f（%s）· SNR %.1f dB",
             p, rep.duration, rep.score, rep.grade, rep.snr_db)
-        return AL.report_markdown(rep), gr.update(value=rep.path)
+        return AL.report_markdown(rep)
 
     analyze_btn.click(on_analyze, inputs=[src_audio, src_path],
-                      outputs=[report_md, seg_audio])
+                      outputs=[report_md])
 
     # ---------- 切片 ----------
     seg_state = gr.State([])
@@ -264,9 +276,24 @@ def render(ctx: AppContext):
     src_audio.change(on_src_changed, inputs=[src_audio],
                      outputs=[seg_pick, seg_state, seg_table_md, seg_source])
 
-    # 选中片段后只控制导出按钮的可用态；预览在导出后才给出
-    seg_pick.change(lambda c: gr.update(interactive=bool(c)),
-                    inputs=[seg_pick], outputs=[seg_export_btn])
+    # ---------- 选中候选 → 立即切出并加载到预览播放器 ----------
+    # 这是候选浏览的主路径：试听**不动主素材**（src_audio 保持长音频，
+    # 候选列表继续有效），想采纳某个片段再显式点「设为主素材」。
+    @LOG.ui_guard("lab.on_seg_preview", slow_sec=2.0)
+    def on_seg_preview(choice, segs, scan_src, audio_val, path_val):
+        # 清空选择（换主素材 / 重扫）会触发一次空 change，静默忽略即可
+        if not choice or not segs:
+            return gr.update()
+        out, err = _export_segment(choice, segs, scan_src, audio_val, path_val)
+        if err:
+            gr.Warning(err)
+            return gr.update()
+        return gr.update(value=out)
+
+    seg_pick.change(on_seg_preview,
+                    inputs=[seg_pick, seg_state, seg_source,
+                            src_audio, src_path],
+                    outputs=[seg_audio])
 
     def _export_segment(choice, segs, scan_src, audio_val, path_val):
         """把选中的候选片段导出成一个 wav。返回 (输出的路径, 错误文案)。
@@ -308,16 +335,22 @@ def render(ctx: AppContext):
 
     @LOG.ui_guard("lab.on_seg_export", slow_sec=2.0)
     def on_seg_export(choice, segs, scan_src, audio_val, path_val):
+        """显式导出：把选中片段落盘到 outputs/lab/ 并加载到预览。
+
+        只写预览播放器，**不碰主素材** —— 导出 ≠ 采纳；要把片段当成新的
+        工作对象请用「设为主素材」。
+        """
         out, err = _export_segment(choice, segs, scan_src, audio_val, path_val)
         if err:
             gr.Error(err)
-            return gr.update(), gr.update()
-        return (gr.update(value=out), gr.update(value=out))
+            return gr.update()
+        gr.Info(f"已导出：{out}（可直接试听；想接着做增强请点「设为主素材」）")
+        return gr.update(value=out)
 
     seg_export_btn.click(on_seg_export,
                          inputs=[seg_pick, seg_state, seg_source,
                                  src_audio, src_path],
-                         outputs=[seg_audio, src_audio])
+                         outputs=[seg_audio])
 
     @LOG.ui_guard("lab.on_seg_as_src", slow_sec=2.0)
     def on_seg_as_src(choice, segs, scan_src, audio_val, path_val):

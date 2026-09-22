@@ -111,10 +111,12 @@ def render(ctx: AppContext):
                 with gr.Row():
                     m_prompt = gr.Audio(label="音色参考音频（可选）", type="filepath",
                                         sources=["upload"],
-                                        elem_classes=["ix-audio-compact"])
+                                        elem_classes=["ix-audio-compact"],
+                                        show_download_button=True)
                     m_emo_audio = gr.Audio(label="情感参考音频（可选）", type="filepath",
                                            sources=["upload"],
-                                           elem_classes=["ix-audio-compact"])
+                                           elem_classes=["ix-audio-compact"],
+                                           show_download_button=True)
                 m_from_bank = gr.Dropdown(choices=[""] + voice_bank.names(), value="",
                                           label="或从音色库选一个作为音色参考",
                                           allow_custom_value=False)

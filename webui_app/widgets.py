@@ -82,6 +82,7 @@ def make_component(
         # 默认路径保持原行为（不带 value，控件为空）。
         if value != "__default__" and value:
             kw["value"] = value
+        kw.setdefault("show_download_button", True)
         return gr.Audio(
             type="filepath", sources=["upload", "microphone"],
             elem_classes=["ix-audio-compact"] + (elem_classes or []), **kw,

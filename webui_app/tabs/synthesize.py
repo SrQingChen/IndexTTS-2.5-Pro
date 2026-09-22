@@ -533,7 +533,8 @@ def render(ctx: AppContext):
                     gen_btn = gr.Button("🎧  生成语音", variant="primary", scale=3, size="lg")
                     stop_note = gr.HTML("")
                 out_audio = gr.Audio(label="生成结果", type="filepath",
-                                     elem_id="ix-output-audio")
+                                     elem_id="ix-output-audio",
+                                     show_download_button=True)
                 out_info = gr.HTML("")
 
         # =================================================================

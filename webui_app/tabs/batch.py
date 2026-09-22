@@ -81,7 +81,8 @@ def render(ctx: AppContext):
                                   "JSONL 里未指定的字段会继承这里的值。"))
                 g_prompt = gr.Audio(label="全局音色参考音频", type="filepath",
                                     sources=["upload"],
-                                    elem_classes=["ix-audio-compact"])
+                                    elem_classes=["ix-audio-compact"],
+                                    show_download_button=True)
                 g_voice = gr.Dropdown(choices=[""] + voice_bank.names(), value="",
                                       label="或从音色库选择",
                                       allow_custom_value=False)
@@ -166,7 +167,8 @@ def render(ctx: AppContext):
                     wrap=False, elem_classes=["ix-table"],
                     label="任务结果",
                 )
-                result_audio = gr.Audio(label="试听（点表格行不会自动加载，用下面的列表）")
+                result_audio = gr.Audio(label="试听（点表格行不会自动加载，用下面的列表）",
+                                       show_download_button=True)
                 result_files = gr.Dropdown(choices=[], value=None,
                                            label="选择要试听的结果",
                                            allow_custom_value=False)
