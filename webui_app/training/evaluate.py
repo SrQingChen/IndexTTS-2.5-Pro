@@ -278,8 +278,12 @@ def run_eval(engine, a: Contender, b: Optional[Contender],
             row: Dict[str, Any] = {"id": u.id, "text": u.text}
             ok_all = True
             for c in [a] + ([b] if b else []):
+                # 选手名可能带「:」（run:ckpt）—— Windows 会把它当成 NTFS
+                # 副数据流分隔符：音频被写进「无扩展名文件:流名」里，目录里
+                # 只剩 0 字节的空壳（实测踩过）。落盘名一律净化。
+                safe = re.sub(r'[\\/:*?"<>|]', "_", c.name)
                 dst = os.path.join(out_dir,
-                                   f"{u.id}_{c.name}.wav")
+                                   f"{u.id}_{safe}.wav")
                 try:
                     got = synth_one(c, u, dst)
                 except Exception as e:

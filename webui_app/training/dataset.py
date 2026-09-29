@@ -313,8 +313,13 @@ def apply_fields(name: str, touched: Dict[str, Dict[str, Any]]) -> int:
 # 模型学习「何时停」的监督信号 —— 双标点直接训出「每隔几个字停一下」的
 # 碎裂模型；切片文本以逗号结尾则让模型永远学不到「完整收束」。
 _PUNCT_RUN = re.compile(r"([，。！？；、,.!?;:：])\1+")
-# 跨类连缀：句号后接逗号等「先终止又续半句」的组合，取终止性最强的那个
+# 跨类连缀两个方向都收：
+#   正序「先终止又续半句」：吧。，→吧。   吗？，→吗？
+#   反序「逗号拖着终止符」：真实。，→真实。  吗？。→吗？（ct-punc 实测高频）
 _PUNCT_MIX = re.compile(r"\s*([。．.！!?？；;]+)[，,、]\s*")
+_PUNCT_MIX_REV = re.compile(r"\s*[，,、]\s*([。．.！!?？；;])")
+# 终止符后拖句号（吗？。→吗？）：语气终止符携带语调，句号是冗余的
+_PUNCT_DOT_AFTER = re.compile(r"([!?？；;])[。．]")
 _TERMINAL = "。！？?!…"
 
 
@@ -335,6 +340,8 @@ def sanitize_text_punct(text: str) -> str:
         return ""
     t = _PUNCT_RUN.sub(r"\1", t)
     t = _PUNCT_MIX.sub(r"\1", t)
+    t = _PUNCT_MIX_REV.sub(r"\1", t)
+    t = _PUNCT_DOT_AFTER.sub(r"\1", t)
     t = re.sub(r"^[\s，。！？；、,.!?;:：]+", "", t)   # 句首标点伪迹
     t = t.strip()
     if not t:

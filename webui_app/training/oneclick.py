@@ -1598,9 +1598,14 @@ def stage_rank(dataset: str, engine, training: Dict[str, Any],
     # 一个 scorer 服务全部候选：run_eval 只卸载自己创建的 scorer，
     # 外面传进去的由这里收尾。否则每个候选都要「加载 1.6 GB whisper + 卸掉」，
     # 6 个候选就是 6 个来回 —— 白等好几分钟，还反复挤压引擎的显存。
+    # 2026-09-29：whisper 改跑 **CPU** —— 本阶段引擎（4.94GB）与打分器
+    # 全程共存，再叠 whisper 就贴满 8GB 触发 WDDM 静默降速（实测 15s 长
+    # 文本单条合成被拖到 226 秒）。small 在 CPU 上打 15~24s 音频约 10~25s，
+    # 换来合成端始终满速，总耗时反而更短且无尖刺。
     shared = RW.RewardScorer(RW.RewardOptions(
         whisper_size=str(opt.score_whisper_size),
-        language=RW.asr_language(opt.lang)))
+        language=RW.asr_language(opt.lang),
+        device="cpu"))
 
     # ---- 显存余量体检：这一步是引擎与打分器**同时驻留**的唯一阶段 ----
     # 实测 8 GB 卡上：引擎 4.94 + whisper medium 1.6 + campplus ≈ 7.8/8.2 GB，
