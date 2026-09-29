@@ -111,9 +111,9 @@ def main() -> int:
           all("测试者" in c["emo_audio_prompt"] for c in routed))
 
     print("== 3. 编排器：拼接长度与台本 ==")
-    expect = 3 * LINE_SEC + (600 + 200) / 1000.0     # 3 句 + 2 个句间停顿
+    expect = 3 * LINE_SEC + (600 + 200) / 1000.0 + 0.16  # +首尾余白 160ms
     dur = sf.info(res["path"]).duration
-    check("总时长 = 句长和 + 台本停顿", abs(dur - expect) < 0.02,
+    check("总时长 = 句长和 + 台本停顿 + 首尾余白", abs(dur - expect) < 0.02,
           f"{dur:.3f}s ≈ {expect:.3f}s")
     side = res["director"]["sidecar"]
     check("旁车台本存在", os.path.isfile(side))
@@ -251,7 +251,7 @@ def main() -> int:
     res8 = ORC.perform(eng8, req, sc8, route=False)
     check("情绪突变断成 2 块", len(eng8.calls) == 2)
     d8 = sf.info(res8["path"]).duration
-    expect8 = 2 * LINE_SEC + 250 / 1000.0     # 块间停顿取第 1 块末行
+    expect8 = 2 * LINE_SEC + 250 / 1000.0 + 0.16   # +首尾余白 160ms
     check("块间停顿按等级插入", abs(d8 - expect8) < 0.02,
           f"{d8:.3f}s ≈ {expect8:.3f}s")
 
@@ -267,7 +267,7 @@ def main() -> int:
     check("同情绪但省略号结尾强制断成 2 块", len(eng9.calls) == 2,
           f"calls={len(eng9.calls)}")
     d9 = sf.info(res9["path"]).duration
-    expect9 = 2 * LINE_SEC + 600 / 1000.0    # 块间停顿=省略号行的 600ms
+    expect9 = 2 * LINE_SEC + 600 / 1000.0 + 0.16  # +首尾余白 160ms
     check("省略号停顿=块间 600ms（不再是模型短停顿）",
           abs(d9 - expect9) < 0.02, f"{d9:.3f}s ≈ {expect9:.3f}s")
 

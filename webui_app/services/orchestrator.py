@@ -26,6 +26,7 @@ import numpy as np
 
 from webui_app import logging_setup as LOG
 from webui_app.services import emotion_bank as EB
+from webui_app.services import audio_lab as AL
 from webui_app.services import inference as INF
 from webui_app.services.director import DirectorScript
 from webui_app.services.engine import EngineError, TTSEngine
@@ -85,6 +86,7 @@ def perform(
     output_path: Optional[str] = None,
     bon_n: int = 0,
     bon_keep: bool = False,
+    lora_run: str = "",
 ) -> Dict[str, Any]:
     """表演块编排（v2）：把台本行合并成「表演块」再逐块合成拼接。
 
@@ -118,6 +120,22 @@ def perform(
     bon_n = int(max(0, min(8, bon_n or 0)))
     cfg = engine.cfg
     log = LOG.get_logger("orchestrator")
+
+    # 响度指纹：挂载的 GPT run 训练时随 run.json 交付的数据集响度分布。
+    # 逐块目标响度从它采样（爆发响/平静轻），没有指纹则保持旧行为。
+    _loudness_fp: Dict[str, Any] = {}
+    if lora_run:
+        try:
+            from webui_app.training import runs as _RN
+            _rj = _RN.read_run(lora_run) or {}
+            _loudness_fp = dict(_rj.get("loudness_fingerprint") or {})
+        except Exception:
+            _loudness_fp = {}
+    if _loudness_fp:
+        log.info("响度指纹命中（%s）：median=%s std=%s",
+                 lora_run, _loudness_fp.get("median"), _loudness_fp.get("std"))
+    import random as _random
+    _rng = _random.Random(INF.resolve_seed(req.seed))   # 逐块响度采样可复现
 
     # 基础 kwargs（采样参数/分句/语速等）走既有装配，情感部分逐句覆盖
     out_base = output_path or INF.output_filename(cfg)
@@ -319,6 +337,19 @@ def perform(
                             pass
 
             wav = _read_mono_int16(cand_paths[chosen_k])
+
+            # ---- 逐块响度（响度指纹迁移）：从角色自己的响度分布采样目标 ----
+            # 爆发块从响端、平静块从轻端 —— "这句该响那句该轻"来自角色本人
+            # 的习惯（run.json 的 loudness_fingerprint），不是随机抖动。
+            # 无指纹（旧 run / 纯底座）时返回 -20，行为与从前一致。
+            block_lufs = None
+            if _loudness_fp:
+                block_lufs = AL.sample_target_loudness(
+                    _loudness_fp, blk["intensity"], _rng)
+                y = wav.astype(np.float32) / 32768.0
+                y = AL.apply_block_loudness(y, block_lufs)
+                wav = np.clip(y * 32767.0, -32767, 32767).astype(np.int16)
+
             wavs.append(wav)
             # 块后停顿 = 块末行的 pause_after_ms（导演层已按标点/情绪给量）；
             # 块内行的停顿标记作废 —— 那部分节奏交还模型
@@ -329,6 +360,7 @@ def perform(
                 "seed": cand_seeds[chosen_k],
                 "emo_ref": entry.name if entry else "",
                 "emo_alpha": (emo_kw["emo_alpha"] if entry is not None else None),
+                "target_lufs": block_lufs,
                 "samples": int(wav.shape[0]),
                 "lines": [l.text for l in blk["lines"]],
             }
@@ -340,14 +372,30 @@ def perform(
         # 块间垫**数字零**：实际使用会在停顿段垫 BGM，零底最干净；人声的
         # 自然衰减在块内由模型完成（见 _merge_blocks 的收束说明），零只
         # 出现在「已经说完」之后，不存在戛然而止。
+        # 吸气（2026-09）：有停顿的块边界按概率插入**角色本人**的吸气采样
+        # （breath_bank），贴下一句开口放置（真人就是「吸完立刻说」）。
+        from webui_app.services import breath_bank as BB
         fade = int(SR * 0.03)
+        inhales_used = 0
         final = wavs[0] if wavs else np.zeros(1, np.int16)
         for i in range(1, n):
             gap = int(line_infos[i - 1]["pause_after_ms"])
             nxt = wavs[i]
             if gap > 0:
-                final = np.concatenate(
-                    [final, np.zeros(int(SR * gap / 1000.0), dtype=np.int16), nxt])
+                gap_n = int(SR * gap / 1000.0)
+                bed = np.zeros(gap_n, dtype=np.int16)
+                if character:
+                    try:
+                        inh = BB.maybe_inhale(character, gap,
+                                              float(line_infos[i].get(
+                                                  "intensity") or 0.5), _rng)
+                    except Exception:
+                        inh = None
+                    if inh is not None and len(inh) < gap_n:
+                        off = max(0, gap_n - 30 - len(inh))
+                        bed[off: off + len(inh)] = inh
+                        inhales_used += 1
+                final = np.concatenate([final, bed, nxt])
             else:
                 f = min(fade, len(final) // 2, len(nxt) // 2)
                 if f > 0:
@@ -358,6 +406,10 @@ def perform(
                     final = np.concatenate([final, nxt[f:]])
                 else:
                     final = np.concatenate([final, nxt])
+
+        # ---- 起止整形：首尾 80ms 余白 + 12ms 淡化（治"被咬掉"感） ----
+        # 余白给下游混音留呼吸口；淡入让第一个字的起振不被切。
+        final = AL.shape_edges(final, SR, pad_ms=80.0, fade_ms=12.0)
 
         try:
             import soundfile as sf
@@ -420,6 +472,7 @@ def perform(
                             if (x.get("bon") or {}).get("best_path")),
             "avg_pause_ms": (sum(x["pause_after_ms"] for x in line_infos[:-1])
                              / max(1, n - 1)) if n > 1 else 0,
+            "inhales": inhales_used,
             "sidecar": sidecar,
         },
     }

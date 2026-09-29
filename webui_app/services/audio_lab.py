@@ -16,6 +16,7 @@ ref_mel 声学模板）。因此**把参考音频选对、处理好，往往比�
 from __future__ import annotations
 
 import os
+import random
 from dataclasses import dataclass, field, asdict
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -1113,3 +1114,143 @@ def enhance_markdown(r: EnhanceResult) -> str:
         lines += ["", "**处理后仍存在的问题**", ""]
         lines += [f"- {i}" for i in r.after["issues"]]
     return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# 响度体系（2026-09-29 · 响度指纹迁移，替代逐条归一的"削平"）
+# ---------------------------------------------------------------------------
+
+def rms_dbfs(y: np.ndarray) -> float:
+    """整段 RMS（dBFS）。静音返回 -120。"""
+    r = float(np.sqrt(np.mean(np.asarray(y, dtype=np.float64) ** 2)))
+    if r < 1e-10:
+        return -120.0
+    return 20.0 * np.log10(r)
+
+
+def measure_loudness(path_or_y, sr: Optional[int] = None) -> float:
+    """一条音频的响度（dBFS RMS）。接受路径或 (y, sr)。"""
+    if isinstance(path_or_y, str):
+        y, _sr = load_audio(path_or_y)
+        return rms_dbfs(y)
+    return rms_dbfs(path_or_y)
+
+
+def anchor_gain(levels_db: List[float], target_dbfs: float = -20.0,
+                max_boost_db: float = 12.0, max_cut_db: float = 12.0,
+                clamp_outlier_db: float = 10.0) -> Dict[str, Any]:
+    """由**全数据集**响度中位数算一个全局增益（所有人站同一块地板）。
+
+    返回 {gain_db, median_db, lo_db, hi_db, n}：调用方给每条音频乘同一
+    个 gain_db；lo/hi 是离群钳制边界（超出中位 ±clamp_outlier_db 的素材
+    在数据集里被拉回边界 —— 由 apply_anchor 执行）。
+    """
+    lv = sorted(float(x) for x in levels_db if x > -100.0)
+    if not lv:
+        return {"gain_db": 0.0, "median_db": float(target_dbfs),
+                "lo_db": float(target_dbfs), "hi_db": float(target_dbfs), "n": 0}
+    med = float(np.median(lv))
+    gain = float(np.clip(target_dbfs - med, -max_cut_db, max_boost_db))
+    return {"gain_db": gain, "median_db": med,
+            "lo_db": med - clamp_outlier_db, "hi_db": med + clamp_outlier_db,
+            "n": len(lv)}
+
+
+def apply_anchor(y: np.ndarray, anchor: Dict[str, Any],
+                 peak_ceiling_db: float = -1.0) -> np.ndarray:
+    """给一条音频施加全局锚定增益（含离群钳制与峰值保护）。
+
+    片段间相对响度保持不变；只有「原始电平离中位数 >10dB 的离群素材」
+    被拉回边界（那多半是录音事故，不是表演）。
+    """
+    cur = rms_dbfs(y)
+    if cur <= -100.0:
+        return y
+    lo, hi = float(anchor["lo_db"]), float(anchor["hi_db"])
+    eff = min(max(cur, lo), hi)              # 离群钳制：限的是增益基准
+    target = eff + float(anchor["gain_db"])
+    gain = 10 ** ((target - cur) / 20.0)
+    out = y * gain
+    peak = float(np.max(np.abs(out))) if len(out) else 0.0
+    limit = 10 ** (peak_ceiling_db / 20.0)
+    if peak > limit:
+        out = out * (limit / peak)
+    return out.astype(np.float32)
+
+
+def loudness_fingerprint(levels_db: List[float]) -> Dict[str, Any]:
+    """角色响度指纹：分布统计（写进 run.json，推理端逐块采样用）。"""
+    lv = sorted(float(x) for x in levels_db if x > -100.0)
+    if len(lv) < 3:
+        return {}
+    arr = np.asarray(lv)
+    return {
+        "n": int(len(lv)),
+        "median": round(float(np.median(arr)), 2),
+        "p25": round(float(np.percentile(arr, 25)), 2),
+        "p40": round(float(np.percentile(arr, 40)), 2),
+        "p60": round(float(np.percentile(arr, 60)), 2),
+        "p75": round(float(np.percentile(arr, 75)), 2),
+        "p10": round(float(np.percentile(arr, 10)), 2),
+        "p90": round(float(np.percentile(arr, 90)), 2),
+        "std": round(float(np.std(arr)), 2),
+    }
+
+
+def sample_target_loudness(fp: Dict[str, Any], intensity: float,
+                           rng: random.Random) -> float:
+    """从角色响度指纹里采一个块目标响度（dBFS）。
+
+    intensity（表演强度 0~1）决定从分布的哪一段采：平静块在轻端
+    （p10~p40），爆发块在响端（p60~p90）——角色的"这句该响那句该轻"
+    由它自己的分布供给，而不是随机抖动。指纹缺失时返回 -20（旧行为）。
+    """
+    if not fp or fp.get("n", 0) < 3:
+        return -20.0
+    if intensity >= 0.7:
+        lo, hi = fp.get("p60", fp["median"]), fp.get("p90", fp["median"])
+    elif intensity <= 0.35:
+        lo, hi = fp.get("p10", fp["median"]), fp.get("p40", fp.get("p25"))
+    else:
+        lo, hi = fp.get("p25", fp["median"]), fp.get("p75", fp["median"])
+    if hi < lo:
+        lo, hi = hi, lo
+    return round(float(rng.uniform(lo, hi)), 2)
+
+
+def apply_block_loudness(y: np.ndarray, target_dbfs: float,
+                         peak_ceiling_db: float = -1.0) -> np.ndarray:
+    """把一个合成块调到目标响度（纯增益 + 峰值保护）。"""
+    cur = rms_dbfs(y)
+    if cur <= -100.0:
+        return y
+    gain = 10 ** ((target_dbfs - cur) / 20.0)
+    out = y * gain
+    peak = float(np.max(np.abs(out))) if len(out) else 0.0
+    limit = 10 ** (peak_ceiling_db / 20.0)
+    if peak > limit:
+        out = out * (limit / peak)
+    return out.astype(np.float32)
+
+
+# ---------------------------------------------------------------------------
+# 起止整形（治"被咬掉"感）
+# ---------------------------------------------------------------------------
+
+def shape_edges(y: np.ndarray, sr: int, pad_ms: float = 80.0,
+                fade_ms: float = 12.0) -> np.ndarray:
+    """首尾加垫 + 短淡化：开头淡入更缓（起振不能被切），收尾自然。
+
+    兼容 int16 / float 波形（内部 float 运算后按原 dtype 归还）。
+    """
+    pad = int(sr * pad_ms / 1000.0)
+    f = max(1, int(sr * fade_ms / 1000.0))
+    out = np.concatenate([np.zeros(pad, dtype=y.dtype), y,
+                          np.zeros(pad, dtype=y.dtype)])
+    if len(out) > 2 * f:
+        body = out.astype(np.float32)
+        body[:f] *= np.linspace(0.0, 1.0, f, dtype=np.float32)
+        body[-f:] *= np.linspace(1.0, 0.0, f, dtype=np.float32)
+        out = (np.clip(body, -32767, 32767).astype(np.int16)
+               if np.issubdtype(out.dtype, np.integer) else body)
+    return out

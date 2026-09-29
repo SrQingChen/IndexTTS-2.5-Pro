@@ -95,6 +95,23 @@ def render(ctx: AppContext):
                                      size="sm")
                 auto_out = gr.HTML("")
 
+            with gr.Accordion("🫁 呼吸库（角色本人的吸气采样）", open=False):
+                gr.HTML(T.hint(
+                    "从该角色的<b>数据集素材</b>里自动检测吸气段（语音前的"
+                    "短气流段）入库，导演模式会在块边界按概率插入（贴下一句"
+                    "开口，-24~-30dBFS）。呼吸是「真人感」最强的生理印记，"
+                    "采样来自角色本人才有音色连续性。"))
+                with gr.Row():
+                    breath_char_tb = gr.Textbox(label="角色名", scale=1,
+                                                placeholder="与导演模式一致")
+                    from webui_app.training import dataset as _DS
+                    breath_ds_dd = gr.Dropdown(choices=_DS.list_datasets(),
+                                                label="数据集", scale=1)
+                    breath_btn = gr.Button("🫁 挖吸气入库", size="sm",
+                                           variant="primary")
+                breath_out = gr.HTML("")
+                breath_md = gr.Markdown("")
+
         # ---------------- 右：已有条目 ----------------
         with gr.Column(scale=2):
             gr.HTML("### 📇 已有条目")
@@ -175,6 +192,31 @@ def render(ctx: AppContext):
     auto_btn.click(on_autotag,
                    inputs=[auto_char_tb, auto_files, auto_fallback_dd],
                    outputs=[auto_out])
+
+    @LOG.ui_guard("emobank.on_breath", slow_sec=5.0)
+    def on_breath(character, dataset):
+        from webui_app.services import breath_bank as BB
+        from webui_app.training import dataset as DS
+        char = (character or "").strip()
+        if not char:
+            return T.err("角色名为空。"), gr.update()
+        if not dataset or not DS.exists(dataset):
+            return T.err("先选择数据集。"), gr.update()
+        try:
+            r = BB.build_from_dataset(char, dataset)
+        except Exception as ex:
+            return T.err(f"挖呼吸失败：{type(ex).__name__}: {ex}"), gr.update()
+        if not r.get("ok"):
+            return T.err(str(r.get("error", ""))), gr.update()
+        msg = (f"🫁 扫描 {r['scanned']} 条素材，入库 {r['added']} 个吸气采样"
+               + ("" if r["added"] else
+                  " —— 没挖到（素材的吸气多被掐静音剪掉了？重跑一键三连"
+                  "可关掉掐静音再试）"))
+        return T.tip(msg), BB.table_markdown(char)
+
+    breath_btn.click(on_breath,
+                     inputs=[breath_char_tb, breath_ds_dd],
+                     outputs=[breath_out, breath_md])
 
     def on_select(label):
         if not label:

@@ -200,6 +200,19 @@ def set_info(name: str, **fields) -> Dict[str, Any]:
     return d
 
 
+# dataset.json 里的 markers 子字典：流水线各阶段往里塞可机读的元数据
+# （如响度指纹），训练结束随 run.json 交付，推理端读取。
+def write_marker(name: str, key: str, value: Any) -> None:
+    d = info(name)
+    marks = d.get("markers") or {}
+    marks[key] = value
+    set_info(name, markers=marks)
+
+
+def read_marker(name: str, key: str) -> Any:
+    return (info(name).get("markers") or {}).get(key)
+
+
 def delete(name: str) -> bool:
     d = dir_of(name)
     if not os.path.isdir(d):

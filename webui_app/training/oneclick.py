@@ -223,6 +223,9 @@ class OneClickOptions:
     denoise_strength: float = 0.6
     normalize: bool = True
     trim_silence: bool = True
+    # 2026-09-29 响度体系:不再逐条归一(削平),改为 S2.5 全数据集
+    # 中位数锚定 —— 片段间相对响度保留,模型学到响度表演。此值为锚点。
+    loudness_target_db: float = -20.0
     # 2026-09-29 句内静音封顶：训练音频内部 >cap 的停顿压到 cap。
     # 游戏配音真实句间停顿 400~800ms 被 ASR 标成逗号，模型学成
     # 「逗号=长停顿」并在无标点处泛化（实测一句话 7 停顿/逗号 800ms）。
@@ -822,7 +825,9 @@ def _enhance_one(ds_dir: str, u: DS.Utterance, opt: OneClickOptions) -> Dict[str
     res = AL.enhance(src, tmp,
                      denoise=bool(opt.denoise),
                      denoise_strength=float(opt.denoise_strength),
-                     normalize=bool(opt.normalize),
+                     # 逐条归一已废弃(削平响度表演);normalize 传 False,
+                     # 电平由 S2.5 的中位数锚定统一处理
+                     normalize=False,
                      trim_silence=bool(opt.trim_silence),
                      pause_cap_ms=float(opt.pause_cap_ms or 0.0),
                      target_sr=OUTPUT_SAMPLE_RATE,
@@ -937,6 +942,45 @@ def stage_optimize(dataset: str, opt: OneClickOptions,
     tail = f"（{workers} 线程 · {outcome.seconds}s）" if workers > 1 else ""
     if out.get("denoise_note"):
         tail += " · 降噪已跳过（未装 noisereduce）"
+
+    # ---- S2.5 响度中位数锚定（2026-09-29：替代逐条归一的"削平"） ----
+    # enhance 不再做逐条归一（见 _enhance_one 的 normalize=False），这里给
+    # 整个数据集算**一个**全局增益（中位数 → 目标 dBFS），片段间相对响度
+    # 原样保留 —— 模型才能学到「这句该响、那句该轻」的响度表演。离群
+    # ±10dB 钳制 + 峰值保护。响度分布（指纹）写进 meta.jsonl 头部行，
+    # 训练结束随 run.json 交付，推理端逐块采样复现。
+    try:
+        import numpy as _np
+        _lu = []
+        for _u in DS.load_meta(dataset):
+            _ap = _u.audio_abs(ds_dir)
+            if _ap and os.path.isfile(_ap):
+                _lu.append(AL.measure_loudness(_ap))
+        _anchor = AL.anchor_gain(_lu, target_dbfs=float(opt.loudness_target_db))
+        if _anchor["n"]:
+            for _u in DS.load_meta(dataset):
+                _ap = _u.audio_abs(ds_dir)
+                if not (_ap and os.path.isfile(_ap)):
+                    continue
+                _y, _sr = AL.load_audio(_ap)
+                _y2 = AL.apply_anchor(_y, _anchor)
+                if not _np.allclose(_y, _y2):
+                    AL.save_audio(_ap, _y2, _sr)
+            _fp = AL.loudness_fingerprint(_lu)
+            out["loudness"] = {
+                "mode": "median_anchor", "n": _anchor["n"],
+                "median_db": _anchor["median_db"],
+                "gain_db": round(_anchor["gain_db"], 2),
+                "fingerprint": _fp,
+            }
+            DS.write_marker(dataset, "loudness", _fp)
+            tail += (f" · 响度锚定 {_anchor['gain_db']:+.1f}dB"
+                     f"（中位 {_anchor['median_db']:.1f}，相对响度保留）")
+    except Exception as _e:
+        LOG.get_logger("oneclick.optimize").warning(
+            "响度锚定失败（跳过，不影响训练）：%s: %s",
+            type(_e).__name__, _e, exc_info=True)
+
     cb(1.0, f"优化 {out['enhanced']} 条，平均体检分 "
             f"{out['before_avg_score']} → {out['after_avg_score']}{tail}")
     return out
@@ -1539,6 +1583,20 @@ def stage_train(dataset: str, engine, tuning: Dict[str, Any],
     out["ok"] = bool(good)
     if not out["ok"]:
         out["error"] = "训练全部失败或没有产出任何可用档位。"
+        return out
+
+    # 响度指纹随训练记录交付(推理端编排器按它逐块采样目标响度)
+    try:
+        _fp = DS.read_marker(dataset, "loudness")
+        if _fp:
+            for row in results:
+                if row.get("run"):
+                    RN.update_run(row["run"],
+                                  loudness_fingerprint=_fp,
+                                  dataset_loudness=_fp)
+    except Exception as _e:
+        LOG.get_logger("oneclick.train").warning(
+            "响度指纹写入 run.json 失败：%s: %s", type(_e).__name__, _e)
     return out
 
 

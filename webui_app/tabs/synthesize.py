@@ -931,7 +931,8 @@ def render(ctx: AppContext):
                     extrapolate=bool(req.emo_extrapolate),
                     progress=progress,
                     bon_n=int(dir_bon_n or 0),
-                    bon_keep=bool(dir_bon_keep))
+                    bon_keep=bool(dir_bon_keep),
+                    lora_run=str(lora_run or ""))
             else:
                 res = INF.generate(eng, req, progress=progress)
         except EngineError as e:
