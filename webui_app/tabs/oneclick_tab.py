@@ -33,8 +33,8 @@ from webui_app.training.runner import get_runner
 OPT_KEYS = [
     "model_name", "lang", "slice_target_sec", "slice_min_sec",
     "slice_over_sec", "slice_max_pieces", "enhance", "denoise",
-    "denoise_strength", "normalize", "trim_silence", "asr", "whisper_size",
-    "score_whisper_size",
+    "denoise_strength", "normalize", "trim_silence", "asr", "asr_engine",
+    "hotwords", "whisper_size", "score_whisper_size",
     "min_score", "max_text_repeats", "val_ratio", "arch_list", "preset_mode",
     "top_k", "rank_eval", "eval_samples", "cpu_workers", "seed",
 ]
@@ -44,6 +44,7 @@ LANG_CHOICES = [("中文 (ZH)", "ZH"), ("英语 (EN)", "EN"), ("日语 (JA)", "J
 
 PRESET_CHOICES = [
     ("自动（按数据量挑，推荐）", "auto"),
+    ("🎭 表现力（推荐 ≥ 8 分钟：学断句/口癖/语气）", "expressive"),
     ("🟢 保守（数据 < 5 分钟）", "conservative"),
     ("⚖️ 均衡（默认档）", "balanced"),
     ("🔴 激进（数据 ≥ 30 分钟）", "aggressive"),
@@ -113,10 +114,12 @@ def plan_markdown(opt: OC.OneClickOptions) -> str:
         f"（强度 {_fmt(opt.denoise_strength)}）· 归一 {_fmt(opt.normalize)}"
         f" · 掐静音 {_fmt(opt.trim_silence)} |")
     rows.append(
-        "| S3 识别与对齐 | 逐条 whisper 转写；**长音频先切片再逐片转写**，"
-        "于是文本与音频按「一片一段」配对 | "
-        f"总开关 {_fmt(opt.asr)} · 识别用 whisper-{opt.whisper_size}"
-        f"（产出训练文本）· 语言 {opt.lang} |")
+        f"| S3 识别与对齐 | 逐条 {opt.asr_engine} 转写"
+        f"{'（funasr 缺失自动回退 whisper）' if opt.asr_engine == 'sensevoice' else ''}；"
+        "**长音频先切片再逐片转写**，于是文本与音频按「一片一段」配对 | "
+        f"总开关 {_fmt(opt.asr)} · 引擎 {opt.asr_engine}"
+        + (f" · 专名纠错：{opt.hotwords}" if (opt.hotwords or "").strip() else "")
+        + f" · whisper 档 {opt.whisper_size} · 语言 {opt.lang} |")
     rows.append(
         "| S4 筛选与划分 | 体检复算 → 丢掉不合格 → 同文本去重 → "
         f"划 train/val | 体检分下限 {_fmt(opt.min_score)} · 同文本最多 "
@@ -249,16 +252,17 @@ def render(ctx: AppContext):
                         info=f"默认 {DS.MAX_TRAIN_SEC:g}s = 训练可接受的最长样本，"
                              "更长的样本体检直接判 too_long、永远不参与训练")
                     slice_target_sl = gr.Slider(
-                        2.0, 20.0, value=12.0, step=0.5, label="每片目标时长（秒）",
-                        info="8~15 秒是零样本 TTS 的甜点区：够长能学到韵律，"
-                             "又不会让显存吃紧")
+                        2.0, 20.0, value=6.0, step=0.5, label="每片目标时长（秒）",
+                        info="默认 6 秒（2026-09 韵律切分）：推理是逐句独立"
+                             "合成，训练片段越接近一两个自然句，学到的断句/"
+                             "停顿分布越对齐真实使用")
                     slice_min_sl = gr.Slider(
-                        1.0, 10.0, value=4.0, step=0.5, label="最短片段（秒）",
-                        info="短于它的片段直接丢掉（不足以体现音色）")
+                        1.0, 10.0, value=2.5, step=0.5, label="最短片段（秒）",
+                        info="短于它的片段直接丢掉（声纹统计不稳）")
                     slice_pieces_nb = gr.Number(
-                        120, label="单条长音频最多切几片", precision=0,
-                        info="默认 120：半小时素材按 10~12 秒一片大约 100 来条，"
-                             "正好够训 LoRA（下限 20 条）。设太小会白白浪费素材")
+                        400, label="单条长音频最多切几片", precision=0,
+                        info="默认 400：6 秒一片时半小时素材约 300 片。"
+                             "设太小会白白浪费素材")
 
                 with gr.Column(elem_classes=["ix-section"]):
                     gr.HTML(T.section("音频优化", "🧹",
@@ -279,9 +283,24 @@ def render(ctx: AppContext):
                                       "音频按「一片一段」配对 —— 这就是本流程的"
                                       "对齐环节（工程里没有强制对齐器）。"))
                     asr_cb = gr.Checkbox(True, label="自动转写为训练文本")
+                    asr_engine_dd = gr.Dropdown(
+                        choices=[("SenseVoice（推荐：专名/标点/情绪标签，约 1 GB）",
+                                  "sensevoice"),
+                                 ("whisper（旧引擎，funasr 不可用时自动回退）",
+                                  "whisper")],
+                        value="sensevoice", label="转写引擎",
+                        info="SenseVoice 的中文专名与标点明显更好（实测 CER "
+                             "0.048 vs whisper-medium 的同音错字），且逐条附带"
+                             "情绪标签（入库 meta，供情感路由/过滤）")
+                    hotwords_tb = gr.Textbox(
+                        label="专名表（逗号分隔，可留空）",
+                        placeholder="例如：卡提希娅,弗洛德利斯,乌啾",
+                        info="转写后按拼音比对把同音错字（哈提西亚）纠回"
+                             "标准名 —— SenseVoice 没有热词接口，这是后纠实现")
                     whisper_dd = gr.Dropdown(
                         choices=list(RW.WHISPER_SIZES.keys()),
-                        value=RW.DEFAULT_WHISPER, label="识别模型（转写成训练文本）",
+                        value=RW.DEFAULT_WHISPER,
+                        label="whisper 档位（引擎选 whisper 或回退时使用）",
                         info="默认 medium：它的产出**直接成为训练文本**，"
                              "准确率决定模型学什么，值得用大一点的")
                     score_whisper_dd = gr.Dropdown(
@@ -379,8 +398,8 @@ def render(ctx: AppContext):
     # =====================================================================
     opt_controls = [model_name_tb, lang_dd, slice_target_sl, slice_min_sl,
                     slice_over_sl, slice_pieces_nb, enhance_cb, denoise_cb,
-                    denoise_sl, norm_cb, trim_cb, asr_cb, whisper_dd,
-                    score_whisper_dd,
+                    denoise_sl, norm_cb, trim_cb, asr_cb, asr_engine_dd,
+                    hotwords_tb, whisper_dd, score_whisper_dd,
                     min_score_sl, repeats_nb, val_ratio_sl, arch_cg,
                     preset_dd, topk_sl, rank_cb, eval_n_sl, cpu_workers_sl,
                     seed_nb]

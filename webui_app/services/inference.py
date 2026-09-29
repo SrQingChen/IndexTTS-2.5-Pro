@@ -35,6 +35,12 @@ class GenRequest:
     emo_vector: List[float] = field(default_factory=lambda: [0.0] * 8)
     emo_text: str = ""
     use_random: bool = False
+    # 情感限幅器实验开关（默认关 = 官方语义原样）：
+    #   emo_unlock_vector_cap：模式2 不做「8 维总和 ≤0.8」的等比压缩（偏置仍生效）
+    #   emo_extrapolate：模式1 允许 emo_alpha>1（参考情绪外推，类比 Style-Bert-VITS2
+    #   的风格权重>1；上游代码此路径本就未截断，是官方留的口子）
+    emo_unlock_vector_cap: bool = False
+    emo_extrapolate: bool = False
 
     # 分句与时长
     max_text_tokens_per_segment: int = 120
@@ -147,6 +153,11 @@ def resolve_emotion(engine: TTSEngine, req: GenRequest) -> Dict[str, Any]:
                 "情感控制方式为「使用情感参考音频」，但没有上传情感参考音频。"
             )
         out["emo_audio_prompt"] = req.emo_audio_prompt
+        # 官方语义 alpha∈[0,1]；外推开关打开才放行 >1（上游该路径未截断，
+        # 嵌入空间里 base + α(emo−base) 在 α>1 时是外推放大）
+        alpha = float(req.emo_alpha or 0.0)
+        hi = 1.5 if req.emo_extrapolate else 1.0
+        out["emo_alpha"] = max(0.0, min(hi, alpha))
         return out
 
     if mode == 2:
@@ -154,7 +165,13 @@ def resolve_emotion(engine: TTSEngine, req: GenRequest) -> Dict[str, Any]:
         if len(vec) < 8:
             vec += [0.0] * (8 - len(vec))
         vec = vec[:8]
-        out["emo_vector"] = engine.normalize_emo_vec(vec, apply_bias=True)
+        if req.emo_unlock_vector_cap:
+            # 解锁版：保留官方偏置，去掉「总和≤0.8 等比压缩」这一道限幅
+            from webui_app.config import EMO_BIAS
+            vec = [v * b for v, b in zip(vec, EMO_BIAS)]
+            out["emo_vector"] = vec
+        else:
+            out["emo_vector"] = engine.normalize_emo_vec(vec, apply_bias=True)
         return out
 
     if mode == 3:

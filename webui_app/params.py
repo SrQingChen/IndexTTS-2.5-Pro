@@ -57,6 +57,7 @@ GROUP_TITLES: Dict[str, str] = {
     "voice":    "音色与参考音频",
     "text":     "文本与语言",
     "emotion":  "情感控制",
+    "director": "导演模式（逐句编排）",
     "sampling": "GPT 采样（T2S 自回归）",
     "segment":  "分句与时长",
     "engine":   "引擎与精度",

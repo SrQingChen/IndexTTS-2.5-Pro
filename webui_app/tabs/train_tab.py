@@ -39,6 +39,7 @@ ARCH_LABELS = [a[0] for a in ARCHS]
 ARCH_OF = {a[0]: a[1] for a in ARCHS}
 
 PRESETS = [
+    ("🎭 表现力（学断句/口癖/语气，≥ 8 分钟推荐）", "expressive"),
     ("🟢 保守（数据 < 5 分钟首选）", "conservative"),
     ("⚖️ 均衡（默认推荐）", "balanced"),
     ("🔴 激进（数据 ≥ 30 分钟再试）", "aggressive"),

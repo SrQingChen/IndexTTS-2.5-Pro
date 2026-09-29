@@ -644,8 +644,9 @@ def main() -> int:
         check("阈值单调递增",
               all(G.DRIFT_LEVELS[i][0] < G.DRIFT_LEVELS[i + 1][0]
                   for i in range(4)))
-        check("三档预设齐全",
-              set(G.CONFIG_PRESETS) == {"conservative", "balanced", "aggressive"})
+        check("四档预设齐全（含 2026-09 表现力档）",
+              set(G.CONFIG_PRESETS) == {"conservative", "balanced",
+                                        "aggressive", "expressive"})
         check("TRAINING_ROOT 不在 checkpoints 里",
               not G.TRAINING_ROOT.startswith(
                   os.path.join(_env.PROJECT_ROOT, G.MODEL_DIR_NAME)))

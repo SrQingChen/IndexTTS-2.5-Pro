@@ -137,6 +137,21 @@ CONFIG_PRESETS: Dict[str, Dict[str, Any]] = {
         grad_clip=1.0, keep_checkpoints=2, eval_every=200,
         target_preset="attn_mlp",
     ),
+    # 2026-09 表现力档（A4）：针对「角色语气/口癖/断句进权重」设计。
+    # 与 aggressive 的本质区别：**高回放 + 慢而长**（aggressive 是无保护猛冲）。
+    #   · rank16/alpha32 + attn_mlp：社区验证的 GPT 语气学习配置
+    #     （risingore/index-tts-2-lora：96 矩阵注入，r=16）；
+    #   · 12 epoch + 50% 回放：epoch 多才有机会学进「怎么说」，回放防背诵
+    #     （laowang-wy 工具包结论：多训磨平口音，5~15 epoch 是甜点区）；
+    #   · val_patience=5 + keep 6：容忍 val 抖动攒够可比档位，最后靠
+    #     真机打分择优而不是 val loss（instavar：最佳 ckpt 从不在最后一步）。
+    "expressive": dict(
+        rank=16, alpha=32, dropout=0.05, use_rslora=False,
+        lr=2e-4, weight_decay=0.01, warmup_ratio=0.06,
+        epochs=12, replay_ratio=0.5, val_patience=5,
+        grad_clip=1.0, keep_checkpoints=6, eval_every=100,
+        target_preset="attn_mlp",
+    ),
 }
 
 PRESET_NOTES: Dict[str, str] = {
@@ -146,6 +161,11 @@ PRESET_NOTES: Dict[str, str] = {
                 "大多数「学某个角色的音色和语气」的需求都够用。",
     "aggressive": "最像角色，也最容易过拟合：无回放、无早停、注入 MLP。"
                   "只建议在数据充足（≥30 分钟）且已用均衡档试过之后使用。",
+    "expressive": "表现力档（2026-09 新增）：rank16 + attn/MLP 全注入 + 12 epoch + "
+                  "50% 回放 + 宽松早停。目标不是「更稳」而是**把角色的断句/口癖/"
+                  "语气学进去**（旧诊断：balanced 只训 30 来步等于没训）。"
+                  "建议数据 ≥8 分钟；训练耗时约为 balanced 的 3 倍，"
+                  "最后靠真机打分从 6 个保险库档位里择优。",
 }
 
 

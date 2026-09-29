@@ -128,6 +128,118 @@ def append_pairs(ds_name: str, rows: Sequence[PairRow]) -> int:
     return save_pairs(ds_name, have + list(rows))
 
 
+def import_bon_sidecars(ds_name: str, sidecar_paths: List[str],
+                        min_margin: float = 0.0, lang: str = "ZH",
+                        progress=None) -> Dict[str, Any]:
+    """从导演模式的 BoN 台本（.script.json）导入偏好对（C2 桥接）。
+
+    前提：合成页开着「保留最优/最差候选」（bon_keep）生成的台本 ——
+    每条 line.bon 里带 best_path / worst_path 与两侧 reward。
+
+    流程：对每一句 → 两条音频经 DS.import_audio 复制进目标数据集 →
+    补写 text 并 evaluate（状态变 ready）→ 直接以**已知 reward** 构造
+    PairRow 追加进 pairs.jsonl（不需要再跑一遍打分）。
+
+    注意：**特征未提取** —— 导入完成后到「数据集」页对该数据集跑特征
+    提取，然后才能在「训练」页跑 DPO（preflight 会再查一遍）。
+
+    返回 {pairs, skipped_margin, skipped_missing, errors}。
+    """
+    import time as _time
+
+    from webui_app import logging_setup as LOG
+    log = LOG.get_logger("dpo.import")
+    if not (ds_name or "").strip():
+        return {"ok": False, "error": "目标数据集名不能为空"}
+    ds_name = ds_name.strip()
+    if not DS.exists(ds_name):
+        DS.create(ds_name, note="从导演 BoN 择优导入的偏好对数据集")
+
+    stats: Dict[str, Any] = {"pairs": 0, "skipped_margin": 0,
+                             "skipped_missing": 0, "skipped_dup": 0,
+                             "imported_audio": 0, "errors": []}
+    rows: List[PairRow] = []
+    ds_dir = DS.dir_of(ds_name)
+    total = max(1, len(sidecar_paths))
+    for si, sc_path in enumerate(sidecar_paths or []):
+        if progress:
+            try:
+                progress(si / total, f"读取台本 {si + 1}/{len(sidecar_paths)}")
+            except Exception:
+                pass
+        try:
+            with open(sc_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception as e:
+            stats["errors"].append(f"{os.path.basename(sc_path)}: 读取失败 {e}")
+            continue
+        for li, ln in enumerate(data.get("lines") or []):
+            bon = ln.get("bon") or {}
+            bp, wp = bon.get("best_path"), bon.get("worst_path")
+            if not (bp and wp and os.path.isfile(bp) and os.path.isfile(wp)):
+                stats["skipped_missing"] += 1
+                continue
+            try:
+                r_best = float(bon.get("reward_best") or 0.0)
+                r_worst = float(bon.get("reward_worst") or 0.0)
+            except (TypeError, ValueError):
+                r_best = r_worst = 0.0
+            margin = r_best - r_worst
+            if margin < float(min_margin):
+                stats["skipped_margin"] += 1
+                continue
+            text = str(ln.get("text") or "").strip()
+            if not text:
+                stats["skipped_missing"] += 1
+                continue
+            try:
+                r = DS.import_audio(ds_name, [bp, wp], copy=True, lang=lang)
+                ids = [str(x) for x in (r.get("ids") or [])]
+                if len(ids) == 2:
+                    pass                      # 正常：两条都是新导入
+                elif not ids and "已导入过" in str(r.get("skipped") or ""):
+                    # 数据集按源文件去重 → 该句两侧都已导入过：幂等跳过，
+                    # 不产生重复对（重复跑导入是安全的）
+                    stats["skipped_dup"] += 1
+                    continue
+                elif len(ids) < 2:
+                    stats["errors"].append(
+                        f"line {li + 1}: 导入返回 {len(ids)} 个 id"
+                        f"（skipped={len(r.get('skipped') or [])}）")
+                    continue
+                # 补文本并把状态刷成 ready（特征还没提，训练前需跑特征提取）
+                DS.update(ds_name, ids[0], text=text)
+                DS.update(ds_name, ids[1], text=text)
+                for uid in ids:
+                    u = DS.get(ds_name, uid)
+                    if u is not None:
+                        DS.evaluate(u, ds_dir, require_features=False)
+                        DS.apply_fields(ds_name, {uid: {
+                            "status": u.status, "score": u.score,
+                            "problems": u.problems}})
+                rows.append(PairRow(
+                    id=f"bon_{_time.time():.0f}_{si:03d}_{li:04d}",
+                    text=text, chosen=ids[0], rejected=ids[1],
+                    prompt_id="", margin=round(margin, 4),
+                    reward_chosen=round(r_best, 4),
+                    reward_rejected=round(r_worst, 4),
+                    source="bon", created_at=_time.time()))
+                stats["pairs"] += 1
+                stats["imported_audio"] += 2
+            except Exception as e:
+                log.warning("BoN 导入失败（%s line %d）：%s",
+                            os.path.basename(sc_path), li + 1, e,
+                            exc_info=True)
+                stats["errors"].append(
+                    f"line {li + 1}: {type(e).__name__}: {e}")
+    if rows:
+        append_pairs(ds_name, rows)
+        log.info("BoN 导入完成：%s · %d 对（margin 丢弃 %d，缺文件 %d）",
+                 ds_name, stats["pairs"], stats["skipped_margin"],
+                 stats["skipped_missing"])
+    return {"ok": True, **stats}
+
+
 def split_pairs(ds_name: str, val_ratio: float = 0.1, seed: int = 42
                 ) -> Dict[str, List[str]]:
     """把**对**切成 train/val（不是把样本切 —— 一对的两个样本必须同侧，

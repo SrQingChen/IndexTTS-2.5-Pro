@@ -63,27 +63,42 @@ VALUE_KEYS: List[str] = [
 ]
 # 枚举/选择类的 UI 值（存 UI 原值，恢复前由调用方校验仍在合法集合内）
 CHOICE_KEYS: List[str] = ["emo_mode_label", "voice_name",
-                          "lora_run", "lora_ckpt"]
+                          "lora_run", "lora_ckpt",
+                          "lora_cfm_run", "lora_cfm_ckpt",
+                          "director_backend"]
 FLOAT_KEYS = {"duration_factor", "emo_alpha", "top_p", "temperature",
               "repetition_penalty", "length_penalty", "interval_silence"} | {
                   f"emo_vec_{i}" for i in range(8)}
 INT_KEYS = {"top_k", "num_beams", "max_mel_tokens",
-            "max_text_tokens_per_segment"}
-BOOL_KEYS = {"text_normalization", "use_random", "do_sample"}
+            "max_text_tokens_per_segment", "director_bon"}
+BOOL_KEYS = {"text_normalization", "use_random", "do_sample",
+             "director_enable", "director_route_emo", "director_bon_keep",
+             "emo_unlock_vector_cap", "emo_extrapolate"}
 # 本项目自有的、官方预设格式之外的配置（记忆机制保存，配置档不保存）
 EXTRA_KEYS: List[str] = ["lora_scale", "polish_on", "polish_presence",
-                         "polish_exciter"]
-FLOAT_KEYS |= {"lora_scale", "polish_presence", "polish_exciter"}
+                         "polish_exciter",
+                         "lora_cfm_scale",
+                         "director_enable", "director_character",
+                         "director_route_emo", "director_pause_scale",
+                         "director_bon", "director_bon_keep",
+                         "emo_unlock_vector_cap", "emo_extrapolate"]
+FLOAT_KEYS |= {"lora_scale", "polish_presence", "polish_exciter",
+               "lora_cfm_scale", "director_pause_scale"}
 
 # 数值范围钳制（与合成页控件一致，防手改 json 注入离谱值）
 _CLAMP: Dict[str, Tuple[float, float]] = {
-    "duration_factor": (0.5, 2.0), "emo_alpha": (0.0, 1.0),
+    "duration_factor": (0.5, 2.0),
+    # 上限 1.5 而非官方 1.0：emo_extrapolate 开关允许外推（2026-09），
+    # 白名单钳制若仍按 1.0 截，外推值在重启后会静默掉回 1.0。
+    "emo_alpha": (0.0, 1.5),
     "top_p": (0.0, 1.0), "top_k": (0, 100), "temperature": (0.1, 2.0),
     "num_beams": (1, 10), "repetition_penalty": (1.0, 20.0),
     "length_penalty": (-5.0, 5.0), "max_mel_tokens": (50, 1815),
     "max_text_tokens_per_segment": (20, 600),
     "lora_scale": (0.0, 1.5), "polish_presence": (0.0, 6.0),
     "polish_exciter": (0.0, 0.3), "interval_silence": (0.0, 1000.0),
+    "lora_cfm_scale": (0.0, 1.5),
+    "director_pause_scale": (0.4, 1.6), "director_bon": (0, 8),
 }
 
 
@@ -309,3 +324,66 @@ def live_to_preset_data(live: Dict[str, Any]) -> Dict[str, Any]:
         "length_penalty": f("length_penalty", 0.0),
         "max_mel_tokens": i("max_mel_tokens", 1500),
     }
+
+
+# -------------------------------------------------------------------------
+# 角色档案（LoRA 双通道配对记忆，2026-09 D 批次）
+# -------------------------------------------------------------------------
+
+PROFILES_PATH = os.path.join(STATE_DIR, "lora_profiles.json")
+
+
+def load_lora_profiles() -> Dict[str, Dict[str, Any]]:
+    """全部角色档案：{角色名: {gpt_run, gpt_ckpt, gpt_scale,
+    cfm_run, cfm_ckpt, cfm_scale, saved_at}}。损坏静默降级为空。"""
+    if not os.path.isfile(PROFILES_PATH):
+        return {}
+    try:
+        with open(PROFILES_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def get_lora_profile(character: str) -> Optional[Dict[str, Any]]:
+    char = (character or "").strip()
+    if not char:
+        return None
+    p = load_lora_profiles().get(char)
+    return p if isinstance(p, dict) else None
+
+
+def save_lora_profile(character: str, fields: Dict[str, Any]) -> bool:
+    """保存/覆盖一个角色的双通道配对。角色名为空返回 False。"""
+    char = (character or "").strip()
+    if not char:
+        return False
+    profiles = load_lora_profiles()
+    profiles[char] = {
+        "gpt_run": str(fields.get("gpt_run") or ""),
+        "gpt_ckpt": str(fields.get("gpt_ckpt") or "best"),
+        "gpt_scale": float(fields.get("gpt_scale") or 1.0),
+        "cfm_run": str(fields.get("cfm_run") or ""),
+        "cfm_ckpt": str(fields.get("cfm_ckpt") or "best"),
+        "cfm_scale": float(fields.get("cfm_scale") or 1.0),
+        "saved_at": time.time(),
+    }
+    try:
+        _atomic_write(PROFILES_PATH, profiles)
+        return True
+    except OSError:
+        return False
+
+
+def delete_lora_profile(character: str) -> bool:
+    char = (character or "").strip()
+    profiles = load_lora_profiles()
+    if char not in profiles:
+        return False
+    profiles.pop(char)
+    try:
+        _atomic_write(PROFILES_PATH, profiles)
+        return True
+    except OSError:
+        return False

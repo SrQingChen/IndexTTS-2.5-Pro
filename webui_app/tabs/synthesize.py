@@ -22,7 +22,10 @@ from webui_app import widgets as W
 from webui_app.config import EMO_BIAS, EMO_SUM_LIMIT, EMO_VECTOR_LABELS
 from webui_app.context import AppContext
 from webui_app.services import audio_lab as AL
+from webui_app.services import director as DR
+from webui_app.services import emotion_bank as EBK
 from webui_app.services import inference as INF
+from webui_app.services import orchestrator as ORC
 from webui_app.services import pronunciation as PR
 from webui_app.services import synth_state as SS
 from webui_app import logging_setup as LOG
@@ -50,9 +53,11 @@ except Exception:      # pragma: no cover - 官方模块缺失时的降级
 LORA_NONE = "（不使用 LoRA）"
 
 
-def _lora_run_choices() -> List[Any]:
+def _lora_run_choices(arch: str = "") -> List[Any]:
     """带 adapter 的训练记录 → [(显示文本, run 名)]。
 
+    arch 给定（"gpt"/"cfm"）时只列该架构 —— 双通道各看各的，避免
+    把 CFM 记录挂到 GPT 通道这种「挂得上但不是你想要的」错位。
     只列出 `has_adapter` 的 run —— 训练失败的记录挂在引擎上只会报错，
     不该出现在推理页里让人误选。
     """
@@ -61,9 +66,11 @@ def _lora_run_choices() -> List[Any]:
         for r in RN.list_runs():
             if not getattr(r, "has_adapter", False):
                 continue
+            if arch and str(getattr(r, "arch", "")) != arch:
+                continue
             bv = (f"val {r.best_val:.4f}"
                   if getattr(r, "best_val", None) is not None else "val —")
-            out.append((f"{r.name} · {r.arch} · {bv}", r.name))
+            out.append((f"{r.name} · {bv}", r.name))
     except Exception:
         pass
     return out
@@ -270,12 +277,21 @@ def render(ctx: AppContext):
     _bank_names = voice_bank.names()
     _st_voice = ST.get("voice_name") if ST.get("voice_name") in _bank_names else ""
     _st_lang = ST.get("lang") if ST.get("lang") in cfg.languages else "__default__"
-    _lora_values = [v for _l, v in _lora_run_choices()]
-    _st_lora_run = ST.get("lora_run") if ST.get("lora_run") in _lora_values else ""
+    _gpt_values = [v for _l, v in _lora_run_choices("gpt")]
+    _cfm_values = [v for _l, v in _lora_run_choices("cfm")]
+    _st_lora_run = (ST.get("lora_run")
+                    if ST.get("lora_run") in _gpt_values else "")
     _st_lora_ckpt = ("best" if not _st_lora_run else
                      (ST.get("lora_ckpt")
                       if ST.get("lora_ckpt") in _lora_ckpt_choices(_st_lora_run)
                       else "best"))
+    _st_lora_cfm_run = (ST.get("lora_cfm_run")
+                        if ST.get("lora_cfm_run") in _cfm_values else "")
+    _st_lora_cfm_ckpt = ("best" if not _st_lora_cfm_run else
+                         (ST.get("lora_cfm_ckpt")
+                          if ST.get("lora_cfm_ckpt")
+                          in _lora_ckpt_choices(_st_lora_cfm_run)
+                          else "best"))
     _st_emo_label = (ST.get("emo_mode_label")
                      if ST.get("emo_mode_label") in W.EMO_MODE_LABELS
                      else "__default__")
@@ -335,20 +351,21 @@ def render(ctx: AppContext):
                     to_lab_btn = gr.Button("→ 送去工作台优化", size="sm", scale=1)
                 voice_info = gr.HTML("")
 
-            # ---------- LoRA 音色模型（自训练产物） ----------
+            # ---------- LoRA 音色模型（GPT+CFM 双通道） ----------
             with gr.Column(elem_classes=["ix-section"]):
                 gr.HTML(T.section(
-                    "LoRA 音色模型", "🧬",
-                    "挂载自训练出来的 adapter。下拉框直接读 "
-                    "<code>training_runs/</code> 里的训练记录 —— "
-                    "「🚀 一键三连」或「🎓 训练」跑完的模型会自动出现在这里。"
-                    "挂上之后照常点「生成」即可，参数不必改。"))
+                    "LoRA 音色模型（双通道）", "🧬",
+                    "GPT 通道学「怎么说」（语气/断句/口癖），CFM 通道学"
+                    "「像谁」（音色/音质）—— 两路<b>可同时挂载</b>、各自"
+                    "独立选档与调强度。下拉框直接读 <code>training_runs/</code>"
+                    "，只列对应架构且已产出 adapter 的记录。"))
+                gr.HTML(T.tip("<b>🎙 GPT · 语气通道</b>"))
                 with gr.Row():
                     lora_run_dd = gr.Dropdown(
-                        choices=_lora_run_choices(), value=_st_lora_run,
-                        label="训练记录（run）", scale=3,
+                        choices=_lora_run_choices("gpt"), value=_st_lora_run,
+                        label="GPT 训练记录", scale=3,
                         allow_custom_value=False,
-                        info="只列出已经产出 adapter 的记录")
+                        info="只列出 gpt 架构且有 adapter 的记录")
                     lora_reload_btn = gr.Button("↻", scale=0,
                                                 variant="secondary", size="sm")
                 with gr.Row():
@@ -361,10 +378,45 @@ def render(ctx: AppContext):
                         0.0, 1.5, value=float(ST.get("lora_scale", 1.0)),
                         step=0.05, label="强度", scale=2,
                         info="推理期实时生效，不用重训")
+                gr.HTML(T.tip("<b>🔊 CFM · 音色通道</b>"))
                 with gr.Row():
-                    lora_mount_btn = gr.Button("🧬 挂载到引擎", size="sm", scale=1)
-                    lora_unmount_btn = gr.Button("卸载 LoRA", size="sm", scale=1)
+                    lora_cfm_run_dd = gr.Dropdown(
+                        choices=_lora_run_choices("cfm"),
+                        value=_st_lora_cfm_run,
+                        label="CFM 训练记录", scale=3,
+                        allow_custom_value=False,
+                        info="只列出 cfm 架构且有 adapter 的记录")
+                    lora_cfm_reload_btn = gr.Button("↻", scale=0,
+                                                    variant="secondary",
+                                                    size="sm")
+                with gr.Row():
+                    lora_cfm_ckpt_dd = gr.Dropdown(
+                        choices=_lora_ckpt_choices(_st_lora_cfm_run),
+                        value=_st_lora_cfm_ckpt, label="档位", scale=1,
+                        info="同上；两通道档位互不影响")
+                    lora_cfm_scale_sl = gr.Slider(
+                        0.0, 1.5, value=float(ST.get("lora_cfm_scale", 1.0)),
+                        step=0.05, label="强度", scale=2,
+                        info="与 GPT 通道强度互相独立")
+                with gr.Row():
+                    lora_mount_btn = gr.Button("🧬 挂载两通道", size="sm",
+                                               scale=1)
+                    lora_unmount_btn = gr.Button("卸载全部", size="sm",
+                                                 scale=1)
                 lora_state_html = gr.HTML(_lora_state_html(eng))
+                # 角色档案：把「该角色用哪两个 run + 强度」记下来，
+                # 选音色/填角色名时自动带出（引擎层的挂载在点生成时发生）。
+                with gr.Accordion("👤 角色档案（双通道配对记忆）", open=False):
+                    gr.HTML(T.hint(
+                        "把当前双通道选择存到角色名下（角色名来自下方导演模式"
+                        "区，选音色库会自动带出）；之后切到该角色时自动填入。"
+                        "存档在 <code>outputs/state/lora_profiles.json</code>。"))
+                    profile_status = gr.HTML("")
+                    with gr.Row():
+                        profile_save_btn = gr.Button("💾 存为角色档案",
+                                                     size="sm", scale=1)
+                        profile_del_btn = gr.Button("🗑 删除该角色档案",
+                                                    size="sm", scale=1)
 
             # ---------- 输出后处理（提亮 / 空气感） ----------
             with gr.Column(elem_classes=["ix-section"]):
@@ -526,6 +578,82 @@ def render(ctx: AppContext):
                     emo_rand = W.make_component("use_random", scale=1,
                                                 value=_v("use_random"))
 
+                with gr.Accordion("🧪 情感限幅器实验开关（默认关闭=官方语义）",
+                                  open=False):
+                    unlock_cap_cb = W.make_component(
+                        "emo_unlock_vector_cap",
+                        value=bool(ST.get("emo_unlock_vector_cap", False)))
+                    extrapolate_cb = W.make_component(
+                        "emo_extrapolate",
+                        value=bool(ST.get("emo_extrapolate", False)))
+
+            # ---------- 导演模式（逐句编排） ----------
+            with gr.Column(elem_classes=["ix-section"]):
+                gr.HTML(T.section(
+                    "导演模式（逐句编排）", "🎬",
+                    "把文本交给「导演层」逐句拆分、标情绪、排停顿，再逐句合成拼接。"
+                    "句间停顿不再固定 200ms，而是按标点与情绪浮动（150~1200ms）；"
+                    "配合「🎭 情感参考库」可逐句切换情绪参考 —— 这是语气起伏的主杠杆。"))
+                director_cb = W.make_component(
+                    "director_enable",
+                    value=bool(ST.get("director_enable", False)))
+                with gr.Group(visible=True) as g_director:
+                    with gr.Row():
+                        dir_backend = gr.Radio(
+                            choices=[("规则引擎（零配置）", "rules"),
+                                     ("LLM API（表演化改写）", "api")],
+                            value=ST.get("director_backend", "rules"),
+                            label="导演后端", scale=3,
+                            info="API 失败自动回退规则引擎，合成不中断")
+                        dir_route = W.make_component(
+                            "director_route_emo",
+                            value=bool(ST.get("director_route_emo", True)))
+                    dir_character = gr.Textbox(
+                        value=ST.get("director_character", ""),
+                        label="角色名（情感路由键）",
+                        placeholder="与情感参考库里的角色一致，如：卡提希娅",
+                        info="选择音色库条目时会自动带出；用于在情感参考库里"
+                             "找该角色对应情绪的参考音频")
+                    dir_scale_sl = W.make_component(
+                        "director_pause_scale",
+                        value=float(ST.get("director_pause_scale", 1.0)))
+                    with gr.Row():
+                        dir_bon = W.make_component(
+                            "director_bon",
+                            value=int(ST.get("director_bon", 0)))
+                        dir_bon_keep = W.make_component(
+                            "director_bon_keep",
+                            value=bool(ST.get("director_bon_keep", False)))
+                    with gr.Accordion("🔌 LLM API 配置（OpenAI 兼容）",
+                                      open=False) as api_acc:
+                        _api_cfg = DR.load_api_config()
+                        with gr.Row():
+                            api_base_tb = gr.Textbox(
+                                value=_api_cfg.get("base_url", ""),
+                                label="base_url", scale=2,
+                                placeholder="https://open.bigmodel.cn/api/paas/v4"
+                                            " 或 http://127.0.0.1:11434/v1")
+                            api_model_tb = gr.Textbox(
+                                value=_api_cfg.get("model", ""),
+                                label="模型名", scale=1,
+                                placeholder="glm-4-flash / qwen2.5:7b …")
+                        api_key_tb = gr.Textbox(
+                            value=_api_cfg.get("api_key", ""),
+                            label="api_key", type="password",
+                            placeholder="本地 ollama / LM Studio 可留空")
+                        with gr.Row():
+                            api_temp_sl = gr.Slider(
+                                0.0, 1.5, float(_api_cfg.get("temperature", 0.7)),
+                                step=0.05, label="temperature", scale=2)
+                            api_save_btn = gr.Button("💾 保存 API 配置",
+                                                     size="sm", scale=1)
+                        api_note = gr.HTML("")
+                    with gr.Row():
+                        dir_preview_btn = gr.Button(
+                            "🎭 预演台本（不合成）", size="sm", scale=1,
+                            variant="secondary")
+                    director_md = gr.Markdown("")
+
             # ---------- 生成 ----------
             with gr.Column(elem_classes=["ix-section"]):
                 gr.HTML(T.section("生成", "▶", ""))
@@ -647,12 +775,16 @@ def render(ctx: AppContext):
         prompt_audio, text_in, lang_dd, seed_n, dur_sl, tn_cb,
         seg_sl, sil_sl, emo_mode, emo_audio, emo_alpha,
         v0, v1, v2, v3, v4, v5, v6, v7, emo_text, emo_rand,
+        unlock_cap_cb, extrapolate_cb,
         do_sample, top_p, top_k, temperature, num_beams,
         rep_pen, len_pen, max_mel,
-        # 末尾这几个不是合成参数：3 个「挂哪个 LoRA」+ 3 个「输出后处理」。
+        # 末尾这几个不是合成参数：LoRA 双通道 6 + 后处理 3 + 导演 8。
         # 它们必须排在 _collect 的 keys 之后，由 on_generate 单独解包（见下）。
         lora_run_dd, lora_ckpt_dd, lora_scale_sl,
+        lora_cfm_run_dd, lora_cfm_ckpt_dd, lora_cfm_scale_sl,
         polish_cb, polish_presence, polish_exciter,
+        director_cb, dir_backend, dir_character, dir_route, dir_scale_sl,
+        dir_bon, dir_bon_keep,
     ]
 
     def _collect(*vals) -> Dict[str, Any]:
@@ -663,62 +795,97 @@ def render(ctx: AppContext):
             "emo_vec_0", "emo_vec_1", "emo_vec_2", "emo_vec_3",
             "emo_vec_4", "emo_vec_5", "emo_vec_6", "emo_vec_7",
             "emo_text", "use_random",
+            "emo_unlock_vector_cap", "emo_extrapolate",
             "do_sample", "top_p", "top_k", "temperature", "num_beams",
             "repetition_penalty", "length_penalty", "max_mel_tokens",
         ]
         return dict(zip(keys, vals))
 
-    def _mounted_runs() -> set:
-        """引擎上**实际**挂着的 adapter 对应的 run 名集合。
+    def _mounted_tags() -> Dict[str, List[str]]:
+        """引擎上**实际**挂着的 adapter 标签，按 target 分组。
 
         只看真实包装状态（`lora_status`），不看 `lora_want` —— 后者只是
         「上次挂过什么」，引擎在别的页面被卸载/重载之后就过期了。
         """
+        out: Dict[str, List[str]] = {"gpt": [], "cfm": []}
         try:
-            return {t.split(":", 1)[1]
-                    for x in eng.lora_status() if x.get("wrapped")
-                    for t in (x.get("tags") or [])}
+            for x in eng.lora_status():
+                tgt = str(x.get("target") or "")
+                if tgt in out and x.get("wrapped"):
+                    out[tgt].extend(str(t) for t in (x.get("tags") or []))
         except Exception:
-            return set()
+            pass
+        return out
 
-    def _sync_lora(run: str, ckpt: str, scale: float):
-        """保证「下拉框选的」与「引擎上挂的」一致。返回 (提示, 是否成功)。
+    def _sync_lora(run_g: str, ckpt_g: str, scale_g: float,
+                   run_c: str, ckpt_c: str, scale_c: float):
+        """双通道版「保证下拉框选的 = 引擎上挂的」。返回 (提示, 是否成功)。
 
-        只在选择变化时才真的重挂：每次生成都重挂要重读一遍 adapter 文件，
-        没必要。换 run / 换档位 / 改强度都会触发。
+        两个通道（gpt=语气 / cfm=音色）各自独立判定：
+            选了 run   → 需要挂载（或已在位则跳过，避免每次生成都重读
+                         adapter 文件——用「期望 tag 是否真在挂载列表里」
+                         判定，不信任可能过期的 lora_want 记录）；
+            选了「不使用」→ 只卸**该通道**（另一通道不受影响 —— 这正是
+                         双通道一等化要修掉的旧版全局卸载）。
 
-        **挂载失败时返回 ok=False**，让上层中止这次生成。原因：
-        用户明确选了某个音色，系统却做不到 —— 这时用底座静默出一版音频
-        比直接报错更糟（听起来"像"，但其实是错的模型）。
+        **任何一通道挂载失败返回 ok=False**，上层中止这次生成 —— 用户明确
+        选了模型，用底座静默出声比报错更糟。
         """
-        act = lora_action(run, _mounted_runs())
-        if act == "unmount":
-            # 选「不使用 LoRA」= 要纯底座。挂着的就卸掉，与下拉框语义一致。
-            try:
-                for tag in list(eng.stats.lora_adapters):
-                    eng.detach_lora(target=str(tag).split(":", 1)[0])
-                ctx.shared["lora_want"] = None
-                return "<br>🧬 已按选择卸下 LoRA，本次用<b>纯底座</b>合成", True
-            except Exception as e:
-                return (f"<br>⚠️ 卸载 LoRA 失败：{type(e).__name__}: {e}", False)
-        if act == "none":
-            return "", True
+        want_rec: Dict[str, tuple] = {}
+        notes: List[str] = []
+        for target, (run, ckpt, scale) in (
+                ("gpt", (run_g, ckpt_g, scale_g)),
+                ("cfm", (run_c, ckpt_c, scale_c))):
+            want = (run, ckpt or "best", round(float(scale or 1.0), 2))
+            want_rec[target] = want if run else None
+            tags = _mounted_tags().get(target, [])
 
-        want = (run, ckpt or "best", round(float(scale), 2))
-        try:
-            if not eng.loaded:
-                eng.load()
-            tag = MG.mount_run(eng, run, checkpoint=want[1], scale=want[2])
-        except Exception as e:
-            return (f"LoRA 挂载失败：{type(e).__name__}: {e}"
-                    "（已中止本次合成，避免用错模型出声）", False)
-        ctx.shared["lora_want"] = want
-        return f"<br>🧬 已自动挂载 <code>{tag}</code>（强度 {want[2]}）", True
+            if not run:
+                if tags:
+                    try:
+                        eng.detach_lora(target=target)
+                        notes.append(f"<br>🧬 已卸下 {target.upper()} 通道")
+                    except Exception as e:
+                        return (f"<br>⚠️ 卸载 {target} 通道失败："
+                                f"{type(e).__name__}: {e}", False)
+                continue
+
+            # 在位判定：期望 tag（= adapter 目录名）真出现在该通道挂载列表
+            expected = None
+            try:
+                d, _arch = MG.resolve_mount_dir(run, want[1])
+                dname = os.path.basename(d.rstrip("/\\"))
+                expected = f"{target}:{dname}"
+            except Exception:
+                expected = None       # 目录缺失 → 走挂载路径让它报错
+            if expected and expected in tags and \
+                    ctx.shared.get("lora_want", {}).get(target) == want:
+                continue
+
+            try:
+                if not eng.loaded:
+                    eng.load()
+                tag = MG.mount_run(eng, run, checkpoint=want[1],
+                                   scale=want[2])
+                notes.append(f"<br>🧬 已挂载 <code>{tag}</code>"
+                             f"（强度 {want[2]}）")
+            except Exception as e:
+                return (f"{target.upper()} 通道 LoRA 挂载失败："
+                        f"{type(e).__name__}: {e}（已中止本次合成，"
+                        "避免用错模型出声）", False)
+        ctx.shared["lora_want"] = want_rec
+        return "".join(notes), True
 
     @LOG.ui_guard("synthesize.on_generate", slow_sec=1.0)
     def on_generate(*vals, progress=gr.Progress(track_tqdm=False)):
+        # core = _collect 的 31 个合成参数（含解锁开关与采样参数，
+        # 顺序与 all_inputs/_collect keys 严格一致）；尾部 16 个单独解包
+        # （LoRA 双通道 6 + 后处理 3 + 导演 7）。
         (*core, lora_run, lora_ckpt, lora_scale,
-         pol_on, pol_presence, pol_exciter) = vals
+         lora_cfm_run, lora_cfm_ckpt, lora_cfm_scale,
+         pol_on, pol_presence, pol_exciter,
+         dir_on, dir_backend, dir_character, dir_route, dir_scale,
+         dir_bon_n, dir_bon_keep) = vals
         raw = _collect(*core)
         raw["emo_control_method"] = W.emo_mode_index(raw["emo_control_method"])
         # 记下本次参数快照，供「预设管理」页的「保存当前参数」使用
@@ -739,7 +906,9 @@ def render(ctx: AppContext):
 
         # 选的 LoRA 与挂的不一致就先挂上，再合成。挂不上就**中止** ——
         # 用户指定了音色却用底座出声，听起来"像"但其实是错模型，比报错更糟。
-        lora_note, lora_ok = _sync_lora(lora_run, lora_ckpt, lora_scale)
+        lora_note, lora_ok = _sync_lora(
+            lora_run, lora_ckpt, lora_scale,
+            lora_cfm_run, lora_cfm_ckpt, lora_cfm_scale)
         if not lora_ok:
             gr.Error(lora_note.replace("<br>", " "))
             return (gr.update(),
@@ -748,7 +917,23 @@ def render(ctx: AppContext):
 
         try:
             progress(0.05, desc="准备中…")
-            res = INF.generate(eng, req, progress=progress)
+            if dir_on:
+                # 导演模式：文本 → 台本 → 逐句合成拼接
+                backend = "api" if str(dir_backend) == "api" else "rules"
+                sc = DR.direct((req.text or ""), backend=backend,
+                               character=str(dir_character or ""),
+                               seed=INF.resolve_seed(req.seed),
+                               pause_scale=float(dir_scale or 1.0))
+                res = ORC.perform(
+                    eng, req, sc,
+                    route=bool(dir_route),
+                    character=str(dir_character or ""),
+                    extrapolate=bool(req.emo_extrapolate),
+                    progress=progress,
+                    bon_n=int(dir_bon_n or 0),
+                    bon_keep=bool(dir_bon_keep))
+            else:
+                res = INF.generate(eng, req, progress=progress)
         except EngineError as e:
             gr.Error(str(e))
             return (gr.update(), T.err(f"<b>合成失败</b>：{e}"),
@@ -775,6 +960,19 @@ def render(ctx: AppContext):
                          "`[" + ", ".join(f"{x:.3f}" for x in vec) + "]`"))
         if kw.get("emo_audio_prompt"):
             rows.append(("情感参考", f'`{os.path.basename(kw["emo_audio_prompt"])}`'))
+        if res.get("director"):
+            d = res["director"]
+            rows.append(("导演编排",
+                         f'{d["n"]} 句 · `{d["backend"]}` 后端 · '
+                         f'句均停顿 {d["avg_pause_ms"]:.0f} ms'))
+            if d.get("bon_n"):
+                rows.append(("逐句择优",
+                             f'每句 {d["bon_n"]} 候选 · reward 重排'
+                             f'（0.35 读对 + 0.25 音色 + 0.30 情绪 + 0.10 停顿）'))
+            if d["n"]:
+                rows.append(("情感路由",
+                             f"命中 {d['routed']} / 回退 {d['fallback']} 句 · "
+                             f'台本 `{os.path.basename(d.get("sidecar") or "")}`'))
 
         # 输出后处理：**另存**一个文件，原始输出保留，方便 A/B 对比
         pol_note = ""
@@ -826,41 +1024,158 @@ def render(ctx: AppContext):
         outputs=[out_audio, out_info, sb, lora_state_html, polish_md],
     )
 
+    # ---------- 导演模式：预演台本 / API 配置 / 角色名联动 ----------
+
+    @LOG.ui_guard("synthesize.on_director_preview")
+    def on_director_preview(text, backend, character, route, pause_scale):
+        """预演台本：跑导演层 + 情感路由预览，不加载引擎不合成。"""
+        if not (text or "").strip():
+            return T.warn("请先在「文本与语言」里输入文本。")
+        backend = "api" if str(backend) == "api" else "rules"
+        sc = DR.direct(text, backend=backend, character=character or "",
+                       seed=INF.resolve_seed(-1),
+                       pause_scale=float(pause_scale or 1.0))
+        route_map = None
+        if route:
+            # 每种出现的情绪预路由一次（同名情绪共享参考）
+            route_map, ref_col = {}, []
+            for ln in sc.lines:
+                if ln.emotion not in route_map:
+                    e = EBK.pick(character or "", ln.emotion)
+                    route_map[ln.emotion] = f"`{e.name}`" if e else ""
+                    ref_col.append((ln.emotion, e.name if e else None))
+            md = DR.script_markdown(sc, route=route_map)
+            hit = sum(1 for _k, n in ref_col if n)
+            rs = EBK.route_summary(character or "")
+            md += (f"\n\n路由：命中 {hit}/{len(ref_col)} 种情绪 · "
+                   f"角色 `{character or '（未填）'}` 已归档 "
+                   f"{rs['n']} 条参考"
+                   + (f" · 缺情绪：{', '.join(rs['missing'])}"
+                      if rs["n"] and rs["missing"] else ""))
+            if not rs["n"]:
+                md += ("\n\n⚠️ 该角色在情感参考库里还没有任何条目 —— 逐句将全部"
+                       "回退「跟随音色参考」。到「🎭 情感参考库」页入库后生效。")
+            return md
+        return DR.script_markdown(sc)
+
+    dir_preview_btn.click(
+        on_director_preview,
+        inputs=[text_in, dir_backend, dir_character, dir_route, dir_scale_sl],
+        outputs=[director_md])
+
+    @LOG.ui_guard("synthesize.on_api_save")
+    def on_api_save(base, key, model, temp):
+        ok = DR.save_api_config({
+            "base_url": (base or "").strip(), "api_key": (key or "").strip(),
+            "model": (model or "").strip(), "temperature": float(temp or 0.7),
+        })
+        if ok:
+            return T.tip("✅ 已保存到 <code>outputs/state/director_config.json</code>。"
+                         "点「预演台本」即可验证 LLM 是否可用。")
+        return T.err("保存失败（目录只读？）")
+
+    api_save_btn.click(
+        on_api_save,
+        inputs=[api_base_tb, api_key_tb, api_model_tb, api_temp_sl],
+        outputs=[api_note])
+
+    _PROFILE_OUTS = 8   # dir_character + 双通道 6 控件 + 档案状态行
+
+    def _noop_profile_outs():
+        return tuple(gr.update() for _ in range(_PROFILE_OUTS - 1))
+
+    def on_voice_to_character(voice_name, current):
+        """选音色库条目 → 带出角色名 → **串联带入该角色的双通道档案**。
+
+        必须在这里串联：gr.update 程序化设值不会触发 dir_character.change
+        （本工程的既知约定），只绑 change 的话走「选音色」这条主路径时
+        档案永远不生效。角色名没变时不动档案（避免覆盖手动调整）。
+        """
+        v = (voice_name or "").strip()
+        cur = (current or "").strip()
+        if not v:
+            return (gr.update(), *_noop_profile_outs())
+        if cur and cur not in voice_bank.names():
+            # 用户自定义的角色名，尊重之；但若与所选音色同名仍刷一次档案
+            if v != cur:
+                return (gr.update(), *_noop_profile_outs())
+        elif v == cur:
+            return (gr.update(), *_noop_profile_outs())
+        ups, status = _profile_apply_updates(v)
+        if ups is None:
+            return (gr.update(value=v), *_noop_profile_outs(),
+                    f'<span class="ix-chip"><span class="ix-dot idle"></span>'
+                    f'角色档案 ·「{v}」暂无存档</span>')
+        return (gr.update(value=v), *ups, status)
+
+    voice_dd.change(
+        on_voice_to_character,
+        inputs=[voice_dd, dir_character],
+        outputs=[dir_character, lora_run_dd, lora_ckpt_dd, lora_scale_sl,
+                 lora_cfm_run_dd, lora_cfm_ckpt_dd, lora_cfm_scale_sl,
+                 profile_status])
+
     # ---------- LoRA 选择与挂载 ----------
 
     @LOG.ui_guard("synthesize.on_lora_run")
     def on_lora_run(run):
-        """换 run 时刷新档位列表。"""
+        """换 GPT 通道 run 时刷新档位列表。"""
         cks = _lora_ckpt_choices(run)
         return gr.update(choices=cks, value=cks[0])
 
     lora_run_dd.change(on_lora_run, inputs=[lora_run_dd],
                        outputs=[lora_ckpt_dd])
 
+    def on_lora_cfm_run(run):
+        """换 CFM 通道 run 时刷新档位列表。"""
+        cks = _lora_ckpt_choices(run)
+        return gr.update(choices=cks, value=cks[0])
+
+    lora_cfm_run_dd.change(on_lora_cfm_run, inputs=[lora_cfm_run_dd],
+                           outputs=[lora_cfm_ckpt_dd])
+
     @LOG.ui_guard("synthesize.on_lora_mount")
-    def on_lora_mount(run, ckpt, scale):
-        if not run:
-            return T.hint("先在上面的下拉框里选一个训练记录。")
-        if not eng.loaded:
-            gr.Info("引擎未加载，正在自动加载…")
+    def on_lora_mount(run_g, ckpt_g, scale_g, run_c, ckpt_c, scale_c):
+        """按两通道当前选择各自挂载（互不干扰；空 = 跳过该通道）。"""
+        notes, ok = [], True
+        for target, (run, ckpt, scale) in (
+                ("gpt", (run_g, ckpt_g, scale_g)),
+                ("cfm", (run_c, ckpt_c, scale_c))):
+            if not run:
+                continue
+            if not eng.loaded:
+                gr.Info("引擎未加载，正在自动加载…")
+                try:
+                    eng.load()
+                except Exception as e:
+                    return T.err(f"引擎加载失败：{type(e).__name__}: {e}")
             try:
-                eng.load()
+                tag = MG.mount_run(eng, run, checkpoint=(ckpt or "best"),
+                                   scale=float(scale))
+                notes.append(f"{tag}")
+            except FileNotFoundError as e:
+                return T.err(f"找不到 adapter：{e}")
             except Exception as e:
-                return T.err(f"引擎加载失败：{type(e).__name__}: {e}")
-        try:
-            tag = MG.mount_run(eng, run, checkpoint=(ckpt or "best"),
-                               scale=float(scale))
-        except FileNotFoundError as e:
-            return T.err(f"找不到 adapter：{e}")
-        except Exception as e:
-            return T.err(f"挂载失败：{type(e).__name__}: {e}")
-        ctx.shared["lora_want"] = (run, ckpt or "best", round(float(scale), 2))
-        gr.Info(f"已挂载 {tag}")
+                return T.err(f"{target} 通道挂载失败：{type(e).__name__}: {e}")
+        want = ctx.shared.get("lora_want") or {}
+        if isinstance(want, dict):
+            if run_g:
+                want["gpt"] = (run_g, ckpt_g or "best",
+                               round(float(scale_g), 2))
+            if run_c:
+                want["cfm"] = (run_c, ckpt_c or "best",
+                               round(float(scale_c), 2))
+            ctx.shared["lora_want"] = want
+        if not notes:
+            return T.hint("两个通道都没选训练记录 —— 选一个再挂载。")
+        gr.Info("已挂载：" + " · ".join(notes))
         return _lora_state_html(eng)
 
-    lora_mount_btn.click(on_lora_mount,
-                         inputs=[lora_run_dd, lora_ckpt_dd, lora_scale_sl],
-                         outputs=[lora_state_html])
+    lora_mount_btn.click(
+        on_lora_mount,
+        inputs=[lora_run_dd, lora_ckpt_dd, lora_scale_sl,
+                lora_cfm_run_dd, lora_cfm_ckpt_dd, lora_cfm_scale_sl],
+        outputs=[lora_state_html])
 
     @LOG.ui_guard("synthesize.on_lora_unmount")
     def on_lora_unmount():
@@ -872,8 +1187,8 @@ def render(ctx: AppContext):
                 eng.detach_lora(target=str(tag).split(":", 1)[0])
             except Exception as e:
                 return T.err(f"卸载 {tag} 失败：{type(e).__name__}: {e}")
-        ctx.shared["lora_want"] = None
-        gr.Info("已卸载 LoRA，回到纯底座")
+        ctx.shared["lora_want"] = {"gpt": None, "cfm": None}
+        gr.Info("已卸载全部 LoRA，回到纯底座")
         return _lora_state_html(eng)
 
     lora_unmount_btn.click(on_lora_unmount, inputs=[],
@@ -881,32 +1196,135 @@ def render(ctx: AppContext):
 
     @LOG.ui_guard("synthesize.on_lora_refresh")
     def on_lora_refresh():
-        return (gr.update(choices=_lora_run_choices()),
+        return (gr.update(choices=_lora_run_choices("gpt")),
+                gr.update(choices=_lora_run_choices("cfm")),
                 _lora_state_html(eng))
 
     lora_reload_btn.click(on_lora_refresh, inputs=[],
-                          outputs=[lora_run_dd, lora_state_html])
+                          outputs=[lora_run_dd, lora_cfm_run_dd,
+                                   lora_state_html])
+    lora_cfm_reload_btn.click(on_lora_refresh, inputs=[],
+                              outputs=[lora_run_dd, lora_cfm_run_dd,
+                                       lora_state_html])
 
     @LOG.ui_guard("synthesize.on_lora_scale")
-    def on_lora_scale(scale, run, ckpt):
-        """拖动强度旋钮即时生效（已挂载时不用重新挂）。"""
+    def on_lora_scale(scale, run, ckpt, target):
+        """拖动某通道强度旋钮即时生效（已挂载时不用重新挂）。"""
         if not run:
             return gr.update()
-        tags = list(getattr(eng.stats, "lora_adapters", []) or [])
+        tags = [t for t in getattr(eng.stats, "lora_adapters", []) or []
+                if str(t).startswith(target + ":")]
         if not tags:
             return gr.update()
         try:
-            for tag in tags:
-                MG.set_scale(eng, float(scale),
-                             target=str(tag).split(":", 1)[0])
+            MG.set_scale(eng, float(scale), target=target)
         except Exception:
             return gr.update()
-        ctx.shared["lora_want"] = (run, ckpt or "best", round(float(scale), 2))
+        want = ctx.shared.get("lora_want") or {}
+        if isinstance(want, dict):
+            want[target] = (run, ckpt or "best", round(float(scale), 2))
+            ctx.shared["lora_want"] = want
         return _lora_state_html(eng)
 
     lora_scale_sl.release(on_lora_scale,
-                          inputs=[lora_scale_sl, lora_run_dd, lora_ckpt_dd],
+                          inputs=[lora_scale_sl, lora_run_dd, lora_ckpt_dd,
+                                  gr.State("gpt")],
                           outputs=[lora_state_html])
+    lora_cfm_scale_sl.release(on_lora_scale,
+                              inputs=[lora_cfm_scale_sl, lora_cfm_run_dd,
+                                      lora_cfm_ckpt_dd, gr.State("cfm")],
+                              outputs=[lora_state_html])
+
+    # ---------- 角色档案：双通道配对记忆 ----------
+
+    def _profile_apply_updates(char: str):
+        """角色 → 双通道控件的 gr.update 序列（含合法集合校验）。
+
+        返回 (updates, status_html)。档案里已消失的 run 跳过该通道
+        并在状态里说明 —— 沉默地把下拉框填成空比提示一句更坑。
+        """
+        p = SS.get_lora_profile(char)
+        if not p:
+            return None, ""
+        gpt_vals = [v for _l, v in _lora_run_choices("gpt")]
+        cfm_vals = [v for _l, v in _lora_run_choices("cfm")]
+        ups, warns = [], []
+        for key, vals in (("gpt", gpt_vals), ("cfm", cfm_vals)):
+            run = str(p.get(f"{key}_run") or "")
+            if run and run not in vals:
+                warns.append(f"{key.upper()} 档案里的 run `{run}` 已不存在，"
+                             "已跳过")
+                run = ""
+            ckpt = str(p.get(f"{key}_ckpt") or "best")
+            if run:
+                cks = _lora_ckpt_choices(run)
+                if ckpt not in cks:
+                    ckpt = "best"
+            else:
+                ckpt = "best"
+            ups.append(gr.update(value=run))
+            ups.append(gr.update(choices=_lora_ckpt_choices(run), value=ckpt))
+            ups.append(gr.update(value=float(p.get(f"{key}_scale") or 1.0)))
+        status = (f'<span class="ix-chip"><span class="ix-dot ok"></span>'
+                  f'👤 已带入角色「{char}」的双通道档案</span>')
+        if warns:
+            status += (f'<div class="ix-warn" style="margin-top:4px">'
+                       + "；".join(warns) + "</div>")
+        return ups, status
+
+    @LOG.ui_guard("synthesize.on_profile_change")
+    def on_profile_auto(char):
+        """角色名变化（选音色带出 / 手填）→ 自动带入该角色的档案。"""
+        ups, status = _profile_apply_updates((char or "").strip())
+        if ups is None:
+            return gr.update(), gr.update(), gr.update(), \
+                gr.update(), gr.update(), gr.update(), \
+                f'<span class="ix-chip"><span class="ix-dot idle"></span>' \
+                f'角色档案 ·「{(char or "").strip() or "（未填）"}」暂无存档</span>'
+        return (*ups, status)
+
+    dir_character.change(
+        on_profile_auto, inputs=[dir_character],
+        outputs=[lora_run_dd, lora_ckpt_dd, lora_scale_sl,
+                 lora_cfm_run_dd, lora_cfm_ckpt_dd, lora_cfm_scale_sl,
+                 profile_status])
+
+    @LOG.ui_guard("synthesize.on_profile_save")
+    def on_profile_save(char, run_g, ckpt_g, scale_g,
+                        run_c, ckpt_c, scale_c):
+        char = (char or "").strip()
+        if not char:
+            return T.warn("角色名为空（在下方「导演模式」区填写或选音色带出）。")
+        ok = SS.save_lora_profile(char, {
+            "gpt_run": run_g or "", "gpt_ckpt": ckpt_g or "best",
+            "gpt_scale": float(scale_g or 1.0),
+            "cfm_run": run_c or "", "cfm_ckpt": ckpt_c or "best",
+            "cfm_scale": float(scale_c or 1.0)})
+        if not ok:
+            return T.err("保存失败（目录只读？）")
+        gr.Info(f"已保存角色档案：{char}")
+        return (f'<span class="ix-chip"><span class="ix-dot ok"></span>'
+                f'👤 已存角色「{char}」：GPT=`{run_g or "（无）"}`×{scale_g} · '
+                f'CFM=`{run_c or "（无）"}`×{scale_c}</span>')
+
+    profile_save_btn.click(
+        on_profile_save,
+        inputs=[dir_character, lora_run_dd, lora_ckpt_dd, lora_scale_sl,
+                lora_cfm_run_dd, lora_cfm_ckpt_dd, lora_cfm_scale_sl],
+        outputs=[profile_status])
+
+    @LOG.ui_guard("synthesize.on_profile_del")
+    def on_profile_del(char):
+        char = (char or "").strip()
+        if not char or not SS.delete_lora_profile(char):
+            return (f'<span class="ix-chip"><span class="ix-dot idle"></span>'
+                    f'角色「{char or "（未填）"}」没有可删的档案</span>')
+        gr.Info(f"已删除角色档案：{char}")
+        return (f'<span class="ix-chip"><span class="ix-dot warn"></span>'
+                f'👤 已删除角色「{char}」的档案</span>')
+
+    profile_del_btn.click(on_profile_del, inputs=[dir_character],
+                          outputs=[profile_status])
 
     # ---------- 情感模式联动 ----------
     MODE_HINTS = [
@@ -1257,7 +1675,7 @@ def render(ctx: AppContext):
             gr.Info("模型已卸载，显存已归还")
         # 卸载会清空 stats.lora_adapters（引擎上的 LoRA 随之消失），
         # 所以「想挂的那个」的标记也要一起失效，否则下次生成会以为还挂着。
-        ctx.shared["lora_want"] = None
+        ctx.shared["lora_want"] = {"gpt": None, "cfm": None}
         return engine_html(), ctx.status_html(), _lora_state_html(eng)
 
     load_btn.click(on_load, inputs=[],
@@ -1311,18 +1729,25 @@ def render(ctx: AppContext):
         voice_dd, prompt_audio, lang_dd, dur_sl, seed_n, tn_cb,
         seg_sl, sil_sl, emo_mode, emo_audio, emo_alpha,
         v0, v1, v2, v3, v4, v5, v6, v7, emo_text, emo_rand,
+        unlock_cap_cb, extrapolate_cb,
         do_sample, temperature, top_p, top_k, num_beams,
         rep_pen, len_pen, max_mel,
         lora_run_dd, lora_ckpt_dd, lora_scale_sl,
+        lora_cfm_run_dd, lora_cfm_ckpt_dd, lora_cfm_scale_sl,
         polish_cb, polish_presence, polish_exciter, remember_cb,
+        director_cb, dir_backend, dir_character, dir_route, dir_scale_sl,
+        dir_bon, dir_bon_keep,
     ]
 
     def _live_snapshot(*vals) -> Dict[str, Any]:
         """remember_comps 的当前值 → 语义键字典（含音频路径与记忆开关）。"""
         (voice_name, pa, lang, dur, seed, tn, seg, sil, emo_lab, ea, alpha,
          vv0, vv1, vv2, vv3, vv4, vv5, vv6, vv7, etxt, erand,
+         ucap, extra,
          dsamp, temp, topp, topk, beams, rpen, lpen, mmel,
-         lrun, lckpt, lscale, pon, ppre, pexc, remember_on) = vals
+         lrun, lckpt, lscale, crun, cckpt, cscale,
+         pon, ppre, pexc, remember_on,
+         d_on, d_backend, d_char, d_route, d_scale, d_bon, d_bkeep) = vals
         return {
             "voice_name": voice_name or "",
             "prompt_audio": pa, "emo_audio": ea,
@@ -1336,12 +1761,23 @@ def render(ctx: AppContext):
             "emo_vec_3": vv3, "emo_vec_4": vv4, "emo_vec_5": vv5,
             "emo_vec_6": vv6, "emo_vec_7": vv7,
             "emo_text": etxt, "use_random": erand,
+            "emo_unlock_vector_cap": ucap, "emo_extrapolate": extra,
             "do_sample": dsamp, "temperature": temp, "top_p": topp,
             "top_k": topk, "num_beams": beams, "repetition_penalty": rpen,
             "length_penalty": lpen, "max_mel_tokens": mmel,
             "lora_run": lrun or "", "lora_ckpt": lckpt or "best",
-            "lora_scale": lscale, "polish_on": pon,
+            "lora_scale": lscale,
+            "lora_cfm_run": crun or "", "lora_cfm_ckpt": cckpt or "best",
+            "lora_cfm_scale": cscale,
+            "polish_on": pon,
             "polish_presence": ppre, "polish_exciter": pexc,
+            "director_enable": bool(d_on),
+            "director_backend": ("api" if str(d_backend) == "api" else "rules"),
+            "director_character": d_char or "",
+            "director_route_emo": bool(d_route),
+            "director_pause_scale": float(d_scale or 1.0),
+            "director_bon": int(d_bon or 0),
+            "director_bon_keep": bool(d_bkeep),
             "_remember": bool(remember_on),
         }
 
@@ -1416,7 +1852,11 @@ def render(ctx: AppContext):
         rep_pen, len_pen, max_mel, seg_sl,
         sil_sl, seed_n, tn_cb, voice_dd,
         lora_run_dd, lora_ckpt_dd, lora_scale_sl,
+        lora_cfm_run_dd, lora_cfm_ckpt_dd, lora_cfm_scale_sl,
         polish_cb, polish_presence, polish_exciter,
+        director_cb, dir_route, dir_character, dir_scale_sl,
+        dir_bon, dir_bon_keep,
+        unlock_cap_cb, extrapolate_cb,
     ]
 
     @LOG.ui_guard("synthesize.on_forget")
@@ -1453,9 +1893,20 @@ def render(ctx: AppContext):
             gr.update(value=""),                          # LoRA run
             gr.update(value="best"),                      # LoRA 档位
             gr.update(value=1.0),                         # LoRA 强度
+            gr.update(value=""),                          # CFM run
+            gr.update(value="best"),                      # CFM 档位
+            gr.update(value=1.0),                         # CFM 强度
             gr.update(value=True),                        # 后处理开关
             gr.update(value=2.5),                         # presence
             gr.update(value=0.08),                        # exciter
+            gr.update(value=bool(P.get("director_enable").default)),   # 导演开关
+            gr.update(value=bool(P.get("director_route_emo").default)),  # 情感路由
+            gr.update(value=""),                          # 角色名
+            gr.update(value=float(P.get("director_pause_scale").default)),  # 停顿系数
+            gr.update(value=int(P.get("director_bon").default)),           # 择优N
+            gr.update(value=bool(P.get("director_bon_keep").default)),     # 保留候选
+            gr.update(value=bool(P.get("emo_unlock_vector_cap").default)),  # 解锁上限
+            gr.update(value=bool(P.get("emo_extrapolate").default)),     # 外推
         ]
         assert len(ups) == len(reset_targets)
         mem = gr.update(

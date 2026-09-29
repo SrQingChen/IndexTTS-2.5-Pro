@@ -77,8 +77,11 @@ class Utterance:
     audio: str = ""                 # 相对数据集目录的路径
     source: str = ""                # 导入时的源文件绝对路径（去重用）
     text: str = ""                  # 训练用文本（人工校对后）
-    asr_text: str = ""              # whisper 原始转写，仅作参考
+    asr_text: str = ""              # 原始转写，仅作参考
     asr_model: str = ""
+    # SenseVoice 富转写的情绪标签（映射到 8 键：happy/angry/...calm）。
+    # 用途：情感参考库自动打标候选、数据集按情绪过滤/配比。
+    emotion: str = ""
     lang: str = "ZH"
 
     duration: float = 0.0

@@ -86,6 +86,31 @@ def main() -> int:
         check("白名单外字段被丢弃", "hacker_key" not in s)
         check("畸形数值字段被丢弃", "interval_silence" not in s)
 
+        # 1b) 2026-09 新键：导演模式 / 解锁开关 / CFM 通道 / 外推钳制修正
+        s2 = SS.sanitize({
+            "director_enable": 1, "director_route_emo": 0,
+            "director_bon": 99, "director_bon_keep": 1,
+            "director_pause_scale": 0.1, "director_character": "卡提希娅",
+            "director_backend": "api",
+            "emo_unlock_vector_cap": True, "emo_extrapolate": True,
+            "emo_alpha": 1.4,                     # 外推值不许被钳回 1.0
+            "lora_cfm_run": "x_cfm", "lora_cfm_ckpt": "best",
+            "lora_cfm_scale": 9.9,                # 越界 → 钳到 1.5
+        })
+        check("导演/解锁/CFM 键进入白名单",
+              s2.get("director_enable") is True
+              and s2.get("director_route_emo") is False
+              and s2.get("director_bon_keep") is True
+              and s2.get("director_character") == "卡提希娅"
+              and s2.get("director_backend") == "api"
+              and s2.get("emo_unlock_vector_cap") is True
+              and s2.get("lora_cfm_run") == "x_cfm")
+        check("director_bon 越界钳到 8", s2.get("director_bon") == 8)
+        check("外推 alpha 1.4 不再被钳回 1.0（2026-09 修正）",
+              abs(s2.get("emo_alpha", 0.0) - 1.4) < 1e-9)
+        check("lora_cfm_scale 越界钳到 1.5", s2.get("lora_cfm_scale") == 1.5)
+        check("停顿系数下限 0.4", s2.get("director_pause_scale") == 0.4)
+
         # --------------------------------------------------------------
         # 2) save / load 往返
         # --------------------------------------------------------------

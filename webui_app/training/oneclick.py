@@ -49,6 +49,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 from webui_app import logging_setup as LOG
 from webui_app.config import OUTPUT_SAMPLE_RATE, PROJECT_ROOT
 from webui_app.services import audio_lab as AL
+from webui_app.services import funasr_hub as FHUB
 from webui_app.training import cfm_lora as CL
 from webui_app.training import dataset as DS
 from webui_app.training import evaluate as EV
@@ -149,6 +150,15 @@ def degenerate_text_reason(text: str, min_chars: int = 2) -> str:
 # 引擎状态：需要 GPU 的阶段之前，把不需要的模型真的卸掉
 # ===========================================================================
 
+def _funasr_loaded() -> bool:
+    """funasr_hub 里是否还有模型驻留（识别阶段卸载核验用）。"""
+    try:
+        s = FHUB.loaded_summary()
+        return bool(s.get("sensevoice") or s.get("emotion2vec"))
+    except Exception:
+        return False
+
+
 def ensure_engine_off(engine, tracker=None, reason: str = "") -> Dict[str, Any]:
     """把推理引擎卸掉并把显存还给驱动。返回一份可记录的状态摘要。
 
@@ -197,11 +207,13 @@ class OneClickOptions:
 
     # ---- S1 切片（只对超过 slice_over_sec 的长音频生效）----
     slice_over_sec: float = DS.MAX_TRAIN_SEC   # 20s：超过就不算「可直接训练」
-    slice_target_sec: float = 12.0             # 每片目标时长
-    slice_min_sec: float = 4.0                 # 太短的片段不要
-    # 单条长音频最多切几片。默认 120：半小时素材按 10~12 秒一片大约就是
-    # 100 来条，正好落在「样本数够训 LoRA」的量级上（下限是 20 条）。
-    slice_max_pieces: int = 120
+    # 2026-09 A3 韵律切分：目标从 12s 长段降到 6s 短句。理由：推理是逐句
+    # 独立合成，训练段越接近「一两个自然句」，GPT 学到的停顿/断句分布越
+    # 对齐真实使用（12s 马拉松段学到的跨句韵律在推理时没机会出场）。
+    slice_target_sec: float = 6.0              # 每片目标时长
+    slice_min_sec: float = 2.5                 # 太短的片段不要（<2.5s 声纹统计不稳）
+    # 单条长音频最多切几片。6s 一片时半小时素材约 300 片，上限相应放宽。
+    slice_max_pieces: int = 400
 
     # ---- S2 优化 ----
     enhance: bool = True              # 关掉则只做体检、不改音频
@@ -212,6 +224,13 @@ class OneClickOptions:
 
     # ---- S3 识别 ----
     asr: bool = True                  # 关掉则需要自己补文本（数据集会留 no_text）
+    # 2026-09 A2 转写引擎升级：sensevoice（funasr，中文专名/标点/情绪标签，
+    # 专名同音错字可用 hotwords 拼音后纠）为**新默认**；whisper 保留可选。
+    # funasr 未安装时 stage_asr 自动回退 whisper（不中断流水线）。
+    asr_engine: str = "sensevoice"
+    # 专名表（逗号分隔，如「卡提希娅,弗洛德利斯」）：转写后按拼音比对把
+    # 同音错字（哈提西亚）替换回标准名。留空 = 不纠。
+    hotwords: str = ""
     whisper_size: str = RW.DEFAULT_WHISPER
     # S7 择优打分用的模型。**故意比 ASR 小一档**：打分只在候选之间做相对比较，
     # 而它运行时引擎还驻留在显存里 —— ASR 用 medium（1.6 GB）+ 引擎（4.94 GB）
@@ -309,6 +328,10 @@ class OneClickOptions:
         if self.whisper_size not in RW.WHISPER_SIZES:
             err(f"whisper_size={self.whisper_size} 不在 "
                 f"{list(RW.WHISPER_SIZES)} 里")
+        if self.asr_engine not in ("sensevoice", "whisper"):
+            err(f"asr_engine={self.asr_engine!r} 必须是 sensevoice 或 whisper")
+        if float(self.slice_min_sec) > float(self.slice_target_sec):
+            err("slice_min_sec 不能大于 slice_target_sec")
         if self.score_whisper_size not in RW.WHISPER_SIZES:
             err(f"score_whisper_size={self.score_whisper_size} 不在 "
                 f"{list(RW.WHISPER_SIZES)} 里")
@@ -974,72 +997,145 @@ def stage_asr(dataset: str, opt: OneClickOptions,
         cb(1.0, "没有需要转写的样本，跳过识别")
         return out
 
-    sc = RW.RewardScorer(
-        RW.RewardOptions(whisper_size=str(opt.whisper_size),
-                         language=RW.asr_language(opt.lang)))
-    out["prompt"] = sc.resolve_prompt()
-    out["vram_before_gb"] = sc.vram_free_gb()
+    # ---- 转写：sensevoice（富输出：文本+情绪+事件）或 whisper（回退） ----
+    engine = "sensevoice" if str(opt.asr_engine) == "sensevoice" else "whisper"
+    names = [w.strip() for w in str(opt.hotwords or "").split(",") if w.strip()]
+    # (uid → 富结果)；sensevoice 批量填，whisper 逐条填（text only）
+    rich: Dict[str, Dict[str, Any]] = {}
+    used_engine = engine
+
+    if engine == "sensevoice":
+        try:
+            from webui_app.services import funasr_hub
+            if not funasr_hub.sensevoice_available():
+                raise ImportError("funasr 未安装")
+            B = 16
+            n = max(1, len(todo))
+            for i in range(0, len(todo), B):
+                if should_stop and should_stop():
+                    out["stopped"] = True
+                    break
+                batch = todo[i:i + B]
+                cb(i / n, f"SenseVoice 转写 {i + 1}~{i + len(batch)}/{len(todo)}"
+                          f"（首次会从 ModelScope 下载约 1 GB）")
+                rs = funasr_hub.transcribe_batch(
+                    [u.audio_abs(DS.dir_of(dataset)) for u in batch],
+                    lang=RW.asr_language(opt.lang))
+                for u, r in zip(batch, rs):
+                    rich[u.id] = r
+        except Exception as e:
+            log.warning("sensevoice 不可用，整批回退 whisper：%s: %s",
+                        type(e).__name__, e)
+            out["asr_fallback"] = f"sensevoice→whisper：{type(e).__name__}: {e}"
+            rich.clear()
+            used_engine = "whisper"
+
+    sc = None
+    if used_engine == "whisper":
+        sc = RW.RewardScorer(
+            RW.RewardOptions(whisper_size=str(opt.whisper_size),
+                             language=RW.asr_language(opt.lang)))
+        out["prompt"] = sc.resolve_prompt()
+    out["vram_before_gb"] = (sc.vram_free_gb() if sc else
+                             RW.RewardScorer(RW.RewardOptions()).vram_free_gb())
     touched: Dict[str, Dict[str, Any]] = {}
     n = max(1, len(todo))
     try:
-        cb(0.01, f"加载 whisper-{opt.whisper_size}"
-                 f"（首次会下载，空闲显存 {out['vram_before_gb']} GB）")
+        if used_engine == "whisper":
+            cb(0.01, f"加载 whisper-{opt.whisper_size}"
+                     f"（首次会下载，空闲显存 {out['vram_before_gb']} GB）")
+        model_tag = ("sensevoice" if used_engine == "sensevoice"
+                     else f"whisper-{opt.whisper_size}")
+        fixed_names: List[str] = []
         for i, u in enumerate(todo):
             if should_stop and should_stop():
                 out["stopped"] = True
                 break
-            cb(i / n, f"转写 {i + 1}/{len(todo)} · {u.id}")
-            ap = u.audio_abs(DS.dir_of(dataset))
-            try:
-                txt = str(sc.transcribe(ap) or "").strip()
-            except Exception as e:
-                out["failed"] += 1
-                out.setdefault("errors", []).append(
-                    f"{u.id}: {type(e).__name__}: {e}")
-                continue
+            if used_engine == "sensevoice":
+                r = rich.get(u.id) or {}
+                txt = str(r.get("text") or "").strip()
+                emo = str(r.get("emotion") or "")
+                events = list(r.get("events") or [])
+            else:
+                cb(i / n, f"转写 {i + 1}/{len(todo)} · {u.id}")
+                ap = u.audio_abs(DS.dir_of(dataset))
+                try:
+                    txt = str(sc.transcribe(ap) or "").strip()
+                except Exception as e:
+                    out["failed"] += 1
+                    out.setdefault("errors", []).append(
+                        f"{u.id}: {type(e).__name__}: {e}")
+                    continue
+                emo, events = "", []
             if not txt:
                 out["empty"] += 1
                 touched[u.id] = {"note": (u.note + " | ASR 无输出").strip(" |")}
                 continue
-            # 退化文本（整条一个字的重复、幻听套话…）不能进训练集：它既会教坏
-            # 模型，又会在评测里把合成拖成几分钟。见 degenerate_text_reason
-            # 的说明（实测那条 446 个「哈」）。
+
+            # 专名后纠（拼音等价替换，宁缺毋滥）：哈提西亚 → 卡提希娅
+            if names:
+                txt, fixed = FHUB.apply_glossary(txt, names)
+                for f in fixed:
+                    if f not in fixed_names:
+                        fixed_names.append(f)
+
+            # 退化文本闸门。**例外**：SenseVoice 标到笑声/音乐事件且文本
+            # 短的，按「副语言素材」保留 —— 这正是角色戏感的原料，
+            # 旧逻辑会把「哈哈哈哈」整条丢掉（2026-09 诊断的第 4 因）。
             bad = degenerate_text_reason(txt)
-            if bad:
+            keep_paralang = (bad and events and "laugh" in events
+                             and 2 <= len(RW.normalize_text(txt)) <= 30)
+            if bad and not keep_paralang:
                 out["degenerate"] += 1
                 out.setdefault("degenerate_ids", []).append(u.id)
-                # asr_text 留档便于复核，但 text 留空 → 后续筛选会剔除它
                 touched[u.id] = {
-                    "asr_text": txt, "text": "",
-                    "asr_model": f"whisper-{opt.whisper_size}",
+                    "asr_text": txt, "text": "", "asr_model": model_tag,
+                    "emotion": emo,
                     "note": ((u.note + " | ") if u.note else "")
                             + f"ASR 输出异常：{bad}（已剔除）"}
                 log.info("丢弃退化转写 %s：%s · 原文前 40 字：%r",
                          u.id, bad, txt[:40])
                 continue
-            touched[u.id] = {"text": txt, "asr_text": txt,
-                             "asr_model": f"whisper-{opt.whisper_size}"}
+            fields: Dict[str, Any] = {
+                "text": txt, "asr_text": txt, "asr_model": model_tag,
+                "emotion": emo}
+            if keep_paralang:
+                fields["note"] = ((u.note + " | ") if u.note else "") + \
+                    "副语言素材（SenseVoice 标到笑声，保留）"
+                out.setdefault("paralang_kept", 0)
+                out["paralang_kept"] = out.get("paralang_kept", 0) + 1
+            touched[u.id] = fields
             out["transcribed"] += 1
     finally:
-        # 用完立刻卸载：后面要加载推理引擎（特征是笔大开销），显存必须先腾出来。
-        # medium/large 是 GB 量级，留在卡上会直接导致引擎加载失败或静默降速。
+        # 用完立刻卸载：后面要加载推理引擎（特征是笔大开销），显存必须先
+        # 腾出来。GB 量级的模型留在卡上会导致引擎加载失败或静默降速。
         try:
-            sc.unload()
+            if sc is not None:
+                sc.unload()
+            else:
+                from webui_app.services import funasr_hub
+                funasr_hub.release_all()
         except Exception:
             pass
 
-    out["loaded_after_unload"] = bool(sc.is_loaded())
-    out["vram_after_gb"] = sc.vram_free_gb()
+    out["asr_engine"] = used_engine
+    out["hotword_fixes"] = fixed_names
+    out["loaded_after_unload"] = bool(
+        (sc is not None and sc.is_loaded()) or _funasr_loaded())
+    out["vram_after_gb"] = RW.RewardScorer(RW.RewardOptions()).vram_free_gb()
     out["freed_gb"] = round(float(out["vram_after_gb"])
                             - float(out["vram_before_gb"]), 2)
 
     FT._apply_meta(dataset, touched)
     release = ("已卸载" if not out.get("loaded_after_unload")
                else "⚠️ 卸载后仍有驻留")
+    extra = (f" · 专名纠正 {len(fixed_names)} 个" if fixed_names else "")
+    if out.get("paralang_kept"):
+        extra += f" · 保留笑声素材 {out['paralang_kept']} 条"
     cb(1.0, f"转写 {out['transcribed']} 条"
             f"（无输出 {out['empty']}，失败 {out['failed']}）· "
-            f"whisper-{opt.whisper_size} {release}，"
-            f"释放 {out.get('freed_gb')} GB")
+            f"{used_engine} {release}，"
+            f"释放 {out.get('freed_gb')} GB{extra}")
     return out
 
 
@@ -1139,15 +1235,21 @@ def stage_curate(dataset: str, opt: OneClickOptions, progress=None,
 def preset_ladder(minutes: float) -> List[str]:
     """按数据量排出候选预设顺序。
 
-    依据 `GD.PRESET_NOTES` 的出厂建议：<5 分钟用保守档，≥30 分钟才考虑激进档。
-    第一个通过的候选会被采用，所以顺序即偏好。
+    依据 `GD.PRESET_NOTES` 的出厂建议：<5 分钟用保守档，≥30 分钟才考虑
+    激进档。第一个通过的候选会被采用，所以顺序即偏好。
+
+    2026-09 A4：8 分钟以上优先「表现力档」—— 游戏角色语料的典型量级
+    （15~25 分钟）正是 expressive 的设计区间；数据极多（≥30 分钟）时
+    aggressive 仍排在其后作备选。
     """
     m = float(minutes or 0.0)
     if m < 5.0:
         return ["conservative", "balanced"]
+    if m < 8.0:
+        return ["balanced", "expressive", "conservative"]
     if m < 30.0:
-        return ["balanced", "conservative", "aggressive"]
-    return ["balanced", "aggressive", "conservative"]
+        return ["expressive", "balanced", "aggressive"]
+    return ["expressive", "aggressive", "balanced"]
 
 
 def eval_every_for(total_steps: int, top_k: int) -> int:

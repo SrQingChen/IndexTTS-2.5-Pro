@@ -148,13 +148,15 @@ def main() -> int:
         l_mid = OC.preset_ladder(10.0)
         l_big = OC.preset_ladder(45.0)
         check("数据 <5 分钟首选保守档", l_min[0] == "conservative", str(l_min))
-        check("5~30 分钟首选均衡档", l_mid[0] == "balanced", str(l_mid))
-        check("≥30 分钟首选均衡、次选激进",
-              l_big[:2] == ["balanced", "aggressive"], str(l_big))
+        check("8~30 分钟首选表现力档（A4 新阶梯）", l_mid[0] == "expressive",
+              str(l_mid))
+        check("≥30 分钟首选表现力、次选激进",
+              l_big[:2] == ["expressive", "aggressive"], str(l_big))
         check("所有梯度只含已定义的预设",
               all(x in GD.CONFIG_PRESETS for x in l_min + l_mid + l_big))
         check("边界：恰好 5 分钟走均衡档", OC.preset_ladder(5.0)[0] == "balanced")
-        check("边界：恰好 30 分钟走均衡档", OC.preset_ladder(30.0)[0] == "balanced")
+        check("边界：恰好 30 分钟走表现力档",
+              OC.preset_ladder(30.0)[0] == "expressive")
 
         # =================================================================
         head("[3] 输入收集")
@@ -249,8 +251,13 @@ def main() -> int:
                       max_pieces=4)
         th.join()
         after = DS.get(ds_name, src_uid)
+        # 断言用 startswith 而不是全等：写入者先落笔时，split_long 的收尾
+        # 会**合法地**在 note 后追加「长音频原件」标记 —— 全等断言依赖
+        # 线程时序碰运气（2026-09-28 在负载机上翻车）。被测属性是
+        # 「并发写入的标记存活」，startswith 才是对的判定。
         check("切片期间的并发写入没有被旧快照覆盖（_META_LOCK 生效）",
-              after is not None and after.note == "并发写入的标记",
+              after is not None
+              and (after.note or "").startswith("并发写入的标记"),
               str(after.note if after else None))
 
         # =================================================================
@@ -1059,9 +1066,13 @@ def main() -> int:
         # 「过长」，那条原件的状态是 no_text 而不是 too_long。必须按时长判。
         from webui_app.training import reward as RW2
 
-        check("切片数默认 120（半小时素材约 100 来条，够训 LoRA）",
-              OC.OneClickOptions().slice_max_pieces == 120,
-              str(OC.OneClickOptions().slice_max_pieces))
+        check("切片默认已改韵律切分（6s 目标 / 2.5s 下限 / 400 片上限）",
+              OC.OneClickOptions().slice_target_sec == 6.0
+              and OC.OneClickOptions().slice_min_sec == 2.5
+              and OC.OneClickOptions().slice_max_pieces == 400,
+              str((OC.OneClickOptions().slice_target_sec,
+                   OC.OneClickOptions().slice_min_sec,
+                   OC.OneClickOptions().slice_max_pieces)))
 
         _e_over = [n.message for n in
                    OC.OneClickOptions(slice_over_sec=60.0).validate()
@@ -1136,7 +1147,7 @@ def main() -> int:
         _real_sc = RW2.RewardScorer
         RW2.RewardScorer = _FakeScorer
         try:
-            _st = OC.stage_asr(ds_asr, OC.OneClickOptions(), progress=None)
+            _st = OC.stage_asr(ds_asr, OC.OneClickOptions(asr_engine="whisper"), progress=None)
         finally:
             RW2.RewardScorer = _real_sc
 
@@ -1154,7 +1165,7 @@ def main() -> int:
               int(_st.get("transcribed") or 0) == _n_slices,
               f"transcribed={_st.get('transcribed')}")
         check("已有文本的样本不被覆盖（重复调用不再转写）",
-              OC.stage_asr(ds_asr, OC.OneClickOptions(),
+              OC.stage_asr(ds_asr, OC.OneClickOptions(asr_engine="whisper"),
                            progress=None).get("transcribed") == 0
               or True)
 
@@ -1230,7 +1241,7 @@ def main() -> int:
         _real2 = RW2.RewardScorer
         RW2.RewardScorer = _DegenScorer
         try:
-            _st_dg = OC.stage_asr(ds_dg, OC.OneClickOptions(), progress=None)
+            _st_dg = OC.stage_asr(ds_dg, OC.OneClickOptions(asr_engine="whisper"), progress=None)
         finally:
             RW2.RewardScorer = _real2
 

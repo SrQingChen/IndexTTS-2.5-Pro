@@ -78,6 +78,13 @@ dependencies = [
   # NOTE: run `uv lock` after editing this list (see the note above).
   "peft>=0.14.0",
   "pypinyin>=0.51.0",
+  # `funasr` powers SenseVoice transcription (better ZH proper nouns /
+  # punctuation + per-utterance emotion tags) and emotion2vec emotion
+  # scoring (webui_app/services/funasr_hub.py). Degrades gracefully:
+  # ASR falls back to whisper, reward's emo term is skipped.
+  # NOTE: it upgrades `protobuf` to 7.x — verified coexisting with
+  # modelscope 1.27 / torch 2.8 (2026-09-28).
+  "funasr>=1.4.0",
 ]
 
 [project.optional-dependencies]

@@ -1,0 +1,242 @@
+"""探针：情感参考库 + 句级编排器。
+
+桩引擎（不加载真模型、不需要 GPU）：验证路由、逐句情感 kwargs、
+停顿拼接长度、种子、旁车台本、临时目录清理。
+用法：python tools/orchestrator_probe.py
+"""
+
+from __future__ import annotations
+
+import os
+import sys
+import tempfile
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+import numpy as np  # noqa: E402
+import soundfile as sf  # noqa: E402
+
+from webui_app.services import emotion_bank as EB  # noqa: E402
+from webui_app.services import inference as INF  # noqa: E402
+from webui_app.services import orchestrator as ORC  # noqa: E402
+from webui_app.services.director import DirectorScript, ScriptLine  # noqa: E402
+
+CHECKS = []
+LINE_SEC = 0.5          # 桩引擎每句产 0.5s
+SR = 22050
+
+
+def check(name, cond, detail=""):
+    CHECKS.append((name, bool(cond), detail))
+    print(f"  {'✅' if cond else '❌'} {name}" + (f" — {detail}" if detail else ""))
+
+
+class _Cfg:
+    is_v25 = True
+    output_dir = ""
+    cache_dir = ""
+
+
+class _StubEngine:
+    """记录每次 infer 的 kwargs，产 0.5s 静音 wav。"""
+
+    def __init__(self, cfg):
+        self.cfg = cfg
+        self.calls = []
+
+    def infer(self, progress=None, **kw):
+        self.calls.append(kw)
+        path = kw["output_path"]
+        sf.write(path, np.zeros(int(SR * LINE_SEC), dtype=np.int16), SR,
+                 subtype="PCM_16")
+        return path
+
+
+def _make_wav(path, sec=1.0):
+    sf.write(path, (np.random.RandomState(0).rand(int(SR * sec)) * 2000 - 1000
+                    ).astype(np.int16), SR, subtype="PCM_16")
+
+
+def main() -> int:
+    tmp = tempfile.mkdtemp(prefix="orc_probe_")
+    os.makedirs(os.path.join(tmp, "out"), exist_ok=True)
+    os.makedirs(os.path.join(tmp, "cache"), exist_ok=True)
+
+    # ---- 情感参考库：指到临时目录，别动真库 ----
+    EB.BANK_DIR = os.path.join(tmp, "emotion_bank")
+    EB.INDEX_FILE = os.path.join(EB.BANK_DIR, "index.json")
+    spk = os.path.join(tmp, "spk.wav")
+    _make_wav(spk)
+
+    print("== 1. 情感参考库 ==")
+    e_happy = EB.add("测试者", "happy", _mk(os.path.join(tmp, "happy.wav")))
+    EB.add("测试者", "angry", _mk(os.path.join(tmp, "angry.wav")))
+    EB.add("别人", "happy", _mk(os.path.join(tmp, "other.wav")))
+    check("入库 3 条", len(EB.list_entries()) == 3)
+    check("中文情绪标签可归一化", EB.norm_emotion("怒") == "angry")
+    check("路由精确命中 happy", EB.pick("测试者", "happy").name == e_happy.name)
+    check("未归档情绪回退同角色最高分",
+          EB.pick("测试者", "afraid").character == "测试者")
+    check("平静句不做情绪借用（回 None）", EB.pick("测试者", "calm") is None)
+    check("未归档角色不跨角色借用", EB.pick("第三者", "happy") is None)
+    check("非法情绪词报错", _raises(lambda: EB.add("测试者", "兴奋", spk)))
+
+    print("== 2. 编排器：路由与逐句 kwargs ==")
+    eng = _StubEngine(_Cfg_populate(tmp))
+    req = INF.GenRequest(spk_audio_prompt=spk, text="你好。再见！",
+                         emo_alpha=0.65, seed=123)
+    sc = DirectorScript(lines=[
+        ScriptLine(text="住手！", emotion="angry", intensity=0.9, pause_after_ms=600),
+        ScriptLine(text="哈哈，太好了。", emotion="happy", intensity=0.5,
+                   pause_after_ms=200),
+        ScriptLine(text="走吧。", emotion="calm", intensity=0.3, pause_after_ms=300),
+    ])
+    res = ORC.perform(eng, req, sc, route=True, character="测试者")
+
+    check("产出文件", os.path.isfile(res["path"]))
+    check("调用引擎 3 次", len(eng.calls) == 3)
+    routed = [c for c in eng.calls if c.get("emo_audio_prompt")]
+    check("2 句路由命中（angry/happy），calm 回退", len(routed) == 2
+          and eng.calls[2]["emo_audio_prompt"] is None,
+          str([bool(c.get("emo_audio_prompt")) for c in eng.calls]))
+    # angry: 0.65 × (0.5+0.9) = 0.91；happy: 0.65 × (0.5+0.5) = 0.65
+    check("逐句 alpha = 全局×(0.5+intensity)",
+          abs(eng.calls[0]["emo_alpha"] - 0.91) < 1e-6
+          and abs(eng.calls[1]["emo_alpha"] - 0.65) < 1e-6,
+          f"{[round(c['emo_alpha'], 3) for c in eng.calls[:2]]}")
+    check("外推关闭时 alpha ≤1", all(c["emo_alpha"] <= 1.0 for c in eng.calls))
+    check("逐句文本正确", [c["text"] for c in eng.calls]
+          == ["住手！", "哈哈，太好了。", "走吧。"])
+    check("路由参考来自同角色",
+          all("测试者" in c["emo_audio_prompt"] for c in routed))
+
+    print("== 3. 编排器：拼接长度与台本 ==")
+    expect = 3 * LINE_SEC + (600 + 200) / 1000.0     # 3 句 + 2 个句间停顿
+    dur = sf.info(res["path"]).duration
+    check("总时长 = 句长和 + 台本停顿", abs(dur - expect) < 0.02,
+          f"{dur:.3f}s ≈ {expect:.3f}s")
+    side = res["director"]["sidecar"]
+    check("旁车台本存在", os.path.isfile(side))
+    import json
+    data = json.load(open(side, encoding="utf-8"))
+    check("台本含逐句种子与路由", len(data["lines"]) == 3
+          and data["lines"][0]["seed"] != data["lines"][1]["seed"]
+          and data["routed"] == 2 and data["fallback"] == 1)
+    check("临时句目录已清理",
+          not os.path.exists(os.path.join(eng.cfg.cache_dir, "perform"))
+          or not os.listdir(os.path.join(eng.cfg.cache_dir, "perform")))
+
+    print("== 4. 编排器：外推与失败路径 ==")
+    eng2 = _StubEngine(_Cfg_populate(tmp))
+    res2 = ORC.perform(eng2, req, sc, route=False, extrapolate=True)
+    check("route=False 时不路由", all(
+        c["emo_audio_prompt"] is None for c in eng2.calls))
+    eng3 = _StubEngine(_Cfg_populate(tmp))
+    try:
+        bad = DirectorScript(lines=[ScriptLine(text="", emotion="calm")])
+        ORC.perform(eng3, req, bad)
+        check("空台词句报错", False)
+    except INF.EngineError:
+        check("空台词句报错", True)
+
+    print("== 5. BoN 逐句择优（桩打分器：reward=候选序号） ==")
+    import re as _re
+    from webui_app.training import reward as RW
+
+    class _RankScorer:
+        def __init__(self, opt=None, model_dir=None):
+            self.calls = []
+        def score(self, path, text, ref, emo_ref_path=None):
+            m = _re.search(r"_c(\d+)\.wav$", str(path))
+            k = int(m.group(1)) if m else 0
+            self.calls.append((os.path.basename(path), k))
+            return {"ok": True, "reward": float(k)}
+        def unload(self):
+            pass
+
+    _real = RW.RewardScorer
+    RW.RewardScorer = _RankScorer
+    try:
+        eng4 = _StubEngine(_Cfg_populate(tmp))
+        sc3 = DirectorScript(lines=[
+            ScriptLine(text="第一句。", emotion="calm", intensity=0.3,
+                       pause_after_ms=200),
+            ScriptLine(text="第二句！", emotion="angry", intensity=0.9,
+                       pause_after_ms=300),
+        ])
+        res4 = ORC.perform(eng4, req, sc3, route=False, bon_n=3)
+    finally:
+        RW.RewardScorer = _real
+    check("每句合成 3 个候选", len(eng4.calls) == 6,
+          f"calls={len(eng4.calls)}")
+    import json as _json
+    data4 = _json.load(open(res4["director"]["sidecar"], encoding="utf-8"))
+    bon_rows = [l.get("bon") for l in data4["lines"]]
+    check("台本记录逐句 BoN 得分与中选",
+          all(b and b["n"] == 3 and b["rewards"] == [0, 1, 2]
+              and b["chosen"] == 2 for b in bon_rows),
+          str(bon_rows))
+    check("中选种子 = 候选2 的种子", all(
+        l["seed"] == (data4["base_seed"] + 977 * l["idx"] + 131 * 2) % (2**31)
+        for l in data4["lines"]), str([l["seed"] for l in data4["lines"]]))
+    check("res 摘要带 bon_n", res4["director"].get("bon_n") == 3)
+
+    print("== 6. BoN 保留候选（bon_keep → outputs/bon/） ==")
+    from webui_app.training import reward as RW2
+    real2 = RW.RewardScorer
+    RW.RewardScorer = _RankScorer
+    try:
+        eng5 = _StubEngine(_Cfg_populate(tmp))
+        res5 = ORC.perform(eng5, req, sc3, route=False, bon_n=3, bon_keep=True)
+    finally:
+        RW.RewardScorer = real2
+    data5 = _json.load(open(res5["director"]["sidecar"], encoding="utf-8"))
+    kept = [l["bon"] for l in data5["lines"] if (l.get("bon") or {}).get("best_path")]
+    check("两句都落了 best/worst 文件", len(kept) == 2)
+    check("文件真实存在且在 outputs/bon/ 下",
+          all(os.path.isfile(b["best_path"]) and os.path.isfile(b["worst_path"])
+              and f"{os.sep}bon{os.sep}" in b["best_path"] for b in kept))
+    check("reward 记录成对（best≥worst）",
+          all(b["reward_best"] >= b["reward_worst"] for b in kept),
+          str([(b["reward_best"], b["reward_worst"]) for b in kept]))
+    check("res 摘要 bon_kept=2", res5["director"].get("bon_kept") == 2)
+    # bon_keep=False（默认）时不应产生持久文件（先清掉上一段的产物，
+    # 否则同秒时间戳会让负例检查吃到正例的文件）
+    import shutil as _shutil
+    eng6 = _StubEngine(_Cfg_populate(tmp))
+    _shutil.rmtree(os.path.join(eng6.cfg.output_dir, "bon"),
+                   ignore_errors=True)
+    res6 = ORC.perform(eng6, req, sc3, route=False, bon_n=3)
+    import glob as _glob
+    fresh = [p for p in _glob.glob(os.path.join(eng6.cfg.output_dir, "bon", "**", "*"),
+                                   recursive=True) if p.endswith(".wav")]
+    check("默认不保留候选", not fresh, str(fresh[:2]))
+
+    fails = [n for n, ok, _ in CHECKS if not ok]
+    print(f"\n结果：{len(CHECKS) - len(fails)}/{len(CHECKS)} 通过"
+          + (f" · 失败：{fails}" if fails else " ✅"))
+    return 1 if fails else 0
+
+
+def _mk(p):
+    _make_wav(p)
+    return p
+
+
+def _Cfg_populate(tmp):
+    c = _Cfg()
+    c.output_dir = os.path.join(tmp, "out")
+    c.cache_dir = os.path.join(tmp, "cache")
+    return c
+
+
+def _raises(fn) -> bool:
+    try:
+        fn()
+        return False
+    except Exception:
+        return True
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

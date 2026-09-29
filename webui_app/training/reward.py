@@ -151,6 +151,22 @@ class RewardOptions:
     # 默认值的作用见 LANGUAGE_PROMPTS 的说明（修繁体字）。
     initial_prompt: str = ""
     auto_prompt: bool = True
+    # ---- 2026-09 表现力升级新增（默认关闭/零权重 = 行为与旧版完全一致）----
+    # 转写引擎：whisper（旧）| sensevoice（中文专名/标点/情绪标签更好，
+    # 经 services/funasr_hub，不可用时自动回退 whisper 并记 warning）
+    asr_engine: str = "whisper"
+    # 情绪项权重：emotion2vec 嵌入的 cos(合成音频, 情绪参考音频)。
+    # emo_ref_path 为空时该项跳过（不贡献分母）。
+    emo_weight: float = 0.0
+    # 停顿项权重：合成音频句内静音占比落在 8%~25% 带内得满分，
+    # 0%（一口气赶完）或 >40%（稀碎）线性衰减 —— 只用能量，零模型。
+    pause_weight: float = 0.0
+    # 打分用 whisper 的独立档位（BoN 择优等「边合成边打分」场景用 small
+    # 甚至 base，避免与引擎抢显存；纯离线打分可用 medium）
+    score_whisper_size: str = ""      # 空 = 沿用 whisper_size
+
+    def effective_whisper(self) -> str:
+        return self.score_whisper_size or self.whisper_size
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -164,6 +180,17 @@ class RewardOptions:
 
         if self.whisper_size not in WHISPER_SIZES:
             err(f"whisper_size={self.whisper_size!r} 不在 {tuple(WHISPER_SIZES)}")
+        if self.asr_engine not in ("whisper", "sensevoice"):
+            err(f"asr_engine={self.asr_engine!r} 必须是 whisper 或 sensevoice")
+        if self.score_whisper_size and self.score_whisper_size not in WHISPER_SIZES:
+            err(f"score_whisper_size={self.score_whisper_size!r} 不在 "
+                f"{tuple(WHISPER_SIZES)}")
+        for name in ("emo_weight", "pause_weight"):
+            if float(getattr(self, name)) < 0:
+                err(f"{name} 不能为负")
+        if self.asr_engine == "sensevoice":
+            info("sensevoice 转写：中文专名/标点更准，附带情绪标签；"
+                 "funasr 未安装时自动回退 whisper。")
         p, v = WHISPER_SIZES.get(self.whisper_size, (0, 0))
         if p >= 700:
             warn(f"whisper {self.whisper_size} 实测要 {v:.2f} GB 显存"
@@ -239,12 +266,18 @@ class RewardScorer:
 
         一键三连的识别阶段会在用完后立刻调它 —— 引擎随后要加载，
         显存必须先腾出来（默认 medium 是 1.6 GB，不是可以无视的量）。
+        sensevoice / emotion2vec 走 funasr_hub，同样在这里一起卸。
         """
         import gc
 
         import torch
         self._asr = None
         self._spk = None
+        try:
+            from webui_app.services import funasr_hub
+            funasr_hub.release_all()
+        except Exception:
+            pass
         gc.collect()
         try:
             if torch.cuda.is_available():
@@ -290,29 +323,27 @@ class RewardScorer:
 
             log = LOG.get_logger("reward.whisper")
             cache = os.path.join(self.model_dir, "hf_cache", "whisper")
+            _size = self.opt.effective_whisper()
             # 加载前先清一次显存。看着多余，其实是实测踩出来的：8 GB 卡上推理
             # 引擎常驻 4.94 GB，再叠 whisper medium 1.6 GB 就只剩几百 MB，
             # Windows 把计算挤进共享内存 → **静默降速 20~30 倍**（一条 10 秒
             # 音频的转写卡了 4 分钟以上）。清理只能归还已释放的块，所以调用方
             # 还必须把用不到的模型真的卸掉。
-            info = GD.free_vram(f"加载 whisper-{self.opt.whisper_size} 前", log)
+            info = GD.free_vram(f"加载 whisper-{_size} 前", log)
             t0 = time.perf_counter()
             log.info("加载 whisper-%s（device=%s，空闲显存 %.2f GB）",
-                     self.opt.whisper_size, self.device, info.get("after_gb"))
+                     _size, self.device, info.get("after_gb"))
             try:
                 self._asr = whisper.load_model(
-                    self.opt.whisper_size, device=self.device,
-                    download_root=cache)
+                    _size, device=self.device, download_root=cache)
             except Exception as e:
-                log.error("whisper %s 加载失败", self.opt.whisper_size,
-                          exc_info=True)
+                log.error("whisper %s 加载失败", _size, exc_info=True)
                 raise RuntimeError(
-                    f"whisper {self.opt.whisper_size} 加载失败：{e}\n"
+                    f"whisper {_size} 加载失败：{e}\n"
                     f"缓存目录 {cache}。首次使用需要联网下载"
-                    f"（{WHISPER_SIZES.get(self.opt.whisper_size, (0, 0))[0]:.0f}M 参数）。") from e
+                    f"（{WHISPER_SIZES.get(_size, (0, 0))[0]:.0f}M 参数）。") from e
             log.info("whisper-%s 就绪 · 加载 %.1fs · 之后空闲 %.2f GB",
-                     self.opt.whisper_size, time.perf_counter() - t0,
-                     self.vram_free_gb())
+                     _size, time.perf_counter() - t0, self.vram_free_gb())
         return self._asr
 
     def _campplus(self):
@@ -362,8 +393,21 @@ class RewardScorer:
     # 转写
     # ------------------------------------------------------------------
     def transcribe(self, audio_path: str) -> str:
-        """whisper 转写。温度 0 + 固定 beam：同一条音频两次调用逐字一致 ——
-        DPO 的偏好对不能建立在会抖的转写上。"""
+        """按 asr_engine 转写。whisper：温度 0 + 固定 beam（确定性）；
+        sensevoice：经 funasr_hub（中文/标点/专名更准）。funasr 不可用时
+        回退 whisper 并记 warning —— 回退不改变返回类型，调用方无感。"""
+        if self.opt.asr_engine == "sensevoice":
+            try:
+                from webui_app.services import funasr_hub
+                r = funasr_hub.transcribe(audio_path,
+                                          lang=asr_language(self.opt.language))
+                return r["text"]
+            except Exception as e:
+                from webui_app import logging_setup as LOG
+                LOG.get_logger("reward.asr").warning(
+                    "sensevoice 转写失败，回退 whisper：%s: %s",
+                    type(e).__name__, e)
+                # 落到下面的 whisper 路径
         m = self._whisper()
         lang = asr_language(self.opt.language) if self.opt.language else None
         r = m.transcribe(audio_path, language=lang, temperature=0.0,
@@ -380,13 +424,58 @@ class RewardScorer:
         return default_prompt(self.opt.language)
 
     # ------------------------------------------------------------------
+    # 停顿启发项（零模型，只用能量）
+    # ------------------------------------------------------------------
+    @staticmethod
+    def pause_score(audio_path: str) -> float:
+        """句内静音占比落在 8%~25% 带内得 1 分，向两侧线性衰减到 0。
+
+        为什么是「带」而不是越大越好：0% = 一口气赶完（赶稿感），
+        >40% = 稀碎/半静音（病态）。真人叙述的句内静音占比大致落在这个
+        带里（Campione & Véronis 2002 量级），这里只奖「落在人味区间」。
+        """
+        try:
+            import librosa
+            import numpy as np
+            y, sr = librosa.load(audio_path, sr=None)
+            if len(y) < sr * 0.3:
+                return 0.5                      # 太短测不准，给中性分
+            frame = int(sr * 0.025)
+            n = len(y) // frame
+            if n < 4:
+                return 0.5
+            rms = np.sqrt(np.mean(
+                y[:n * frame].reshape(n, frame) ** 2, axis=1) + 1e-12)
+            thr = max(float(np.percentile(rms, 10)) * 2.0, 1e-4)
+            # 只统计首/尾语音之间的静音（首尾静音已被增强链掐过，
+            # 但打分对象可能是未处理的原始合成）
+            speech = np.where(rms > thr)[0]
+            if len(speech) < 2:
+                return 0.5
+            core = rms[speech[0]:speech[-1] + 1]
+            ratio = float(np.mean(core <= thr))
+            if 0.08 <= ratio <= 0.25:
+                return 1.0
+            if ratio < 0.08:
+                return max(0.0, ratio / 0.08)
+            return max(0.0, 1.0 - (ratio - 0.25) / 0.25)
+        except Exception:
+            return 0.5
+
+    # ------------------------------------------------------------------
     # 组合打分
     # ------------------------------------------------------------------
     def score(self, synth_path: str, text: str, ref_path: str,
-              lang: Optional[str] = None) -> Dict[str, Any]:
+              lang: Optional[str] = None,
+              emo_ref_path: Optional[str] = None) -> Dict[str, Any]:
         """合成音频 → {wer, sim, reward, asr_text, ...}。
 
-        reward = wer_weight·(1-WER) + sim_weight·SS，越大越好。
+        reward = Σ wᵢ·sᵢ / Σ wᵢ，各项：
+            wer  (1-WER)   whisper/sensevoice 回转
+            sim  (SS)      campplus 声纹余弦
+            emo  (EmoSim)  emotion2vec 余弦 —— 仅当 emo_weight>0 且
+                           emo_ref_path 给了（合成 vs 情绪参考的情绪贴合度）
+            pause          句内静音占比带内得分（pause_weight>0 时）
         任何一环失败都返回 ok=False + error，**不抛异常** ——
         DPO 批量打分时一条坏音频不该炸掉整批。
         """
@@ -404,16 +493,41 @@ class RewardScorer:
                     self.opt.language = old
             wer = cer(text, asr_text)
             sim = self.cosine(self.embed(synth_path), self.embed(ref_path))
-            w1 = float(self.opt.wer_weight)
-            w2 = float(self.opt.sim_weight)
-            tot = w1 + w2
-            reward = (w1 * (1.0 - wer) + w2 * sim) / (tot if tot > 0 else 1.0)
+
+            terms: List[Tuple[str, float, float]] = [
+                ("wer", float(self.opt.wer_weight), 1.0 - wer),
+                ("sim", float(self.opt.sim_weight), sim),
+            ]
+            emo = None
+            if float(self.opt.emo_weight) > 0 and emo_ref_path:
+                try:
+                    from webui_app.services import funasr_hub
+                    emo = funasr_hub.emo_cosine(synth_path, emo_ref_path)
+                    terms.append(("emo", float(self.opt.emo_weight), emo))
+                except Exception as e:
+                    # 情绪项是增强项：取不到就跳过（不进分母），不连坐
+                    from webui_app import logging_setup as LOG
+                    LOG.get_logger("reward.emo").warning(
+                        "emotion2vec 打分跳过：%s: %s", type(e).__name__, e)
+            pause = None
+            if float(self.opt.pause_weight) > 0:
+                pause = self.pause_score(synth_path)
+                terms.append(("pause", float(self.opt.pause_weight), pause))
+
+            tot = sum(w for _k, w, _v in terms) or 1.0
+            reward = sum(w * v for _k, w, v in terms) / tot
+            detail = {"whisper": self.opt.whisper_size,
+                      "asr_engine": self.opt.asr_engine,
+                      "lang": asr_language(self.opt.language)}
+            if emo is not None:
+                detail["emo"] = round(emo, 4)
+            if pause is not None:
+                detail["pause"] = round(pause, 4)
             return ScoreResult(
                 ok=True, wer=round(wer, 4), sim=round(sim, 4),
                 reward=round(reward, 4), asr_text=asr_text,
                 seconds=round(time.perf_counter() - t0, 2),
-                detail={"whisper": self.opt.whisper_size,
-                        "lang": asr_language(self.opt.language)}).to_dict()
+                detail=detail).to_dict()
         except Exception as e:
             return ScoreResult(
                 ok=False, error=f"{type(e).__name__}: {e}",

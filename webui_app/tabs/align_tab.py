@@ -14,6 +14,7 @@ from typing import Any, Dict, List
 
 import gradio as gr
 
+from webui_app import logging_setup as LOG
 from webui_app import theme as T
 from webui_app.context import AppContext
 from webui_app.training import dpo as DP
@@ -93,6 +94,26 @@ def render(ctx: AppContext):
                 p_split_btn = gr.Button("✂️ 重新划分")
                 p_split_out = gr.HTML("")
 
+            with gr.Accordion("📥 从导演择优导入（BoN → DPO 桥）", open=False):
+                gr.HTML(T.hint(
+                    "合成页导演模式开着「逐句择优 + 保留最优/最差候选」跑出来的"
+                    "台本（<code>*.script.json</code>），这里可以把每句的"
+                    "优/劣候选直接变成偏好对 —— reward 在合成时已算好，"
+                    "**不需要重新打分**。导入后到「🗂 数据集」页跑特征提取，"
+                    "再到「🎓 训练」页跑 DPO。"))
+                bon_out_tb = gr.Textbox(
+                    value="dpo_pairs", label="目标数据集（不存在会创建）")
+                bon_margin_sl = gr.Slider(
+                    0.0, 0.3, value=0.05, step=0.01, label="最小 margin",
+                    info="优/劣 reward 差小于它的句跳过（与构造器同一逻辑）")
+                with gr.Row():
+                    bon_scan_btn = gr.Button("🔍 扫描 BoN 台本", size="sm")
+                    bon_import_btn = gr.Button("📥 导入为偏好对", size="sm",
+                                               variant="primary")
+                bon_scan_html = gr.HTML("")
+                bon_import_html = gr.HTML("")
+                bon_sidecars = gr.State([])
+
             with gr.Accordion("ℹ️ DPO 怎么用这些对", open=False):
                 gr.Markdown(
                     "1. 构造完成后到 **「训练」** 页：目标选 **DPO**、数据集选"
@@ -160,6 +181,77 @@ def render(ctx: AppContext):
 
     p_split_btn.click(on_split, inputs=[pairs_dd, p_val_ratio, p_seed],
                       outputs=[p_split_out])
+
+    # ---------- BoN 台本 → 偏好对导入 ----------
+
+    def _find_bon_sidecars() -> List[str]:
+        """扫 outputs/ 下带「保留的最优/最差候选」的导演台本。"""
+        import glob
+        import json as _json
+        from webui_app.config import PROJECT_ROOT
+        found = []
+        for p in glob.glob(str(PROJECT_ROOT / "outputs" / "**" / "*.script.json"),
+                           recursive=True):
+            try:
+                with open(p, "r", encoding="utf-8") as f:
+                    data = _json.load(f)
+                for ln in (data.get("lines") or []):
+                    bon = ln.get("bon") or {}
+                    if bon.get("best_path") and bon.get("worst_path"):
+                        found.append(p)
+                        break
+            except Exception:
+                continue
+        return found
+
+    @LOG.ui_guard("align.on_bon_scan")
+    def on_bon_scan():
+        found = _find_bon_sidecars()
+        if not found:
+            return (T.hint("没有找到带保留候选的 BoN 台本 —— 到合成页导演模式"
+                           "开「逐句择优」+「保留最优/最差候选」跑一次。"),
+                    gr.update())
+        lines = sum(1 for p in found
+                    for ln in _read_bon_lines(p)
+                    if (ln.get("bon") or {}).get("best_path"))
+        return (T.tip(f"找到 <b>{len(found)}</b> 个台本 · 可导入约 "
+                      f"<b>{lines}</b> 句的优/劣候选对。填好目标数据集后点"
+                      "「导入为偏好对」。"),
+                gr.update(value=found))
+
+    def _read_bon_lines(path: str):
+        import json as _json
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                return _json.load(f).get("lines") or []
+        except Exception:
+            return []
+
+    @LOG.ui_guard("align.on_bon_import", slow_sec=5.0)
+    def on_bon_import(out_name, sidecars, margin):
+        if not sidecars:
+            return (T.err("先点「扫描 BoN 台本」。"), gr.update())
+        r = DP.import_bon_sidecars((out_name or "").strip(), sidecars,
+                                   min_margin=float(margin))
+        if not r.get("ok"):
+            return (T.err(str(r.get("error"))), gr.update())
+        msg = (f"✅ 导入 {r['pairs']} 对（音频 {r['imported_audio']} 条）→ "
+               f"`{out_name}` · margin 丢弃 {r['skipped_margin']} · "
+               f"缺文件 {r['skipped_missing']}")
+        if r.get("errors"):
+            msg += (f"<br>⚠️ {len(r['errors'])} 条失败："
+                    + "；".join(r["errors"][:3]))
+        msg += ("<br>📌 下一步：到「🗂 数据集」页对该数据集跑<b>特征提取</b>"
+                "（导入的样本还没有特征），然后到「🎓 训练」页选 DPO。")
+        gr.Info(f"BoN 导入完成：{r['pairs']} 对")
+        return T.tip(msg), gr.update(choices=DS.list_datasets(),
+                                     value=(out_name or "").strip())
+
+    bon_scan_btn.click(on_bon_scan, inputs=[],
+                       outputs=[bon_scan_html, bon_sidecars])
+    bon_import_btn.click(on_bon_import,
+                         inputs=[bon_out_tb, bon_sidecars, bon_margin_sl],
+                         outputs=[bon_import_html, pairs_dd])
 
     # ---------- 轮询 ----------
     poll_cache: Dict[str, Any] = {"snap": None}

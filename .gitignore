@@ -43,6 +43,7 @@ desktop.ini
 /training_runs/
 /voice_bank/audio/
 /voice_bank/index.json
+/emotion_bank/
 
 .claude
 .memsearch

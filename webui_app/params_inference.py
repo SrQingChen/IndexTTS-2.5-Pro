@@ -18,6 +18,199 @@ def build(reg, P):
     _memory(reg, P)
     _logging(reg, P)
     _polish(reg, P)
+    _director(reg, P)
+
+
+def _director(reg, P):
+    """导演模式（逐句编排）与情感限幅器实验开关。"""
+    reg(P(
+        key="director_enable", group="director", label="启用导演模式",
+        kind="checkbox", default=False, experimental=True,
+        summary="把整段文本交给「导演层」逐句拆分、标情绪、排停顿，"
+                "再逐句合成拼接（替代官方的一次性整段合成）。",
+        info="开启后：句间停顿来自台本（标点+情绪感知，150~1200ms 浮动），"
+             "不再是固定 interval_silence；配合情感参考库可逐句切换情绪参考。",
+        affects="停顿自然度、情绪起伏、逐句情感路由",
+        detail_md="""
+**解决什么**：官方 infer 把长文本切段后，每两段插入**完全相同**的
+interval_silence（默认 200ms），且整段共用一份情感条件 —— 这是
+「机械感」与「语气平淡」的两大结构性来源（真人句间停顿是三峰分布、
+中位 300~400ms，且随情绪变化：悲伤 +23%、愤怒 −7%）。
+
+**流程**：文本 → 导演层（台本：每句 text/emotion/intensity/pause_after_ms）
+→ 编排器逐句调用引擎（单句=单段，情感参考逐句路由，种子逐句确定）
+→ 按台本停顿拼接。台本会落盘为旁车 `<输出名>.script.json`。
+
+**规则后端**零配置：只切分/标情绪/排停顿，**不改写文本**。
+**API 后端**（OpenAI 兼容）允许 LLM 做表演化改写（省略号/破折号/语气词），
+失败自动回退规则后端，合成不中断。
+""",
+        pitfall_md="""
+逐句合成 = N 次推理，整篇耗时约等于文本句数 × 单句耗时。
+句与句是独立冷启动（这正是官方低显存模式的同款做法），跨句韵律衔接
+依赖台本停顿来弥合；对「一口气念完」的长排比句请关掉导演模式。
+""",
+    ))
+
+    reg(P(
+        key="director_backend", group="director", label="导演后端",
+        kind="dropdown", default="rules", choices=["rules", "api"],
+        summary="rules=内置规则引擎（零配置、确定性）；api=OpenAI 兼容 LLM。",
+        info="api 需在「导演模式」区配置 base_url / api_key / 模型名",
+        affects="台本质量（情绪标注精度、停顿规划、文本表演化改写）",
+        detail_md="""
+**rules**：标点切分 + 情绪词表（怒/喜/哀/惧/厌/低落/惊讶各 ~10 关键词）
++ 标点→停顿基表（。320 / ！400 / ？380 / ……650 ms）× 情绪修饰
+（悲伤×1.3、愤怒×0.85）× ±20% 抖动。同 seed 完全可复现。
+
+**api**：LLM 按配音导演的 system prompt 输出结构化 JSON 台本，
+可做表演化改写（内容不变，标点/语气词/气口变化）。返回经严格校验
+（情绪必须在 8 键内、强度/停顿夹取、句数上限 400），任何失败回退 rules。
+配置存在 `outputs/state/director_config.json`。
+""",
+    ))
+
+    reg(P(
+        key="director_route_emo", group="director", label="逐句路由情感参考",
+        kind="checkbox", default=True, experimental=True,
+        summary="按每句的 emotion 从「情感参考库」取该角色对应情绪的参考音频。",
+        info="未命中的句子回退模式0语义（跟随音色参考自身的情感）",
+        affects="逐句情绪贴合度；音色一致性（参考始终限同角色）",
+        detail_md="""
+路由链（**只在同角色内回退**，跨角色情感参考会把别人的音色气息带进来）：
+精确（角色, 情绪）→ 该角色任意情绪中评分最高 → 回退音色参考（模式0）。
+
+命中时该句的 emo_alpha = 全局情感权重 × (0.5 + intensity)：
+平静句（0.3）约 0.8×全局，爆发句（0.9+）约 1.4×全局，
+外推开关关闭时整体夹回 [0,1]（官方语义）。
+
+情感参考在「🎭 情感参考库」页按 角色×情绪 入库；上游 emo 参考缓存
+按路径字符串命中，逐句轮换只在切换时重提一次 w2v-BERT 特征。
+""",
+    ))
+
+    reg(P(
+        key="director_pause_scale", group="director", label="停顿时长系数",
+        kind="slider", default=1.0, minimum=0.4, maximum=1.6, step=0.05,
+        summary="句间停顿的整体缩放。1.0 = 默认标定（句界约 200~300ms），"
+                "嫌长就往下调，戏要拖就往上调。",
+        info="同时作用于规则与 API 两种后端；±15% 的拟人抖动不受它影响",
+        affects="句间停顿时长（不改句内韵律）",
+        detail_md="""
+默认标定（2026-09-28 按「正常人类断句」校准，整体比初版短约 25%）：
+
+| 句末标点 | 基表 ms | 情绪修饰后典型范围 |
+|---|---|---|
+| 。/； | 240 | 200~290 |
+| ！ | 300 | 250~340 |
+| ？ | 280 | 235~320 |
+| …… | 420 | 350~480（犹豫/哽咽仍最长） |
+| ，/、 | 140/120 | 句内语气停顿 |
+
+公式：`基表 × 情绪修饰(悲伤1.2/愤怒0.9) × ±15%抖动 × 本系数`，
+最终夹在 [80, 2000] ms。系数 0.6 ≈ 语速偏快的对话感；
+1.3+ 适合剧情向长停顿（初版的戏剧化观感在 1.3 左右）。
+""",
+        pitfall_md="""
+调这个之前先确认听感的来源：句与句之间太拖是它；
+**句内**节奏拖沓要调的是 duration_factor 或换情感参考，不是这个。
+""",
+    ))
+
+    reg(P(
+        key="director_bon", group="director", label="逐句择优候选数 N",
+        kind="slider", default=0, minimum=0, maximum=8, step=1,
+        summary="每句合成 N 个候选，用奖励打分自动选最好的一条（0=关闭）。",
+        info="以时间换质量：耗时约 N 倍；打分跑 CPU 不抢显存，适合离线精修",
+        affects="逐句的读对/音色/情绪/停顿综合质量",
+        experimental=True,
+        detail_md="""
+打分器（跑在 **CPU**，与 GPU 推理引擎零显存竞争）：
+`reward = 0.35·(1−WER) + 0.25·声纹相似 + 0.30·情绪贴合 + 0.10·停顿人味`
+
+- WER：SenseVoice 回转（读得对不对）
+- 声纹：campplus 余弦（像不像参考）
+- 情绪：emotion2vec 余弦 vs 该句路由到的情感参考（未路由则该项跳过）
+- 停顿：句内静音占比落在 8%~25% 带内满分（人味区间）
+
+文献背书：arXiv 2608.31035 在二次元风格语音上实测 **best-of-8 ≈ GRPO
+训练收益** —— 这是「不想重训也能提质」的最便宜路径。旁车 script.json
+逐句记录各候选得分与中选者，可复盘。
+""",
+        pitfall_md="""
+N=1 等于关闭（只有一个候选无从择优）。打分含 CPU 转写与情绪模型，
+每句每候选约多花 2~5 秒；N=4×10 句 ≈ 多等几分钟，夜间批量正合适。
+reward 依赖 SenseVoice/emotion2vec（首次从 ModelScope 下载约 2 GB）。
+""",
+    ))
+
+    reg(P(
+        key="director_bon_keep", group="director", label="保留最优/最差候选",
+        kind="checkbox", default=False, experimental=True,
+        summary="BoN 择优时把每句的最优与最差候选落成持久文件"
+                "（outputs/bon/），供「⚖️ 对齐」页一键导入为 DPO 偏好对。",
+        info="择优收益（推理期）→ DPO 蒸馏（进权重）的桥：攒够一批后"
+             "去对齐页导入、提特征、跑 DPO",
+        affects="磁盘占用（每句多存 2 条）；不影响当次合成结果",
+        detail_md="""
+**C1 → C2 的桥**：BoN 打分本来就产出了「同文本的优/劣候选对」——
+落盘后，对齐页的「📥 从导演择优导入」能直接把它们变成偏好对
+（reward 已知，不用重新打分），DPO 训练把推理期择优的收益蒸进权重。
+
+文献逻辑与社区实践一致（InstaVAR / GPT-SoVITS DPO）：自动择优
+「稳定地好」，DPO 把它固化。
+""",
+        pitfall_md="""
+每句多存 2 个 wav（约 1~2 MB），长文本批量跑会积累磁盘 ——
+导入完成或放弃后记得清 outputs/bon/。
+""",
+    ))
+
+    reg(P(
+        key="emo_unlock_vector_cap", group="emotion",
+        label="实验：解除情感向量总和限幅",
+        kind="checkbox", default=False, experimental=True,
+        summary="模式2下不再做「8 维总和 ≤0.8」的等比压缩（偏置系数仍生效）。",
+        info="官方默认把向量总和压到 0.8 以内，情绪强度存在天花板；"
+             "解锁后滑到多强就生效多强。默认关闭=官方语义原样",
+        affects="模式2/3 的情绪强度上限",
+        detail_md="""
+官方 `normalize_emo_vec`（infer_v2_5.py:496-499）在偏置之后做了一道
+**等比压缩**：总和 >0.8 就整体缩到 0.8。这是上游刻意压制「过激情绪」
+的保险丝 —— 对「戏要足」的角色配音它是天花板。
+
+本开关在 webui 层重算（偏置 × 各维原值，跳过压缩），不改上游代码。
+注意模式 3（QwenEmotion 文本）走的是 QwenEmotion 原始输出，本就不过
+这道压缩，不受此开关影响。
+""",
+        pitfall_md="""
+解锁后拉满多维可能出恶声/破音（情绪嵌入超出训练分布），请从 1.2 倍
+总量开始试。出现怪声立即关闭。
+""",
+    ))
+
+    reg(P(
+        key="emo_extrapolate", group="emotion",
+        label="实验：情感权重外推（>1）",
+        kind="checkbox", default=False, experimental=True,
+        summary="模式1下允许 emo_alpha 超过 1.0，向情感参考之外外推放大。",
+        info="上游在情感参考音频路径上本就未截断 alpha（向量路径才截断），"
+             "这是官方留的口子。默认关闭=严格官方语义",
+        affects="模式1 的情绪强度上限（1.0 → 1.5）",
+        detail_md="""
+`merge_emovec` 是线性插值：`out = base + α·(emo − base)`。
+α=1 完全用情感参考的情绪；α>1 是**外推** —— 朝情感参考方向越过它，
+类比 Style-Bert-VITS2 的「风格权重可以 >1（放大）」。
+
+本地核验：infer_v2_5 只在**向量路径** clamp(emo_alpha, 0, 1)（:605），
+情感参考音频路径的 alpha 原样传入 merge_emovec（:616 仅在无参考时
+强制 1.0）—— 所以 >1 在上游是可达的，本开关只负责在 webui 层放行。
+""",
+        pitfall_md="""
+外推是嵌入空间的越界操作，α>1.2 后可能出现气息不稳/破音，逐档试听。
+此为实验功能，出怪声请回 1.0 并关闭开关。
+""",
+    ))
 
 
 # ---------------------------------------------------------------------------
@@ -381,9 +574,10 @@ emovec       = emovec_mat + (1 - sum(weight_vector)) * emovec   # 剩余权重�
 
     reg(P(
         key="emo_alpha", group="emotion", label="情感权重", kind="slider", default=0.65,
-        minimum=0.0, maximum=1.0, step=0.01,
+        minimum=0.0, maximum=1.5, step=0.01,
         summary="情感混合强度。**在不同模式下语义完全不同**。",
-        info="模式0下无效；模式1是插值系数；模式2/3是向量缩放系数",
+        info="模式0下无效；模式1是插值系数（>1 需开「外推」实验开关）；"
+             "模式2/3是向量缩放系数",
         affects="情感强度、音色相似度",
         detail_md="""### 模式 1（情感参考音频）：线性插值系数
 `merge_emovec()` 实现：
