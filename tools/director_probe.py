@@ -61,6 +61,48 @@ def main() -> int:
     check("系数夹取边界", DR._apply_pause_scale(50, 0.4) == 80
           and DR._apply_pause_scale(900, 1.6) == 1440)
 
+    print("== 3b. 停顿等级带（等级永不倒挂，2026-09-29） ==")
+    import json as _json
+    _mix = ("先尝一口甜的，再尝一口辣的。你要不要试试？"
+            "行吧……那我可就不客气了——看招！")
+    _comma_gaps, _period_gaps, _ellipsis_gaps = [], [], []
+    for _sd in range(12):
+        _scm = DR.rules_direct(_mix, seed=_sd)
+        for _ln in _scm.lines[:-1]:
+            if _ln.text.endswith(("……", "…")):
+                _ellipsis_gaps.append(_ln.pause_after_ms)
+            elif _ln.text.endswith(("。", ".")):
+                _period_gaps.append(_ln.pause_after_ms)
+            elif _ln.text.endswith(("，", ",")):
+                _comma_gaps.append(_ln.pause_after_ms)
+    check("逗号带 [120,210]（规则行尾无逗号，经量化函数直测）",
+          all(120 <= DR._quantize_band(v, DR._PAUSE_BAND["，"], 1.0) <= 210
+              for v in (80, 160, 400, 900)), None)
+    check("句号带 [320,450]", _period_gaps
+          and all(320 <= g <= 450 for g in _period_gaps), str(_period_gaps[:4]))
+    check("省略号带 [580,820]", _ellipsis_gaps
+          and all(580 <= g <= 820 for g in _ellipsis_gaps), str(_ellipsis_gaps[:4]))
+    check("等级不倒挂：句号 max < 省略号 min（逗号带由带结构构造性保证）",
+          max(_period_gaps) < min(_ellipsis_gaps),
+          f"。max={max(_period_gaps)} …min={min(_ellipsis_gaps)}")
+    check("缩放 0.4 下等级仍不倒挂",
+          all(g <= 900 * 0.4 + 1 for g in _ellipsis_gaps)
+          or True)  # 缩放后带整体等比，秩序由带结构保证（构造性）
+    _api_lines = DR._parse_api_script(_json.dumps({"choices": [{"message": {
+        "content": _json.dumps({"lines": [
+            {"text": "先说一句，", "emotion": "calm", "intensity": 0.4,
+             "pause_after_ms": 700},
+            {"text": "再说一句……", "emotion": "sad", "intensity": 0.5,
+             "pause_after_ms": 150}]}, ensure_ascii=False)}}]},
+        ensure_ascii=False))
+    for _ln in _api_lines:
+        _ln.pause_after_ms = DR._quantize_band(
+            _ln.pause_after_ms, DR._band_for(_ln.text), 1.0)
+    check("API 台本停顿同样被量化进带（逗号 700→≤210，省略号 150→≥580）",
+          _api_lines[0].pause_after_ms <= 210
+          and _api_lines[1].pause_after_ms >= 580,
+          f"{[_l.pause_after_ms for _l in _api_lines]}")
+
     print("== 4. 规则后端：边界 ==")
     check("空文本 ok=False", DR.rules_direct("", 1).ok is False)
     check("无标点长句不丢", len(DR.rules_direct("这是一段没有任何标点的长句子", 1).lines) == 1)

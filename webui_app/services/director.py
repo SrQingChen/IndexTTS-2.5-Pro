@@ -171,6 +171,49 @@ def _apply_pause_scale(ms: int, scale: float) -> int:
     s = max(0.1, min(3.0, float(scale or 1.0)))
     return int(max(80, min(2000, round(ms * s))))
 
+
+# ---------------------------------------------------------------------------
+# 停顿等级带（2026-09-29 用户反馈：逗号停顿比省略号还长——等级倒挂）
+# ---------------------------------------------------------------------------
+# 修复方式：每类标点有一个**互不重叠或按等级递增的取值带**，情绪修饰与
+# 抖动只能在带内移动，越界即夹回。硬保证：
+#     逗号上限 210 < 句号下限 320 < 句号上限 450 < 省略号下限 580
+# 感叹/问号是句末标点，与句号同级相邻（260~380），允许与句号部分重叠。
+# 带宽随 pause_scale 等比缩放 → 任何系数下等级顺序都不变。
+_PAUSE_BAND: Dict[str, tuple] = {
+    "、": (100, 170),
+    "，": (120, 210),
+    "；": (200, 300),
+    "：": (200, 300),
+    "？": (250, 370),
+    "！": (260, 380),
+    "。": (320, 450),
+    "——": (480, 640),
+    "……": (580, 820),
+}
+# 匹配顺序：长标点优先（…… 必须先于 … 检查）
+_BAND_ORDER = [("……",), ("——",), ("…",), ("—",), ("！",), ("？",),
+               ("。", "."), ("；", ";"), ("：", ":"), ("，", ","), ("、",)]
+
+
+def _band_for(line_ending: str) -> tuple:
+    """按句尾标点取停顿等级带 (lo, hi) ms @ scale=1.0。"""
+    for marks in _BAND_ORDER:
+        if any(line_ending.endswith(m) for m in marks):
+            for m in marks:
+                if line_ending.endswith(m) and m in _PAUSE_BAND:
+                    return _PAUSE_BAND[m]
+    return _PAUSE_BAND["。"]
+
+
+def _quantize_band(ms: float, band: tuple, scale: float) -> int:
+    """把原始停顿值夹进等级带（带随 pause_scale 等比缩放）。"""
+    s = max(0.1, min(3.0, float(scale or 1.0)))
+    lo = max(80, band[0] * s)
+    hi = min(2000, band[1] * s)
+    return int(max(lo, min(hi, ms)))
+
+
 _SENT_SPLIT_RE = re.compile(r'([^。！？!?…；;\n]*[。！？!?…]+|[^。！？!?…；;\n]*[；;\n]+|[^。！？!?…；;\n]+)')
 
 
@@ -215,7 +258,8 @@ def _guess_emotion(line: str) -> tuple:
 
 def _pause_for(line: str, emotion: str, rng: random.Random,
                scale: float = 1.0) -> int:
-    """句后停顿 = 标点基表 × 情绪修饰 × ±15% 抖动 × 停顿系数。"""
+    """句后停顿 = 标点基表 × 情绪修饰 × ±15% 抖动，再夹进该标点的
+    **等级带**（×停顿系数）——带间互不越界，等级永不倒挂。"""
     base = 240
     for marks, val in _PAUSE_BASE:
         if any(line.endswith(m) or m in line[-3:] for m in marks):
@@ -223,9 +267,8 @@ def _pause_for(line: str, emotion: str, rng: random.Random,
             break
     mod = _PAUSE_EMO_MOD.get(emotion, 1.0)
     jitter = rng.uniform(*_JITTER)
-    ms = int(base * mod * jitter)
-    ms = max(100, min(900, ms))
-    return _apply_pause_scale(ms, scale)
+    ms = base * mod * jitter
+    return _quantize_band(ms, _band_for(line), scale)
 
 
 def rules_direct(text: str, seed: int = 0, pause_scale: float = 1.0) -> DirectorScript:
@@ -351,9 +394,11 @@ def api_direct(text: str, character: str = "",
     raw = _api_call(cfg, text, character)
     dt = time.perf_counter() - t0
     lines = _parse_api_script(raw)
-    # 停顿系数同样作用于 API 台本（规则/API 一个旋钮管两边）
+    # LLM 给的停顿值同样夹进等级带（按每行句尾标点）——LLM 的标点
+    # 等级感不可靠（实测会把逗号排得比省略号长），量化兜底。
     for ln in lines:
-        ln.pause_after_ms = _apply_pause_scale(ln.pause_after_ms, pause_scale)
+        ln.pause_after_ms = _quantize_band(
+            ln.pause_after_ms, _band_for(ln.text), pause_scale)
     log.info("API 导演完成：%d 句 · %.1fs · model=%s · pause_scale=%.2f",
              len(lines), dt, cfg.get("model"), pause_scale)
     return DirectorScript(lines=lines, backend="api", ok=True, raw=raw[:4000])
