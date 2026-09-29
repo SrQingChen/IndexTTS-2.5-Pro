@@ -24,6 +24,7 @@
 from __future__ import annotations
 
 import json
+import re
 import os
 import shutil
 import threading
@@ -301,6 +302,69 @@ def apply_fields(name: str, touched: Dict[str, Dict[str, Any]]) -> int:
         if n:
             save_meta(name, items)
     return n
+
+
+# ---------------------------------------------------------------------------
+# 文本标点清洗（2026-09-29 · 碎裂停顿的根治件之一）
+# ---------------------------------------------------------------------------
+
+# 重复标点折叠 + 连缀修复 + 收束补全。动机（真机实测）：SenseVoice 的
+# ct-punc 对角色台词输出 99% 含「。。」「，，」「。，」类污染，而标点是
+# 模型学习「何时停」的监督信号 —— 双标点直接训出「每隔几个字停一下」的
+# 碎裂模型；切片文本以逗号结尾则让模型永远学不到「完整收束」。
+_PUNCT_RUN = re.compile(r"([，。！？；、,.!?;:：])\1+")
+# 跨类连缀：句号后接逗号等「先终止又续半句」的组合，取终止性最强的那个
+_PUNCT_MIX = re.compile(r"\s*([。．.！!?？；;]+)[，,、]\s*")
+_TERMINAL = "。！？?!…"
+
+
+def sanitize_text_punct(text: str) -> str:
+    """清洗一条训练/转写文本的标点。纯函数，探针直接测。
+
+    规则（宁少勿滥，只处理可判定的污染）：
+        1. 同字符标点连缀折叠：  ！！！→！  ？？→？  。。→。  ，，→，
+        2. 「先终止又续半句」取终止符：吧。，→吧。  好吗？，→好吗？
+        3. 去掉句首标点（切片起点落在标点上的伪迹）与首尾空白；
+        4. **收束补全**：结尾是逗号/顿号 → 换成句号；完全无标点 → 补句号。
+           每条训练文本都必须以终止性标点收尾 —— 这是模型学会
+           「句末延长+收束」的前提（延长与收束是随句末终止符一起出现的）。
+        5. 保留合法组合（？！……——）不动。
+    """
+    t = (text or "").strip()
+    if not t:
+        return ""
+    t = _PUNCT_RUN.sub(r"\1", t)
+    t = _PUNCT_MIX.sub(r"\1", t)
+    t = re.sub(r"^[\s，。！？；、,.!?;:：]+", "", t)   # 句首标点伪迹
+    t = t.strip()
+    if not t:
+        return ""
+    if t[-1] in "，,、；;：:":
+        t = t[:-1] + "。"
+    elif t[-1] not in _TERMINAL:
+        t += "。"
+    return t
+
+
+def sanitize_texts(name: str) -> Dict[str, Any]:
+    """对整个数据集的 text 字段跑标点清洗（修文）。
+
+    只改 text；asr_text 保留原始转写供复核。返回改动统计。
+    """
+    changed, samples = 0, []
+    with _META_LOCK:
+        items = load_meta(name)
+        for u in items:
+            old = u.text or ""
+            new = sanitize_text_punct(old)
+            if new and new != old:
+                u.text = new
+                changed += 1
+                if len(samples) < 3:
+                    samples.append(f"{old[:24]} → {new[:24]}")
+        if changed:
+            save_meta(name, items)
+    return {"total": len(items), "changed": changed, "samples": samples}
 
 
 def remove_utterances(name: str, uids: Sequence[str]) -> int:

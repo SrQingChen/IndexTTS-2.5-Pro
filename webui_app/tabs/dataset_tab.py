@@ -17,6 +17,7 @@ from typing import Any, Dict, List, Optional
 import gradio as gr
 
 from webui_app import fsutil
+from webui_app import logging_setup as LOG
 from webui_app import theme as T
 from webui_app.context import AppContext
 from webui_app.services.engine import EngineError
@@ -76,6 +77,18 @@ def render(ctx: AppContext):
                                      placeholder='{"id": "u001", "text": "今天天气不错"}')
                 text_btn = gr.Button("写入文本")
                 text_out = gr.HTML("")
+                with gr.Accordion("🧹 修文标点（碎裂停顿根治件）", open=False):
+                    gr.HTML(T.hint(
+                        "对整个数据集的文本跑标点清洗：折叠 ct-punc/whisper 的"
+                        "重复标点（<code>。。</code>→<code>。</code>、"
+                        "<code>。，</code>→<code>。</code>）、句首标点伪迹，"
+                        "并把逗号/无标点结尾<b>补全为句号收束</b>。标点是模型"
+                        "学习「何时停」的监督信号——训练文本满是双标点会直接"
+                        "训出「每隔几个字停一下」的碎裂模型。只改 text，"
+                        "原始转写保留在 asr_text 供复核。"))
+                    fixpunct_btn = gr.Button("🧹 全数据集修文标点", variant="primary",
+                                             size="sm")
+                    fixpunct_out = gr.HTML("")
 
         # ============================== 右：状态与提取 ==============================
         with gr.Column(scale=1, min_width=380):
@@ -194,6 +207,27 @@ def render(ctx: AppContext):
         return out
 
     text_btn.click(on_text, inputs=[ds_dd, text_ta], outputs=[text_out])
+
+    @LOG.ui_guard("dataset.on_fix_punct")
+    def on_fix_punct(name):
+        err = _need_ds(name)
+        if err:
+            return err
+        try:
+            r = DS.sanitize_texts(name)
+        except Exception as e:
+            return T.err(f"修文失败：{type(e).__name__}: {e}")
+        if not r["changed"]:
+            return T.tip(f"✅ {r['total']} 条文本全部干净，无需修改。")
+        out = T.tip(f"🧹 已清洗 {r['changed']}/{r['total']} 条文本。示例：<br>"
+                    + "<br>".join(f"<code>{s}</code>" for s in r["samples"]))
+        if any(u.has_features for u in DS.load_meta(name)):
+            out += T.warn("该数据集已有特征缓存——文本变了，特征里的 text_tokens"
+                          "是旧的。请到「特征提取」勾选<b>覆盖已有特征</b>重提，"
+                          "否则训练用的还是旧标点。")
+        return out
+
+    fixpunct_btn.click(on_fix_punct, inputs=[ds_dd], outputs=[fixpunct_out])
 
     def on_stats(name):
         err = _need_ds(name)

@@ -172,7 +172,13 @@ def _sv_model(disable_punc: bool = False):
 
 
 def _parse_rich(raw: str) -> Dict[str, Any]:
-    """剥离 <|...|> 标签：文本 / 语言 / 情绪 / 事件 各归各。"""
+    """剥离 <|...|> 标签：文本 / 语言 / 情绪 / 事件 各归各。
+
+    2026-09-29 关键修复：ct-punc 会输出**重复/连缀标点**（「。。」「，，」
+    「。，」——真机实测 99% 的转写含此类污染）。标点是模型学习「何时停」
+    的监督信号，双标点直接教出「每隔几个字停一下」的碎裂模型 —— 在解析
+    层就地清洗，绝不放行。
+    """
     text = raw or ""
     events = sorted(set(m.group(1) for m in _SV_EVENT_RE.finditer(text)))
     text = _SV_EVENT_RE.sub("", text)
@@ -183,8 +189,18 @@ def _parse_rich(raw: str) -> Dict[str, Any]:
             text = text.replace(f"<|{tag}|>", "")
             break
     text = re.sub(r"<\|[^|]*\|>", "", text)     # 其余 <|zh|> 之类
-    text = re.sub(r"\s+", " ", text).strip()
+    text = sanitize_punct(re.sub(r"\s+", " ", text))
     return {"text": text, "emotion": emo, "events": events}
+
+
+# 与数据集侧同一套规则（webui_app/training/dataset.py:sanitize_text_punct
+# 是权威实现）；这里延迟导入避免环，失败则退化为本地最小清洗。
+def sanitize_punct(text: str) -> str:
+    try:
+        from webui_app.training.dataset import sanitize_text_punct
+        return sanitize_text_punct(text)
+    except Exception:
+        return re.sub(r"(?<=([，。！？；、,.!?;]))\1+", "", text or "")
 
 
 def transcribe_batch(paths: List[str], lang: str = "zh",

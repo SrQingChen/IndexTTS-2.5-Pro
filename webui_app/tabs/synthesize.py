@@ -963,8 +963,9 @@ def render(ctx: AppContext):
         if res.get("director"):
             d = res["director"]
             rows.append(("导演编排",
-                         f'{d["n"]} 句 · `{d["backend"]}` 后端 · '
-                         f'句均停顿 {d["avg_pause_ms"]:.0f} ms'))
+                         f'{d.get("lines_in", d["n"])} 行 → {d["n"]} 块 · '
+                         f'`{d["backend"]}` 后端 · 块间均停顿 '
+                         f'{d["avg_pause_ms"]:.0f} ms（块内零人工静音）'))
             if d.get("bon_n"):
                 rows.append(("逐句择优",
                              f'每句 {d["bon_n"]} 候选 · reward 重排'

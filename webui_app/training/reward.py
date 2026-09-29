@@ -428,11 +428,12 @@ class RewardScorer:
     # ------------------------------------------------------------------
     @staticmethod
     def pause_score(audio_path: str) -> float:
-        """句内静音占比落在 8%~25% 带内得 1 分，向两侧线性衰减到 0。
+        """句内静音占比落在 5%~20% 带内得 1 分，向两侧线性衰减到 0。
 
-        为什么是「带」而不是越大越好：0% = 一口气赶完（赶稿感），
-        >40% = 稀碎/半静音（病态）。真人叙述的句内静音占比大致落在这个
-        带里（Campione & Véronis 2002 量级），这里只奖「落在人味区间」。
+        2026-09-29 校准（碎裂停顿事故复盘）：旧带区 8~25% 偏向奖励停顿，
+        而真人语流的句内静音是**稀缺品**（<200ms 的微停为主，Goldman-Eisler
+        1968 的 200~250ms 计划性停顿阈值基本都落在句界）。0% = 一口气赶完，
+        >30% = 稀碎/半静音。
         """
         try:
             import librosa
@@ -454,11 +455,11 @@ class RewardScorer:
                 return 0.5
             core = rms[speech[0]:speech[-1] + 1]
             ratio = float(np.mean(core <= thr))
-            if 0.08 <= ratio <= 0.25:
+            if 0.05 <= ratio <= 0.20:
                 return 1.0
-            if ratio < 0.08:
-                return max(0.0, ratio / 0.08)
-            return max(0.0, 1.0 - (ratio - 0.25) / 0.25)
+            if ratio < 0.05:
+                return max(0.0, ratio / 0.05)
+            return max(0.0, 1.0 - (ratio - 0.20) / 0.20)
         except Exception:
             return 0.5
 

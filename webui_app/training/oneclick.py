@@ -207,13 +207,15 @@ class OneClickOptions:
 
     # ---- S1 切片（只对超过 slice_over_sec 的长音频生效）----
     slice_over_sec: float = DS.MAX_TRAIN_SEC   # 20s：超过就不算「可直接训练」
-    # 2026-09 A3 韵律切分：目标从 12s 长段降到 6s 短句。理由：推理是逐句
-    # 独立合成，训练段越接近「一两个自然句」，GPT 学到的停顿/断句分布越
-    # 对齐真实使用（12s 马拉松段学到的跨句韵律在推理时没机会出场）。
-    slice_target_sec: float = 6.0              # 每片目标时长
-    slice_min_sec: float = 2.5                 # 太短的片段不要（<2.5s 声纹统计不稳）
-    # 单条长音频最多切几片。6s 一片时半小时素材约 300 片，上限相应放宽。
-    slice_max_pieces: int = 400
+    # 2026-09-29 节奏修正：6s 短句切片被实测证伪 —— 官方预训练用「单说话人
+    # 段合并至最长 25s 的多句段」，短切片给 AR 模型灌进「说一小段就停」的
+    # 先验（用户重训集 206 条全部 5.8~6.0s，生成四五个字一停）。改为
+    # 12~20s 多句呼吸群：每片含多个完整句、片内自然停顿全保留，模型才能
+    # 学到目标音色自己的「延长与收束」。
+    slice_target_sec: float = 15.0             # 每片目标时长（多句呼吸群）
+    slice_min_sec: float = 5.0                 # 太短的片段不要（保底）
+    # 单条长音频最多切几片。15s 一片时半小时素材约 120 片。
+    slice_max_pieces: int = 240
 
     # ---- S2 优化 ----
     enhance: bool = True              # 关掉则只做体检、不改音频
@@ -1078,6 +1080,15 @@ def stage_asr(dataset: str, opt: OneClickOptions,
                 for f in fixed:
                     if f not in fixed_names:
                         fixed_names.append(f)
+
+            # 标点清洗（2026-09-29 碎裂停顿根治件）：ct-punc/whisper 的
+            # 重复标点（。。，，）与逗号结尾是「每隔几字停一下」的训练
+            # 源头 —— 在写回 meta 前就地清洗，含收束补全。
+            txt = DS.sanitize_text_punct(txt)
+            if not txt:
+                out["empty"] += 1
+                touched[u.id] = {"note": (u.note + " | 清洗后无有效文本").strip(" |")}
+                continue
 
             # 退化文本闸门。**例外**：SenseVoice 标到笑声/音乐事件且文本
             # 短的，按「副语言素材」保留 —— 这正是角色戏感的原料，

@@ -1066,10 +1066,10 @@ def main() -> int:
         # 「过长」，那条原件的状态是 no_text 而不是 too_long。必须按时长判。
         from webui_app.training import reward as RW2
 
-        check("切片默认已改韵律切分（6s 目标 / 2.5s 下限 / 400 片上限）",
-              OC.OneClickOptions().slice_target_sec == 6.0
-              and OC.OneClickOptions().slice_min_sec == 2.5
-              and OC.OneClickOptions().slice_max_pieces == 400,
+        check("切片默认已改多句呼吸群（15s 目标 / 5s 下限 / 240 片上限）",
+              OC.OneClickOptions().slice_target_sec == 15.0
+              and OC.OneClickOptions().slice_min_sec == 5.0
+              and OC.OneClickOptions().slice_max_pieces == 240,
               str((OC.OneClickOptions().slice_target_sec,
                    OC.OneClickOptions().slice_min_sec,
                    OC.OneClickOptions().slice_max_pieces)))
@@ -1173,6 +1173,44 @@ def main() -> int:
             DS.delete(ds_asr)
 
         # =================================================================
+        head("[15b] 标点清洗器（碎裂停顿根治，2026-09-29）")
+        # 真机事故：ct-punc 输出 99% 含重复标点（。。，，），训练文本
+        # 满是双标点 = 教模型每隔几个字停一下；逗号结尾 = 永远学不到收束。
+        cases = [
+            ("消散吧，，因为这样，凝氏的意识将被永远困死。。",
+             "消散吧，因为这样，凝氏的意识将被永远困死。"),
+            ("将他的意识带到这里吧。，让我们重新合一。。",
+             "将他的意识带到这里吧。让我们重新合一。"),
+            ("哈哈，太好了，，再见，走吧。。", "哈哈，太好了，再见，走吧。"),
+            ("她停下了脚步", "她停下了脚步。"),               # 无标点 → 补收束
+            ("你说，", "你说。"),                            # 逗号结尾 → 句号收束
+            ("什么？！", "什么？！"),                          # 合法组合保留
+            ("……走吧。……", "……走吧。……"),                    # 省略号保留
+        ]
+        for _raw, _want in cases:
+            check(f"清洗 {_raw[:14]!r}", DS.sanitize_text_punct(_raw) == _want,
+                  DS.sanitize_text_punct(_raw))
+        check("空文本清洗后仍为空", DS.sanitize_text_punct("") == "")
+        # 修文入口：整个数据集
+        _ds_fp = "probe_fixpunct"
+        if DS.exists(_ds_fp):
+            DS.delete(_ds_fp)
+        DS.create(_ds_fp, note="fixpunct probe")
+        DS.import_audio(_ds_fp, [make_wav(os.path.join(tmp, f"fp{i}.wav"),
+                                          4.0, seed=300 + i)
+                                 for i in range(3)], copy=True, lang="ZH")
+        _uids_fp = [u.id for u in DS.load_meta(_ds_fp)]
+        DS.update(_ds_fp, _uids_fp[0], text="消散吧，，因为这样。。")
+        DS.update(_ds_fp, _uids_fp[1], text="将他的意识带到这里吧，")
+        DS.update(_ds_fp, _uids_fp[2], text="干净文本不动。")
+        _fp = DS.sanitize_texts(_ds_fp)
+        check("修文只改被污染的行", _fp["changed"] == 2, str(_fp))
+        check("修文结果落盘",
+              DS.get(_ds_fp, _uids_fp[0]).text == "消散吧，因为这样。"
+              and DS.get(_ds_fp, _uids_fp[1]).text == "将他的意识带到这里吧。"
+              and DS.get(_ds_fp, _uids_fp[2]).text == "干净文本不动。")
+        DS.delete(_ds_fp)
+
         head("[16] 退化文本过滤 + 择优优先选短样本")
         # =================================================================
         # 来源是一起真实事故：一条 11.4 秒的音频被 whisper 转成 **446 个「哈」**。

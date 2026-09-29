@@ -212,6 +212,49 @@ def main() -> int:
                                    recursive=True) if p.endswith(".wav")]
     check("默认不保留候选", not fresh, str(fresh[:2]))
 
+    print("== 7. 表演块合并（v2 核心） ==")
+    eng7 = _StubEngine(_Cfg_populate(tmp))
+    sc7 = DirectorScript(lines=[
+        ScriptLine(text="我们曾经约定过。", emotion="sad", intensity=0.6,
+                   pause_after_ms=300),
+        ScriptLine(text="要一起看到最后的结局。", emotion="sad", intensity=0.6,
+                   pause_after_ms=300),
+        ScriptLine(text="所以,不许你死在这里。", emotion="sad", intensity=0.7,
+                   pause_after_ms=400),
+        ScriptLine(text="听到了吗?!", emotion="sad", intensity=0.8,
+                   pause_after_ms=600),
+    ])
+    res7 = ORC.perform(eng7, req, sc7, route=False)
+    check("同情绪 4 行合并为 1 块（1 次引擎调用）",
+          len(eng7.calls) == 1, f"calls={len(eng7.calls)}")
+    check("块文本按序拼接", "我们曾经约定过。" in eng7.calls[0]["text"]
+          and "听到了吗?!" in eng7.calls[0]["text"])
+    check("块内零人工静音（interval_silence 被压到 ≤120ms）",
+          eng7.calls[0]["interval_silence"] <= 120,
+          str(eng7.calls[0]["interval_silence"]))
+    data7 = _json.load(open(res7["director"]["sidecar"], encoding="utf-8"))
+    check("台本记录行→块（4 行 1 块）",
+          data7.get("lines_in") == 4 and data7.get("blocks") == 1
+          and len(data7["lines"][0]["lines"]) == 4)
+    check("块后停顿取块末行", data7["lines"][0]["pause_after_ms"] == 600)
+    check("摘要 lines_in/blocks", res7["director"].get("lines_in") == 4
+          and res7["director"]["n"] == 1)
+
+    # 情绪突变断块 + 块间停顿仍然生效
+    eng8 = _StubEngine(_Cfg_populate(tmp))
+    sc8 = DirectorScript(lines=[
+        ScriptLine(text="平静地说。", emotion="calm", intensity=0.3,
+                   pause_after_ms=250),
+        ScriptLine(text="突然爆发！", emotion="angry", intensity=0.9,
+                   pause_after_ms=280),
+    ])
+    res8 = ORC.perform(eng8, req, sc8, route=False)
+    check("情绪突变断成 2 块", len(eng8.calls) == 2)
+    d8 = sf.info(res8["path"]).duration
+    expect8 = 2 * LINE_SEC + 250 / 1000.0     # 块间停顿取第 1 块末行
+    check("块间停顿按等级插入", abs(d8 - expect8) < 0.02,
+          f"{d8:.3f}s ≈ {expect8:.3f}s")
+
     fails = [n for n, ok, _ in CHECKS if not ok]
     print(f"\n结果：{len(CHECKS) - len(fails)}/{len(CHECKS)} 通过"
           + (f" · 失败：{fails}" if fails else " ✅"))

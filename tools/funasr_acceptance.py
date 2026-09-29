@@ -28,14 +28,16 @@ def check(name, cond, detail=""):
 
 
 def main() -> int:
+    import json as _json
+
     from webui_app.config import PROJECT_ROOT
     from webui_app.services import funasr_hub as FH
     from webui_app.services import voice_bank as VB
     from webui_app.training import reward as RW
 
-    # 验收音频：优先用今天导演模式真机验收的产物（文本已知）
-    TEXT = "住手！你这家伙，到底做了什么？！哈哈，太好了。再见……走吧。"
-    synth = None
+    # 验收音频：最新的带台本合成产物；**文本自描述**——从旁车台本读回
+    # （用户可能清过 outputs 或用任意文本生成，写死文本会误报）
+    synth, TEXT = None, ""
     out_dir = os.path.join(PROJECT_ROOT, "outputs")
     cands = sorted(
         (f for f in os.listdir(out_dir)
@@ -45,11 +47,18 @@ def main() -> int:
         reverse=True)
     if cands:
         synth = os.path.join(out_dir, cands[0])
-    check("找到带台本的合成产物作验收音频", synth is not None,
-          os.path.basename(synth) if synth else "outputs/ 无 spk_*.script.json")
+        try:
+            with open(synth.replace(".wav", ".script.json"),
+                      "r", encoding="utf-8") as f:
+                _sc = _json.load(f)
+            TEXT = "".join((ln.get("text") or "") for ln in _sc.get("lines") or [])
+        except Exception:
+            TEXT = ""
+    check("找到带台本的合成产物作验收音频", synth is not None and TEXT,
+          f"{os.path.basename(synth) if synth else '无'} · 文本 {len(TEXT)} 字")
     ref_entry = VB.get("wujiu") or next(iter(VB.list_voices()), None)
     ref = ref_entry.audio_path if ref_entry else synth
-    if synth is None:
+    if synth is None or not TEXT:
         return finish()
 
     print("== 1. SenseVoice 转写（含首次下载） ==")

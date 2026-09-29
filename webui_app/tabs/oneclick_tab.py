@@ -252,16 +252,17 @@ def render(ctx: AppContext):
                         info=f"默认 {DS.MAX_TRAIN_SEC:g}s = 训练可接受的最长样本，"
                              "更长的样本体检直接判 too_long、永远不参与训练")
                     slice_target_sl = gr.Slider(
-                        2.0, 20.0, value=6.0, step=0.5, label="每片目标时长（秒）",
-                        info="默认 6 秒（2026-09 韵律切分）：推理是逐句独立"
-                             "合成，训练片段越接近一两个自然句，学到的断句/"
-                             "停顿分布越对齐真实使用")
+                        2.0, 20.0, value=15.0, step=0.5, label="每片目标时长（秒）",
+                        info="默认 15 秒多句呼吸群（2026-09-29 节奏修正）："
+                             "官方预训练就是多句 ≤25s 的段——每片含多个完整句、"
+                             "保留片内停顿，模型才学得到「延长与收束」；"
+                             "短切片会训出「说几句就停」的碎裂先验")
                     slice_min_sl = gr.Slider(
-                        1.0, 10.0, value=2.5, step=0.5, label="最短片段（秒）",
-                        info="短于它的片段直接丢掉（声纹统计不稳）")
+                        1.0, 10.0, value=5.0, step=0.5, label="最短片段（秒）",
+                        info="短于它的片段直接丢掉（不足以覆盖完整句的收束）")
                     slice_pieces_nb = gr.Number(
-                        400, label="单条长音频最多切几片", precision=0,
-                        info="默认 400：6 秒一片时半小时素材约 300 片。"
+                        240, label="单条长音频最多切几片", precision=0,
+                        info="默认 240：15 秒一片时半小时素材约 120 片。"
                              "设太小会白白浪费素材")
 
                 with gr.Column(elem_classes=["ix-section"]):
