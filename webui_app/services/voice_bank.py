@@ -136,10 +136,24 @@ def add(
         raise ValueError("音色名称不能为空")
 
     ext = os.path.splitext(audio_path)[1].lower() or ".wav"
-    rel = os.path.join(AUDIO_SUBDIR, key + ext).replace("\\", "/")
-    dst = os.path.join(BANK_DIR, rel)
-    if os.path.abspath(dst) != os.path.abspath(audio_path):
-        shutil.copy2(audio_path, dst)
+    # 入库即 wav（2026-09-29）：引擎读参考走 torchaudio，mp3 支持因
+    # libsndfile 版本而异 —— 非 wav 统一转码；转码失败按原扩展名保留
+    if ext != ".wav":
+        try:
+            rel = os.path.join(AUDIO_SUBDIR, key + ".wav").replace("\\", "/")
+            dst = os.path.join(BANK_DIR, rel)
+            if os.path.abspath(dst) != os.path.abspath(audio_path):
+                AL.ensure_wav(audio_path, dst)
+        except Exception:
+            rel = os.path.join(AUDIO_SUBDIR, key + ext).replace("\\", "/")
+            dst = os.path.join(BANK_DIR, rel)
+            if os.path.abspath(dst) != os.path.abspath(audio_path):
+                shutil.copy2(audio_path, dst)
+    else:
+        rel = os.path.join(AUDIO_SUBDIR, key + ext).replace("\\", "/")
+        dst = os.path.join(BANK_DIR, rel)
+        if os.path.abspath(dst) != os.path.abspath(audio_path):
+            shutil.copy2(audio_path, dst)
 
     entry = VoiceEntry(
         name=key, audio=rel, note=note or "",

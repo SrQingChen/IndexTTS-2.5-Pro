@@ -277,6 +277,39 @@ def main() -> int:
         check("合成样本全部 ready（音频与文本都过关）",
               st["ready"] == 5, f"ready={st['ready']} by_status={st['by_status']}")
 
+        # ---- 入库即 wav：非 wav 源自动转码（2026-09-29） ----
+        _flac = os.path.join(tmp, "probe.flac")
+        sf.write(_flac, np.random.default_rng(9).normal(
+            0, 0.1, 22050 * 3).astype(np.float32), 22050,
+            format="FLAC", subtype="PCM_16")   # flac=mp3/m4a 的可写真替身
+        imp_f = DS.import_audio(ds_small, [_flac], copy=True, lang="ZH")
+        _uid_f = (imp_f.get("ids") or [""])[0]
+        _u_f = DS.get(ds_small, _uid_f) if _uid_f else None
+        check("flac 导入被转码成 .wav",
+              _u_f is not None and _u_f.audio.lower().endswith(".wav"),
+              str(_u_f and _u_f.audio))
+        _decodable = False
+        if _u_f is not None:
+            try:
+                import soundfile as _sf2
+                _info = _sf2.info(_u_f.audio_abs(DS.dir_of(ds_small)))
+                _decodable = _info.frames > 0
+            except Exception:
+                _decodable = False
+        check("转码产物是有效 wav（sf.info 可读）", _decodable)
+        # 损坏源：转码失败回退原扩展名（不产生 .wav 名的假 wav）
+        _junk = os.path.join(tmp, "junk.mp3")
+        open(_junk, "wb").write(b"not audio at all")
+        imp_j = DS.import_audio(ds_small, [_junk], copy=True, lang="ZH")
+        _uid_j = (imp_j.get("ids") or [""])[0]
+        _u_j = DS.get(ds_small, _uid_j) if _uid_j else None
+        check("损坏源回退原扩展名（无 .wav 名假文件）",
+              _u_j is not None and not _u_j.audio.lower().endswith(".wav"),
+              str(_u_j and _u_j.audio))
+        check("损坏源在 skipped 里留了说明",
+              any("转码失败" in str(x) for x in (imp_j.get("skipped") or [])),
+              str((imp_j.get("skipped") or [])[:1]))
+
         cur = OC.stage_curate(ds_small, OC.OneClickOptions(), report=None)
         check("样本不足 MIN_SAMPLES 时 gate 关闭",
               cur.get("ok") is False, f"ready_after={cur.get('ready_after')}")
@@ -286,7 +319,9 @@ def main() -> int:
               ("多录" in str(cur.get("error")) or "调低" in str(cur.get("error"))))
         check("没有在样本不足时去划分 train/val",
               not cur.get("split"), str(cur.get("split")))
-        check("删掉的样本数被记录", cur.get("dropped_total", 0) == 0,
+        # dropped_total==2：上面两个转码用例导入的样本（flac 无文本、
+        # junk 无文本且体检不过）在筛选时被丢——预期内
+        check("删掉的样本数被记录", cur.get("dropped_total", 0) == 2,
               f"dropped={cur.get('dropped_total')}")
 
         # -- 评分门槛与去重 --

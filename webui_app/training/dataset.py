@@ -597,15 +597,34 @@ def import_audio(name: str, paths: Sequence[str], copy: bool = True,
             stem, ext = os.path.splitext(base)
             # 统一重命名为 `<uid>.<ext>`：既避开同名覆盖，也让 meta 里的
             # audio 字段与 id 一一对应（排查问题时看文件名就知道是哪条）。
+            # 2026-09-29 入库即 wav：非 wav（mp3/m4a…）自动转码 —— 引擎侧
+            # torchaudio 对 mp3 支持不可靠、sf.write(PCM_16) 到非 wav 会抛
+            # Invalid combination（响度锚定实测崩过），统一成 wav 后全链路
+            # 再无格式特例。转码失败回退原样复制（librosa 读得到就能训）。
             uid = gen()
-            dst_name = f"{uid}{ext.lower()}"
-            dst = os.path.join(audio_dir, dst_name)
+            dst = os.path.join(audio_dir, f"{uid}.wav")
+            ok_wav = False
             try:
-                shutil.copy2(src, dst)
+                if ext.lower() == ".wav":
+                    shutil.copy2(src, dst)
+                    ok_wav = True
+                else:
+                    try:
+                        from webui_app.services import audio_lab as _AL
+                        _AL.ensure_wav(src, dst)
+                        ok_wav = True
+                    except Exception as te:
+                        # 转码失败回退：**保留原扩展名**另存 —— 把 mp3 内容
+                        # 拷进 .wav 名会产生「后缀 wav 内容 mp3」的迷惑文件
+                        # （librosa 读得到、sf/引擎按 wav 解会炸）。
+                        dst = os.path.join(audio_dir, f"{uid}{ext.lower()}")
+                        shutil.copy2(src, dst)
+                        skipped.append(
+                            f"{base}: 转码失败已按原格式导入（{te}）")
             except OSError as e:
                 failed.append(f"{base}: 复制失败 {e}")
                 continue
-            rel = os.path.join(AUDIO_SUBDIR, dst_name)
+            rel = os.path.join(AUDIO_SUBDIR, os.path.basename(dst))
         else:
             uid = gen()
             rel = src_abs

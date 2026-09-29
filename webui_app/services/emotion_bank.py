@@ -211,17 +211,28 @@ def add(
             f"情绪必须是 8 键之一（{'/'.join(EMOTION_KEYS)}），收到：{emotion!r}")
 
     ext = os.path.splitext(audio_path)[1].lower() or ".wav"
-    # 同角色同情绪允许多条（路由自动取评分最高），文件名加序号防覆盖
+    # 同角色同情绪允许多条（路由自动取评分最高），文件名加序号防覆盖。
+    # 入库即 wav（2026-09-29）：非 wav 转码（引擎 torchaudio 读 mp3 不可靠），
+    # 转码失败按原扩展名保留（绝不把 mp3 内容拷进 .wav 名）
     seq = 1
     while True:
         name = f"{char}_{emo}_{seq:02d}" if seq > 1 else f"{char}_{emo}"
-        rel = os.path.join(AUDIO_SUBDIR, name + ext).replace("\\", "/")
+        rel = os.path.join(AUDIO_SUBDIR, name + ".wav").replace("\\", "/")
         dst = os.path.join(BANK_DIR, rel)
         if not os.path.isfile(dst) or os.path.abspath(dst) == os.path.abspath(audio_path):
             break
         seq += 1
     if os.path.abspath(dst) != os.path.abspath(audio_path):
-        shutil.copy2(audio_path, dst)
+        if ext == ".wav":
+            shutil.copy2(audio_path, dst)
+        else:
+            try:
+                AL.ensure_wav(audio_path, dst)
+            except Exception:
+                rel = os.path.join(AUDIO_SUBDIR,
+                                   name + ext).replace("\\", "/")
+                dst = os.path.join(BANK_DIR, rel)
+                shutil.copy2(audio_path, dst)
 
     entry = EmoRefEntry(
         name=name, character=character.strip(), emotion=emo, audio=rel,

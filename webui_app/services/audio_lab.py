@@ -1254,3 +1254,25 @@ def shape_edges(y: np.ndarray, sr: int, pad_ms: float = 80.0,
         out = (np.clip(body, -32767, 32767).astype(np.int16)
                if np.issubdtype(out.dtype, np.integer) else body)
     return out
+
+
+def ensure_wav(src: str, dst: str) -> str:
+    """把任意可解码音频落成 wav（PCM_16+TPDF 抖动）。已是 wav 则直接复制。
+
+    入库即 wav 的统一入口（数据集导入 / 音色库 / 情感库共用）：
+    · 引擎侧 torchaudio 对 mp3/m4a 的支持因 libsndfile 版本而异 —— mp3
+      参考音频可能**静默读不了**（2026-09-29 响度锚定在 mp3 上崩掉是
+      同族问题的显性版）；
+    · 转码后全链路（体检/增强/切片/锚定/特征提取）只剩一种格式，
+      不再有 sf.write(PCM_16) 到非 wav 的 Invalid combination 特例。
+    解码失败或解码结果为空时抛异常，由调用方决定回退。
+    """
+    import shutil
+
+    ext = os.path.splitext(src)[1].lower()
+    if ext in ("", ".wav"):
+        shutil.copy2(src, dst)
+        return dst
+    y, sr = load_audio(src)          # librosa：mp3/m4a/flac/ogg 经 audioread
+    save_audio(dst, y, sr)           # 空音频在这里被拒绝
+    return dst
