@@ -337,6 +337,9 @@ def perform(
             line_infos.append(info)
 
         # ---- 拼接：块间停顿（按边界等级）+ 直连时 30ms 交叉淡化 ----
+        # 块间垫**数字零**：实际使用会在停顿段垫 BGM，零底最干净；人声的
+        # 自然衰减在块内由模型完成（见 _merge_blocks 的收束说明），零只
+        # 出现在「已经说完」之后，不存在戛然而止。
         fade = int(SR * 0.03)
         final = wavs[0] if wavs else np.zeros(1, np.int16)
         for i in range(1, n):
