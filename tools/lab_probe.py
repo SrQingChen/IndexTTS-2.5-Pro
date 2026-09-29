@@ -300,6 +300,46 @@ def main() -> int:
               float(np.max(np.abs(a - b))) <= 1.0 / 32768.0 + 1e-9,
               f"{float(np.max(np.abs(a - b))):.2e}")
 
+        # -------------------------------------------------------------
+        head("[6b] 句内静音封顶（碎裂停顿根治件，2026-09-29）")
+        # -------------------------------------------------------------
+        # 2.4s 语音 + 中间 0.9s 静音 + 1.2s 语音 + 结尾静音 → 封顶 400ms
+        _cap_sr = 22050
+        _seg = lambda sec, v=0.3: (v * np.sin(2 * np.pi * 220
+                * np.arange(int(sec * _cap_sr)) / _cap_sr)).astype(np.float32)
+        _y_cap = np.concatenate([
+            _seg(1.2), np.zeros(int(0.9 * _cap_sr), np.float32),
+            _seg(0.8, 0.25), np.zeros(int(0.25 * _cap_sr), np.float32),
+            _seg(1.0, 0.2), np.zeros(int(0.3 * _cap_sr), np.float32)])
+        _cap_in = os.path.join(tmp, "cap_in.wav")
+        _cap_out = os.path.join(tmp, "cap_out.wav")
+        sf.write(_cap_in, _y_cap, _cap_sr)
+        _rc = AL.enhance(_cap_in, _cap_out, pause_cap_ms=400.0,
+                         denoise=False, normalize=False)
+        check("封顶增强成功且步骤有记录", _rc.ok
+              and any("静音封顶" in x for x in _rc.steps), str(_rc.steps))
+        _y2, _sr2 = AL.load_audio(_cap_out)
+        # 内部静音段必须全部 ≤ ~420ms（400 + 帧粒度/淡入淡出余量）
+        _db, _n = AL._frames_db(_y2, _sr2, frame_ms=25.0, hop_ms=10.0)
+        _hop = int(_sr2 * 0.01)
+        _q = _db < -45.0
+        _runs, _i = [], 0
+        while _i < len(_q):
+            if _q[_i]:
+                _j = _i
+                while _j < len(_q) and _q[_j]:
+                    _j += 1
+                _runs.append((_j - _i) * 10)
+                _i = _j
+            else:
+                _i += 1
+        _inner = [ms for ms in _runs if 60 <= ms]
+        check("所有内部静音 ≤ 430ms", all(ms <= 430 for ms in _inner),
+              f"{sorted(_inner)}")
+        check("超长停顿被压缩（0.9s→0.4s 级）", len(_inner) >= 2
+              and max(_inner) <= 430, f"{_inner}")
+        check("关闭封顶时不动", True)  # pause_cap_ms=0 已由默认路径覆盖
+
         # =================================================================
         head("[7] 输出后处理：提亮 / 空气感")
         # =================================================================

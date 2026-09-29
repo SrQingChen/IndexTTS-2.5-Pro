@@ -162,11 +162,21 @@ def perform(
         """台本行 → 表演块：情绪相同的相邻行合并，≤120 文本 token。
 
         与官方 split_text_by_tokens 同预算；情绪突变 / 预算到顶断块。
+        **省略号/破折号结尾强制断块**（2026-09-29）：那是戏剧性停顿拍，
+        必须成为块边界才能拿到台本的长停顿——留在块内会被模型读成
+        普通逗号级停顿（实测「……」比句内停顿还短）。
         块内文本一次合成调用 —— 这是「块内零人工静音、节奏交还模型」
         的机制保证。
         """
         blocks: List[Dict[str, Any]] = []
         cur: Optional[Dict[str, Any]] = None
+
+        def _close():
+            nonlocal cur
+            if cur is not None:
+                blocks.append(cur)
+                cur = None
+
         for ln in script.lines:
             cost = _count_tokens(ln.text)
             if (cur is not None and ln.emotion == cur["emotion"]
@@ -176,11 +186,13 @@ def perform(
                 cur["intensity"] = max(cur["intensity"], ln.intensity)
                 joiner = "" if cur["text"][-1:] in "。！？…！？.!?\"" else "。"
                 cur["text"] = cur["text"] + joiner + ln.text
-                continue
-            if cur is not None:
-                blocks.append(cur)
-            cur = {"emotion": ln.emotion, "lines": [ln], "tokens": cost,
-                   "intensity": ln.intensity, "text": ln.text}
+            else:
+                _close()
+                cur = {"emotion": ln.emotion, "lines": [ln], "tokens": cost,
+                       "intensity": ln.intensity, "text": ln.text}
+            # 戏剧性停顿拍：……/—— 结尾的行绝不与后文同块
+            if cur is not None and cur["text"].endswith(("……", "…", "——", "—")):
+                _close()
         if cur is not None:
             blocks.append(cur)
         return blocks

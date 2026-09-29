@@ -255,6 +255,22 @@ def main() -> int:
     check("块间停顿按等级插入", abs(d8 - expect8) < 0.02,
           f"{d8:.3f}s ≈ {expect8:.3f}s")
 
+    print("== 8. 省略号强制断块（戏剧性停顿拍） ==")
+    eng9 = _StubEngine(_Cfg_populate(tmp))
+    sc9 = DirectorScript(lines=[
+        ScriptLine(text="遇见我想见的人……", emotion="calm", intensity=0.4,
+                   pause_after_ms=600),
+        ScriptLine(text="成为一名流浪骑士，是我真正的志向。", emotion="calm",
+                   intensity=0.5, pause_after_ms=300),
+    ])
+    res9 = ORC.perform(eng9, req, sc9, route=False)
+    check("同情绪但省略号结尾强制断成 2 块", len(eng9.calls) == 2,
+          f"calls={len(eng9.calls)}")
+    d9 = sf.info(res9["path"]).duration
+    expect9 = 2 * LINE_SEC + 600 / 1000.0    # 块间停顿=省略号行的 600ms
+    check("省略号停顿=块间 600ms（不再是模型短停顿）",
+          abs(d9 - expect9) < 0.02, f"{d9:.3f}s ≈ {expect9:.3f}s")
+
     fails = [n for n, ok, _ in CHECKS if not ok]
     print(f"\n结果：{len(CHECKS) - len(fails)}/{len(CHECKS)} 通过"
           + (f" · 失败：{fails}" if fails else " ✅"))

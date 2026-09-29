@@ -644,11 +644,20 @@ def enhance(
     max_sec: float = 15.0,
     highpass_hz: float = 60.0,
     denoise_keep_high_hz: float = DENOISE_KEEP_HIGH_HZ,
+    pause_cap_ms: float = 0.0,
 ) -> EnhanceResult:
-    """一站式增强：去 DC → 裁静音 → 降噪 → 响度归一 → 重采样 → 限长。
+    """一站式增强：去 DC → 裁静音 → **句内静音封顶** → 降噪 → 响度归一 → 重采样 → 限长。
 
     顺序是刻意安排的：先裁静音再降噪，可以避免对纯噪声段做无谓计算；
     先降噪再归一，可以避免把噪声一起放大。
+
+    pause_cap_ms > 0 时启用**句内静音封顶**（2026-09-29 碎裂停顿根治件）：
+    片段内部超过该时长的静音一律压缩到该时长。动机（真机实测）：游戏配音
+    的真实句间停顿常达 400~800ms，而 ASR 的标点模型把它们标成逗号——
+    模型从这样的数据里学到「逗号=长停顿」并在无标点处泛化（实测生成
+    一句话 7 个停顿、逗号处 800ms）。封顶后模型听到的句内停顿 ≤400ms
+    （人类自然区间），长停顿的「名额」留给句末与省略号（推理端由导演
+    模式的块间停顿供给）。
     """
     res = EnhanceResult()
     try:
@@ -682,6 +691,15 @@ def enhance(
             if len(y2) and len(y2) < len(y):
                 steps.append(f"裁掉首尾静音 {(len(y)-len(y2))/sr:.2f}s")
                 y = y2
+
+        # 2.5) 句内静音封顶（pause_cap_ms>0 时）
+        if pause_cap_ms and pause_cap_ms > 0:
+            y2, n_capped = _cap_pauses(y, sr, silence_thresh_db,
+                                       float(pause_cap_ms))
+            if n_capped:
+                y = y2
+                steps.append(f"句内静音封顶 {pause_cap_ms:.0f} ms"
+                             f"（压缩 {n_capped} 处超长停顿）")
 
         # 3) 降噪（高频段保留原始信号，避免把齿音/气息细节一起压掉）
         if denoise and denoise_strength > 0:
@@ -737,6 +755,59 @@ def _trim(y: np.ndarray, sr: int, thresh_db: float) -> np.ndarray:
     a = max(0, int(active[0] * hop) - int(0.05 * sr))
     b = min(len(y), int((active[-1] + 1) * hop) + int(0.05 * sr))
     return y[a:b]
+
+
+def _cap_pauses(y: np.ndarray, sr: int, thresh_db: float,
+                cap_ms: float) -> tuple:
+    """把片段**内部**超过 cap_ms 的静音压缩到 cap_ms。返回 (波形, 压缩处数)。
+
+    首尾各保留 50ms 不参与（那是 _trim 的辖区）。压缩方式：从超长静音的
+    **中间**截掉超出部分——两端都是静音，不存在波形突变；切口两侧再做
+    5ms 线性淡入淡出兜底。帧长 25ms / 帧移 10ms，与 _trim 同一套尺度。
+    """
+    db, n = _frames_db(y, sr, frame_ms=25.0, hop_ms=10.0)
+    if not n:
+        return y, 0
+    hop = int(sr * 0.01)
+    quiet = db < thresh_db
+    edge = int(0.05 * sr)                      # 首尾 50ms 保护区
+    lo_frame = edge // hop
+    hi_frame = max(lo_frame, (len(y) - edge) // hop)
+
+    cap_n = int(sr * cap_ms / 1000.0)
+    fade = max(1, int(0.005 * sr))
+    runs = []
+    i = lo_frame
+    while i < hi_frame:
+        if quiet[i]:
+            j = i
+            while j < hi_frame and quiet[j]:
+                j += 1
+            a = i * hop
+            b = min(len(y), j * hop)
+            if b - a > cap_n:
+                runs.append((a, b))
+            i = j
+        else:
+            i += 1
+
+    if not runs:
+        return y, 0
+    out = y
+    # 从后往前截，前面区间的偏移不受影响
+    for a, b in reversed(runs):
+        cut = (b - a) - cap_n
+        mid_a = a + cap_n // 2
+        mid_b = b - (cap_n - cap_n // 2)
+        head = out[:mid_a]
+        tail = out[mid_b:]
+        if len(head) >= fade and len(tail) >= fade:
+            head = head.copy()
+            tail = tail.copy()
+            head[-fade:] *= np.linspace(1.0, 0.0, fade, dtype=head.dtype)
+            tail[:fade] *= np.linspace(0.0, 1.0, fade, dtype=tail.dtype)
+        out = np.concatenate([head, tail])
+    return out, len(runs)
 
 
 # noisereduce 是**可选依赖**（没写进 pyproject 的基础依赖里）。它缺席时

@@ -223,6 +223,11 @@ class OneClickOptions:
     denoise_strength: float = 0.6
     normalize: bool = True
     trim_silence: bool = True
+    # 2026-09-29 句内静音封顶：训练音频内部 >cap 的停顿压到 cap。
+    # 游戏配音真实句间停顿 400~800ms 被 ASR 标成逗号，模型学成
+    # 「逗号=长停顿」并在无标点处泛化（实测一句话 7 停顿/逗号 800ms）。
+    # 封顶后句内停顿 ≤400ms（人类自然区间），长停顿名额留给句末/省略号。
+    pause_cap_ms: float = 400.0       # 0 = 关闭
 
     # ---- S3 识别 ----
     asr: bool = True                  # 关掉则需要自己补文本（数据集会留 no_text）
@@ -819,6 +824,7 @@ def _enhance_one(ds_dir: str, u: DS.Utterance, opt: OneClickOptions) -> Dict[str
                      denoise_strength=float(opt.denoise_strength),
                      normalize=bool(opt.normalize),
                      trim_silence=bool(opt.trim_silence),
+                     pause_cap_ms=float(opt.pause_cap_ms or 0.0),
                      target_sr=OUTPUT_SAMPLE_RATE,
                      max_sec=float(opt.slice_over_sec))
     if not res.ok:

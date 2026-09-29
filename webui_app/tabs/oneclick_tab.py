@@ -33,7 +33,8 @@ from webui_app.training.runner import get_runner
 OPT_KEYS = [
     "model_name", "lang", "slice_target_sec", "slice_min_sec",
     "slice_over_sec", "slice_max_pieces", "enhance", "denoise",
-    "denoise_strength", "normalize", "trim_silence", "asr", "asr_engine",
+    "denoise_strength", "normalize", "trim_silence", "pause_cap_ms",
+    "asr", "asr_engine",
     "hotwords", "whisper_size", "score_whisper_size",
     "min_score", "max_text_repeats", "val_ratio", "arch_list", "preset_mode",
     "top_k", "rank_eval", "eval_samples", "cpu_workers", "seed",
@@ -112,7 +113,9 @@ def plan_markdown(opt: OC.OneClickOptions) -> str:
         "| S2 音频优化 | 去直流 / 掐静音 / 降噪 / 归一 / 重采样 / 截断 | "
         f"总开关 {_fmt(opt.enhance)} · 降噪 {_fmt(opt.denoise)}"
         f"（强度 {_fmt(opt.denoise_strength)}）· 归一 {_fmt(opt.normalize)}"
-        f" · 掐静音 {_fmt(opt.trim_silence)} |")
+        f" · 掐静音 {_fmt(opt.trim_silence)}"
+        + (f" · 句内静音封顶 {_fmt(opt.pause_cap_ms)}ms"
+           if float(opt.pause_cap_ms or 0) > 0 else "") + " |")
     rows.append(
         f"| S3 识别与对齐 | 逐条 {opt.asr_engine} 转写"
         f"{'（funasr 缺失自动回退 whisper）' if opt.asr_engine == 'sensevoice' else ''}；"
@@ -277,7 +280,12 @@ def render(ctx: AppContext):
                                                 "音色会变闷")
                     norm_cb = gr.Checkbox(True, label="响度归一")
                     trim_cb = gr.Checkbox(True, label="掐掉首尾静音")
-
+                    pausecap_sl = gr.Slider(
+                        0.0, 800.0, value=400.0, step=50.0,
+                        label="句内静音封顶（ms，0=关）",
+                        info="训练音频内部超过它的停顿压到该时长。游戏配音"
+                             "的真实大停顿被 ASR 标成逗号，不封顶会训出"
+                             "「逗号=长停顿」的碎裂模型（实测逗号 800ms）")
                 with gr.Column(elem_classes=["ix-section"]):
                     gr.HTML(T.section("语音识别", "📝",
                                       "长音频在切片之后**逐片转写**，于是文本与"
@@ -399,7 +407,8 @@ def render(ctx: AppContext):
     # =====================================================================
     opt_controls = [model_name_tb, lang_dd, slice_target_sl, slice_min_sl,
                     slice_over_sl, slice_pieces_nb, enhance_cb, denoise_cb,
-                    denoise_sl, norm_cb, trim_cb, asr_cb, asr_engine_dd,
+                    denoise_sl, norm_cb, trim_cb, pausecap_sl,
+                    asr_cb, asr_engine_dd,
                     hotwords_tb, whisper_dd, score_whisper_dd,
                     min_score_sl, repeats_nb, val_ratio_sl, arch_cg,
                     preset_dd, topk_sl, rank_cb, eval_n_sl, cpu_workers_sl,
