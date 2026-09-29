@@ -73,6 +73,7 @@ INT_KEYS = {"top_k", "num_beams", "max_mel_tokens",
             "max_text_tokens_per_segment", "director_bon"}
 BOOL_KEYS = {"text_normalization", "use_random", "do_sample",
              "director_enable", "director_route_emo", "director_bon_keep",
+             "director_breath",
              "emo_unlock_vector_cap", "emo_extrapolate"}
 # 本项目自有的、官方预设格式之外的配置（记忆机制保存，配置档不保存）
 EXTRA_KEYS: List[str] = ["lora_scale", "polish_on", "polish_presence",
@@ -81,6 +82,7 @@ EXTRA_KEYS: List[str] = ["lora_scale", "polish_on", "polish_presence",
                          "director_enable", "director_character",
                          "director_route_emo", "director_pause_scale",
                          "director_bon", "director_bon_keep",
+                         "director_breath",
                          "emo_unlock_vector_cap", "emo_extrapolate"]
 FLOAT_KEYS |= {"lora_scale", "polish_presence", "polish_exciter",
                "lora_cfm_scale", "director_pause_scale"}

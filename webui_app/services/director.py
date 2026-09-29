@@ -96,6 +96,10 @@ class ScriptLine:
         self.text = (self.text or "").strip()
         return self
 
+    def to_dict(self):
+        from dataclasses import asdict as _ad
+        return _ad(self)
+
 
 @dataclass
 class DirectorScript:
@@ -104,6 +108,7 @@ class DirectorScript:
     ok: bool = True
     error: str = ""                # api 失败原因（已回退 rules 时记录在此）
     raw: str = ""                  # api 原始返回（观测用）
+    note: str = ""                 # 备注（如 cache-hit）
 
     @property
     def n(self) -> int:
@@ -422,8 +427,9 @@ def direct(
     """文本 → 台本。api 失败自动回退 rules（合成永不因导演层中断）。"""
     if backend == "api":
         try:
-            return api_direct(text, character=character, cfg=api_cfg,
-                              pause_scale=pause_scale)
+            # 走缓存版：同文本+同角色+同停顿系数命中即免一次 LLM 调用
+            return cached_api_direct(text, character=character, cfg=api_cfg,
+                                     pause_scale=pause_scale)
         except Exception as e:
             LOG.get_logger("director").warning(
                 "API 导演失败，回退规则引擎：%s: %s", type(e).__name__, e)
@@ -459,3 +465,78 @@ def script_markdown(sc: DirectorScript, route: Optional[Dict[str, str]] = None) 
     lines.append(f"句间停顿：均值 {avg:.0f} ms · 区间 "
                  f"{min(pauses)}~{max(pauses)} ms（拟人化=不均匀）")
     return head + "\n" + "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# 台本缓存（2026-09-29 · 用户需求：同文本不再调 LLM）
+# ---------------------------------------------------------------------------
+
+SCRIPT_CACHE_PATH = os.path.join(STATE_DIR, "director_cache.json")
+SCRIPT_CACHE_MAX = 200          # 条目上限，超了丢最旧（按写入时间）
+
+
+def _cache_key(text: str, character: str, pause_scale: float) -> str:
+    import hashlib
+    h = hashlib.sha1()
+    h.update(f"{(text or '').strip()}|{character or ''}|"
+             f"{round(float(pause_scale or 1.0), 2)}".encode("utf-8"))
+    return h.hexdigest()
+
+
+def _load_script_cache() -> Dict[str, Any]:
+    if not os.path.isfile(SCRIPT_CACHE_PATH):
+        return {}
+    try:
+        with open(SCRIPT_CACHE_PATH, "r", encoding="utf-8") as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+
+def _save_script_cache(cache: Dict[str, Any]) -> None:
+    try:
+        os.makedirs(STATE_DIR, exist_ok=True)
+        if len(cache) > SCRIPT_CACHE_MAX:
+            keep = sorted(cache.items(), key=lambda kv: kv[1].get("_t", 0)
+                          )[-SCRIPT_CACHE_MAX:]
+            cache = dict(keep)
+        tmp = SCRIPT_CACHE_PATH + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(cache, f, ensure_ascii=False)
+        os.replace(tmp, SCRIPT_CACHE_PATH)
+    except OSError:
+        pass
+
+
+def cached_api_direct(text: str, character: str = "",
+                      cfg: Optional[Dict[str, Any]] = None,
+                      pause_scale: float = 1.0,
+                      use_cache: bool = True) -> DirectorScript:
+    """api_direct 的带缓存版：命中即免一次 LLM 调用（note 标 cache）。
+
+    缓存键 = 文本 + 角色 + 停顿系数（这些变了台本就该变）。API 失败
+    照旧抛 DirectorError（由 direct() 回退 rules）。
+    """
+    key = _cache_key(text, character, pause_scale)
+    if use_cache:
+        hit = _load_script_cache().get(key)
+        if hit and hit.get("lines"):
+            sc = DirectorScript(
+                lines=[ScriptLine(**{k: v for k, v in ln.items()
+                                     if k in ScriptLine.__dataclass_fields__})
+                       for ln in hit["lines"]],
+                backend="api", ok=True, raw="(cache)",
+                note="cache-hit")
+            LOG.get_logger("director").info("台本缓存命中（%d 句）", sc.n)
+            return sc
+    sc = api_direct(text, character=character, cfg=cfg,
+                    pause_scale=pause_scale)
+    if use_cache:
+        cache = _load_script_cache()
+        cache[key] = {"lines": [ln.to_dict() for ln in sc.lines],
+                      "_t": time.time(),
+                      "character": character or "",
+                      "preview": (text or "")[:60]}
+        _save_script_cache(cache)
+    return sc

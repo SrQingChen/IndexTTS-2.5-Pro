@@ -130,6 +130,34 @@ def main() -> int:
     check("返回波形电平在 -24~-30dBFS 邻域",
           all(-32 <= v <= -22 for v in _lv), f"{[round(v,1) for v in _lv][:3]}")
 
+    print("== 5. 频谱画像与包络匹配（不饱满/缺频段根治件） ==")
+    # 闷源(220Hz 单音=能量全在 0-1k) vs 亮目标(多谐波)
+    _dull = _tone(1.5, 0.4)
+    _bright = (0.3 * np.sin(2 * np.pi * 220 * np.arange(int(1.5 * SR)) / SR)
+               + 0.15 * np.sin(2 * np.pi * 1320 * np.arange(int(1.5 * SR)) / SR)
+               + 0.08 * np.sin(2 * np.pi * 5600 * np.arange(int(1.5 * SR)) / SR)
+               ).astype(np.float32)
+    _tp = AL.band_profile(_bright)
+    _cp0 = AL.band_profile(_dull)
+    _y_m = AL.match_band_profile(_dull, SR, _tp)
+    _cp1 = AL.band_profile(_y_m)
+    check("画像输出 6 频段+质心", len(_cp0.get("bands", [])) == 6
+          and "centroid" in _cp0)
+    hi0 = sum(_cp0["bands"][3:])      # 3k 以上占比
+    hi1 = sum(_cp1["bands"][3:])
+    check("闷源匹配后高频占比显著抬升", hi1 > hi0 * 1.5,
+          f"{hi0:.1f}% → {hi1:.1f}%")
+    check("匹配不改时长且限幅生效（质心抬但不越界）",
+          len(_y_m) == len(_dull)
+          and _cp1["centroid"] > _cp0["centroid"]
+          and _cp1["centroid"] < _tp["centroid"] * 1.6,
+          f"{_cp0['centroid']} → {_cp1['centroid']} (目标 {_tp['centroid']})")
+    _sil = np.concatenate([np.zeros(int(SR * 2), np.float32), _tone(1.0, 0.3)])
+    check("画像忽略静音段（含 2s 前导静音仍出有效画像）",
+          bool(AL.band_profile(_sil)))
+    _pp = AL.dataset_band_profile([_dull, _bright, _tone(1.2, 0.2)])
+    check("多素材平均画像", _pp.get("n") == 3 and len(_pp.get("bands", [])) == 6)
+
     fails = [n for n, ok, _ in CHECKS if not ok]
     print(f"\n结果：{len(CHECKS) - len(fails)}/{len(CHECKS)} 通过"
           + (f" · 失败：{fails}" if fails else " ✅"))

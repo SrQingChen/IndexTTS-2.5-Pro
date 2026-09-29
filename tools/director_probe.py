@@ -22,6 +22,19 @@ SAMPLE = ("住手！你这家伙，到底对她们做了什么？！"
 CHECKS = []
 
 
+def tmp_dir_for_cache():
+    import tempfile
+    d = os.path.join(tempfile.gettempdir(), "director_cache_probe")
+    os.makedirs(d, exist_ok=True)
+    import glob as _g
+    for f in _g.glob(os.path.join(d, "*.json")):
+        try:
+            os.remove(f)
+        except OSError:
+            pass
+    return d
+
+
 def check(name, cond, detail=""):
     CHECKS.append((name, bool(cond), detail))
     print(f"  {'✅' if cond else '❌'} {name}" + (f" — {detail}" if detail else ""))
@@ -102,6 +115,43 @@ def main() -> int:
           _api_lines[0].pause_after_ms <= 210
           and _api_lines[1].pause_after_ms >= 580,
           f"{[_l.pause_after_ms for _l in _api_lines]}")
+
+    print("== 3c. 台本缓存（同文本免二次 LLM） ==")
+    DR.SCRIPT_CACHE_PATH = os.path.join(tmp_dir_for_cache(), "dcache.json")
+    _calls = {"n": 0}
+    _real_call = DR._api_call
+    def _counting_call(cfg, text, character):
+        _calls["n"] += 1
+        import json as _j
+        return _j.dumps({"choices": [{"message": {"content": _j.dumps({
+            "lines": [{"text": text, "emotion": "calm", "intensity": 0.5,
+                       "pause_after_ms": 300}]}, ensure_ascii=False)}}]},
+            ensure_ascii=False)
+    DR._api_call = _counting_call
+    try:
+        _cfgok = {"base_url": "http://x", "model": "m"}
+        s1 = DR.cached_api_direct("同一句话", "卡提希娅", cfg=_cfgok)
+        _n1 = _calls["n"]
+        s2 = DR.cached_api_direct("同一句话", "卡提希娅", cfg=_cfgok)
+        _n2 = _calls["n"]
+        s3 = DR.cached_api_direct("另一句话", "卡提希娅", cfg=_cfgok)
+        s4 = DR.cached_api_direct("同一句话", "别的角色", cfg=_cfgok)
+        _n4 = _calls["n"]
+        s5 = DR.cached_api_direct("同一句话", "卡提希娅", cfg=_cfgok,
+                                  pause_scale=0.5)
+        _n5 = _calls["n"]
+    finally:
+        DR._api_call = _real_call
+    check("首次调用走了 LLM", _n1 == 1 and s1.note != "cache-hit",
+          f"n1={_n1}")
+    check("同文本+同角色+同系数 命中缓存（不调 LLM）",
+          _n2 == 1 and s2.note == "cache-hit" and s2.n == s1.n,
+          f"n2={_n2} note={s2.note!r}")
+    check("换文本/换角色都重新调用", _n4 == 3,
+          f"calls={_n4}")
+    check("缓存命中仍是 api 后端且 ok", s2.backend == "api" and s2.ok)
+    check("换停顿系数不命中（台本会变）", _n5 == _n4 + 1,
+          f"calls={_n5}")
 
     print("== 4. 规则后端：边界 ==")
     check("空文本 ok=False", DR.rules_direct("", 1).ok is False)

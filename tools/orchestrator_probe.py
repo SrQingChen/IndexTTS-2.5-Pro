@@ -307,6 +307,15 @@ def main() -> int:
     check("滚动参考 ≤14s(引擎 15s 窗口内)",
           _sfx.info(p2_keep).duration <= 14.5,
           f"{_sfx.info(p2_keep).duration:.1f}s")
+    # 无零填充：整条参考的静音占比必须很小(不足段用参考音频补,不是零)
+    _ry, _rsr = sf.read(p2_keep, dtype="float32")
+    _fr = int(_rsr * 0.02); _n = len(_ry) // _fr
+    _rms = np.sqrt(np.mean(_ry[:_n * _fr].reshape(_n, _fr) ** 2, axis=1) + 1e-12)
+    _quiet_ratio = float(np.mean(_rms < 1e-4))
+    check("滚动参考无零填充段(静音占比<10%)", _quiet_ratio < 0.10,
+          f"quiet={_quiet_ratio:.1%}")
+    check("滚动参考定长 14.0s(±0.1)", abs(len(_ry) / _rsr - 14.0) < 0.1,
+          f"{len(_ry)/_rsr:.2f}s")
     data12 = _json.load(open(res12["director"]["sidecar"], encoding="utf-8"))
     check("台本记录 rolling_ref", data12["lines"][0].get("rolling_ref") is False
           and data12["lines"][1].get("rolling_ref") is True)

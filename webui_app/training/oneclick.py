@@ -983,6 +983,20 @@ def stage_optimize(dataset: str, opt: OneClickOptions,
                 "fingerprint": _fp,
             }
             DS.write_marker(dataset, "loudness", _fp)
+            # 频谱画像（6 频段占比+质心）：推理端用它把音色参考的包络
+            # 向角色本人素材靠拢（实测：闷参考→闷输出，300-1kHz 47.5%
+            # 遗传成 33.7%——参考是克隆链的频谱模板，必须先修它）
+            try:
+                _sp = AL.dataset_band_profile([
+                    _u.audio_abs(ds_dir) for _u in DS.load_meta(dataset)
+                    if (_u.audio_abs(ds_dir) or "").lower().endswith(".wav")
+                    and os.path.isfile(_u.audio_abs(ds_dir))])
+                if _sp:
+                    DS.write_marker(dataset, "spectral", _sp)
+                    out["spectral"] = _sp
+            except Exception as _se:
+                LOG.get_logger("oneclick.optimize").warning(
+                    "频谱画像计算失败（跳过）：%s", _se)
             tail += (f" · 响度锚定 {_anchor['gain_db']:+.1f}dB"
                      f"（中位 {_anchor['median_db']:.1f}，相对响度保留）")
     except Exception as _e:
@@ -1597,12 +1611,17 @@ def stage_train(dataset: str, engine, tuning: Dict[str, Any],
     # 响度指纹随训练记录交付(推理端编排器按它逐块采样目标响度)
     try:
         _fp = DS.read_marker(dataset, "loudness")
-        if _fp:
-            for row in results:
-                if row.get("run"):
-                    RN.update_run(row["run"],
-                                  loudness_fingerprint=_fp,
-                                  dataset_loudness=_fp)
+        _sp2 = DS.read_marker(dataset, "spectral")
+        for row in results:
+            if not row.get("run"):
+                continue
+            _kw2 = {}
+            if _fp:
+                _kw2.update(loudness_fingerprint=_fp, dataset_loudness=_fp)
+            if _sp2:
+                _kw2["spectral_profile"] = _sp2
+            if _kw2:
+                RN.update_run(row["run"], **_kw2)
     except Exception as _e:
         LOG.get_logger("oneclick.train").warning(
             "响度指纹写入 run.json 失败：%s: %s", type(_e).__name__, _e)

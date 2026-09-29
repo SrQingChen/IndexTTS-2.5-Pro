@@ -88,6 +88,7 @@ def perform(
     bon_keep: bool = False,
     lora_run: str = "",
     continuity: bool = True,
+    breath: bool = False,
 ) -> Dict[str, Any]:
     """表演块编排（v2）：把台本行合并成「表演块」再逐块合成拼接。
 
@@ -271,13 +272,53 @@ def perform(
     log.info("表演块合并：%d 行 → %d 块（≤40 字/块，情绪一致，低显存路径不触发）",
              len(script.lines), n)
 
+    # ---- 频谱画像（2026-09-29 不饱满/缺频段根治）----
+    # 实测：音色库参考 300-1kHz 占比 47.5% → 输出 33.7%（克隆链忠实遗传
+    # 参考的频谱包络，参考被降噪链搞闷了）。这里把参考的 6 频段包络向
+    # **角色本人训练素材的均值画像**（run.json 的 spectral_profile）靠拢
+    # （±5dB 平滑曲线、相位不变），块 1 与滚动参考共用这份匹配后的参考。
+    _spectral_fp: Dict[str, Any] = {}
+    if lora_run:
+        try:
+            from webui_app.training import runs as _RN
+            _rj2 = _RN.read_run(lora_run) or {}
+            _spectral_fp = dict(_rj2.get("spectral_profile") or {})
+        except Exception:
+            _spectral_fp = {}
+
+    _base_ref_path = str(base.get("spk_audio_prompt") or "")
+
+    def _matched_base_ref() -> str:
+        """块 1 的（可选频谱匹配后的）参考；无画像/失败时原样返回。"""
+        if not (_spectral_fp and _base_ref_path):
+            return _base_ref_path
+        try:
+            y, sr = AL.load_audio(_base_ref_path)
+            if sr != SR:
+                import librosa
+                y = librosa.resample(y, orig_sr=sr, target_sr=SR)
+                sr = SR
+            y2 = AL.match_band_profile(y, sr, _spectral_fp, max_db=5.0)
+            p = os.path.join(run_dir, "prompt_base_matched.wav")
+            AL.save_audio(p, y2, sr)
+            log.info("参考已做频谱匹配（画像质心 %s → 目标 %s Hz）",
+                     AL.band_profile(y, sr).get("centroid"),
+                     _spectral_fp.get("centroid"))
+            return p
+        except Exception as e:
+            log.warning("参考频谱匹配失败（用原参考）：%s", e)
+            return _base_ref_path
+
+    _matched_ref = _matched_base_ref()
+
     # ---- 滚动参考续合成（continuity，2026-09-29 用户猜想的正式实现） ----
-    # 第 N 块的音色参考 = [原参考尾部(≤3s) + 上一块成品音频(≤11s)]，
-    # 窗口 ≤14s、**结尾是上一块**（最新语境在末尾：GPT 的 w2v-BERT 条件是
-    # 时序分布的、CFM 的 ref_mel 是前缀续写——两者都能拿到「刚说完那句」
-    # 的语速/语调/收束，跨块语气因此接得上；MoonCast/VoiceStar 式前缀
-    # 续接在本引擎的零改动实现）。每块写**独立临时文件**：引擎的参考
-    # 缓存按路径命中，同路径换内容会被旧缓存骗过。
+    # 第 N 块的音色参考 = [参考填充段 + 上一块成品(≤11s)]，定长 14.0s、
+    # **结尾是上一块**（最新语境在末尾：GPT 的 w2v-BERT 条件是时序分布的、
+    # CFM 的 ref_mel 是前缀续写——两者都拿到「刚说完那句」的语速/语调/
+    # 收束，跨块语气接得上；MoonCast/VoiceStar 式前缀续接的零改动实现）。
+    # 不足 14s 时**用参考音频补满前面（绝不补零）**——静音占大头的参考会
+    # 稀释 CAMPPlus/w2v 条件（实测闷/房间感的来源之一）。每块独立临时
+    # 文件：引擎参考缓存按路径命中，同路径换内容会被旧缓存骗过。
     def _rolling_prompt(prev_wav: str, base_ref: str, bi: int) -> str:
         try:
             ref_y, ref_sr = AL.load_audio(base_ref)
@@ -294,16 +335,18 @@ def perform(
                 a[-f:] *= np.linspace(1.0, 0.0, f, dtype=np.float32)
                 b[:f] *= np.linspace(0.0, 1.0, f, dtype=np.float32)
             mixed = np.concatenate([a, b])
-            # **定长 14.0s**（不足前补零）：块音频长度各异，若参考长度跟着
-            # 变，CFM/DiT 每个新输入形状都会触发一次 cuDNN 自动调优
-            # （实测冷引擎上每形状 +30~70s，三块 216s 就是这么来的）。
-            # 定长后所有块的参考张量形状恒定，只调优一次。
+            # **定长 14.0s**（形状恒定 → cuDNN 只调优一次；不定长时每新
+            # 形状 +30~70s，实测三块 216s）。不足时**用参考音频补满前面**：
+            # 绝不补零——静音占大头的参考会稀释 CAMPPlus/w2v 条件
+            # （闷/房间感来源之一）。
             fixed = int(14.0 * SR)
             if len(mixed) > fixed:
                 mixed = mixed[-fixed:]
             elif len(mixed) < fixed:
-                mixed = np.concatenate(
-                    [np.zeros(fixed - len(mixed), dtype=np.float32), mixed])
+                pad_need = fixed - len(mixed)
+                filler = ref_y if len(ref_y) >= pad_need else np.tile(
+                    ref_y, pad_need // max(1, len(ref_y)) + 1)
+                mixed = np.concatenate([filler[-pad_need:], mixed])
             p = os.path.join(run_dir, f"prompt_blk{bi:04d}.wav")
             AL.save_audio(p, mixed, SR)
             return p
@@ -340,15 +383,13 @@ def perform(
             emo_ref_path = entry.audio_path if entry is not None else ""
             blk_text = blk["text"]
 
-            # 滚动参考：第 2+ 块把上一块成品拼进音色参考（跨块语气续接）
+            # 参考：块 1 用（可选频谱匹配后的）参考；第 2+ 块滚动续接
             used_rolling = False
             if continuity and bi > 0 and prev_chosen:
-                blk_ref = _rolling_prompt(prev_chosen,
-                                          str(base.get("spk_audio_prompt") or ""),
-                                          bi)
-                used_rolling = (blk_ref != base.get("spk_audio_prompt"))
+                blk_ref = _rolling_prompt(prev_chosen, _matched_ref, bi)
+                used_rolling = (blk_ref != _matched_ref)
             else:
-                blk_ref = str(base.get("spk_audio_prompt") or "")
+                blk_ref = _matched_ref
 
             # ---- 合成：单候选，或 BoN 的 N 个候选（块级） ----
             cand_paths: List[str] = []
@@ -478,6 +519,8 @@ def perform(
         # 出现在「已经说完」之后，不存在戛然而止。
         # 吸气（2026-09）：有停顿的块边界按概率插入**角色本人**的吸气采样
         # （breath_bank），贴下一句开口放置（真人就是「吸完立刻说」）。
+        # 默认关（breath=False）：启发式挖取的采样质量未经耳检，贸然常开
+        # 会往听感里掺噪声（用户实测「嘈杂不干净」的嫌疑之一）。
         from webui_app.services import breath_bank as BB
         fade = int(SR * 0.03)
         inhales_used = 0
@@ -488,7 +531,7 @@ def perform(
             if gap > 0:
                 gap_n = int(SR * gap / 1000.0)
                 bed = np.zeros(gap_n, dtype=np.int16)
-                if character:
+                if breath and character:
                     try:
                         inh = BB.maybe_inhale(character, gap,
                                               float(line_infos[i].get(

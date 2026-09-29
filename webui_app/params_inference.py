@@ -175,6 +175,20 @@ reward 依赖 SenseVoice/emotion2vec（首次从 ModelScope 下载约 2 GB）。
     ))
 
     reg(P(
+        key="director_breath", group="director", label="块边界插入吸气（实验）",
+        kind="checkbox", default=False, experimental=True,
+        summary="在块间停顿处按概率插入角色本人的吸气采样（贴下一句开口）。",
+        info="默认关：呼吸采样由启发式自动挖取、质量未经耳检，先在情感参考"
+             "库页挖库试听满意再开。参考电平 -24~-30dBFS，gap<200ms 不插",
+        affects="「真人感」生理印记；采样质量差时会掺噪声",
+        detail_md="""
+证据：给合成句插入**真实吸气声**显著提升听者回忆成绩，频谱等效的
+非呼吸噪声无效（Whalen 1995, JASA）——所以采样必须来自角色本人
+（情感参考库页「从数据集挖吸气入库」），且**耳检通过再开**。
+""",
+    ))
+
+    reg(P(
         key="emo_unlock_vector_cap", group="emotion",
         label="实验：解除情感向量总和限幅",
         kind="checkbox", default=False, experimental=True,

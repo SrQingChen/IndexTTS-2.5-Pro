@@ -1276,3 +1276,110 @@ def ensure_wav(src: str, dst: str) -> str:
     y, sr = load_audio(src)          # librosa：mp3/m4a/flac/ogg 经 audioread
     save_audio(dst, y, sr)           # 空音频在这里被拒绝
     return dst
+
+
+# ---------------------------------------------------------------------------
+# 频谱画像与包络匹配（2026-09-29 · 不饱满/缺频段的根治件）
+# ---------------------------------------------------------------------------
+
+SPEC_BANDS = [(0, 300), (300, 1000), (1000, 3000), (3000, 6000),
+              (6000, 8500), (8500, 11000)]
+
+
+def band_profile(y_or_path, sr: Optional[int] = None) -> Dict[str, Any]:
+    """长时频谱画像：6 频段能量占比(%) + 谱质心。只统计语音活跃帧。"""
+    if isinstance(y_or_path, str):
+        y, sr = load_audio(y_or_path)
+    else:
+        y = np.asarray(y_or_path, dtype=np.float32)
+    y = np.asarray(y, dtype=np.float32)
+    if len(y) < sr * 0.3:
+        return {}
+    fr = int(sr * 0.025)
+    n = len(y) // fr
+    rms = np.sqrt(np.mean(y[:n * fr].reshape(n, fr) ** 2, axis=1) + 1e-12)
+    thr = float(np.percentile(rms, 70)) * 0.35
+    act = rms > thr
+    yy = (np.concatenate([y[i * fr:(i + 1) * fr]
+                          for i in range(n) if act[i]])
+          if act.any() else y)
+    S = np.abs(_rfft_stft(yy)) ** 2
+    freqs = np.fft.rfftfreq(2048, 1.0 / sr)
+    e = S.sum(axis=1)
+    tot = float(e.sum()) + 1e-12
+    bands = [round(100.0 * float(e[(freqs >= lo) & (freqs < hi)].sum()) / tot, 2)
+             for lo, hi in SPEC_BANDS]
+    cen = float(np.sum(freqs * e) / tot)
+    return {"bands": bands, "centroid": round(cen, 1)}
+
+
+def _rfft_stft(y: np.ndarray, n_fft: int = 2048, hop: int = 512):
+    frames = [y[i:i + n_fft] for i in range(0, max(1, len(y) - n_fft), hop)]
+    if not frames:
+        return np.zeros((n_fft // 2 + 1, 1), dtype=np.float32)
+    win = np.hanning(n_fft).astype(np.float32)
+    return np.stack([np.fft.rfft(f * win)[:n_fft // 2 + 1]
+                     for f in frames], axis=1)
+
+
+def match_band_profile(y: np.ndarray, sr: int, target: Dict[str, Any],
+                       max_db: float = 5.0) -> np.ndarray:
+    """把波形的 6 频段能量占比向 target 靠拢（STFT 域平滑增益曲线）。
+
+    参考/条件的频谱包络会被克隆链忠实遗传（实测：闷参考→闷输出，
+    300-1kHz 占比 47.5% → 输出 33.7%）。这里按「目标占比/当前占比」
+    求 dB 增益（逐段钳 ±max_db、段间线性插值成平滑曲线），STFT 幅度
+    相乘后 ISTFT —— 相位不变、无振铃。target 缺失时原样返回。
+    """
+    if not target or not target.get("bands"):
+        return y
+    cur = band_profile(y, sr)
+    if not cur:
+        return y
+    tb, cb = target["bands"], cur["bands"]
+    n_fft = 2048
+    freqs = np.fft.rfftfreq(n_fft, 1.0 / sr)
+    # 逐段增益(dB)：能量占比的比值 → 对数域
+    seg_db = []
+    for t, c, (lo, hi) in zip(tb, cb, SPEC_BANDS):
+        ratio = max(t, 0.05) / max(c, 0.05)
+        seg_db.append(float(np.clip(10.0 * np.log10(ratio), -max_db, max_db)))
+    # 段中心频率上的控制点 → 全频段线性插值（dB 域平滑曲线）
+    centers = np.array([(lo + hi) / 2.0 for lo, hi in SPEC_BANDS])
+    centers[0] = max(80.0, centers[0])
+    gain_db = np.interp(freqs, centers, seg_db)
+    gain_db[freqs < 70] = gain_db[0]          # 低于首段不再外推
+    gain_db[freqs > 11500] = gain_db[-1]      # Nyquist 之上持平
+    g = 10.0 ** (gain_db / 20.0)
+    # STFT 增益 + ISTFT（overlap-add, hop=n_fft//4）
+    hop = n_fft // 4
+    win = np.hanning(n_fft).astype(np.float32)
+    if len(y) < n_fft:
+        return y
+    out = np.zeros(len(y) + n_fft, dtype=np.float32)
+    wsum = np.zeros(len(y) + n_fft, dtype=np.float32)
+    for i in range(0, len(y) - n_fft + 1, hop):
+        seg = y[i:i + n_fft] * win
+        spec = np.fft.rfft(seg)
+        seg2 = np.fft.irfft(spec * g[:len(spec)], n=n_fft)
+        out[i:i + n_fft] += seg2 * win
+        wsum[i:i + n_fft] += win * win
+    valid = wsum > 1e-6
+    out[valid] /= wsum[valid]
+    out = out[:len(y)]
+    peak = float(np.max(np.abs(out))) if len(out) else 0.0
+    if peak > 10 ** (-1.0 / 20.0):
+        out = out * (10 ** (-1.0 / 20.0) / peak)
+    return out.astype(np.float32)
+
+
+def dataset_band_profile(paths: List[str]) -> Dict[str, Any]:
+    """一批素材的平均频谱画像（写进 dataset markers → run.json，
+    推理端用它把音色参考的包络向角色本人素材靠拢）。"""
+    profs = [p for p in (band_profile(x) for x in paths) if p]
+    if len(profs) < 3:
+        return {}
+    bands = [round(float(np.mean([p["bands"][i] for p in profs])), 2)
+             for i in range(len(SPEC_BANDS))]
+    cen = round(float(np.mean([p["centroid"] for p in profs])), 1)
+    return {"bands": bands, "centroid": cen, "n": len(profs)}

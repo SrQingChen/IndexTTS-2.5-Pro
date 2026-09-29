@@ -624,6 +624,9 @@ def render(ctx: AppContext):
                         dir_bon_keep = W.make_component(
                             "director_bon_keep",
                             value=bool(ST.get("director_bon_keep", False)))
+                        dir_breath_cb = W.make_component(
+                            "director_breath",
+                            value=bool(ST.get("director_breath", False)))
                     with gr.Accordion("🔌 LLM API 配置（OpenAI 兼容）",
                                       open=False) as api_acc:
                         _api_cfg = DR.load_api_config()
@@ -784,7 +787,7 @@ def render(ctx: AppContext):
         lora_cfm_run_dd, lora_cfm_ckpt_dd, lora_cfm_scale_sl,
         polish_cb, polish_presence, polish_exciter,
         director_cb, dir_backend, dir_character, dir_route, dir_scale_sl,
-        dir_bon, dir_bon_keep,
+        dir_bon, dir_bon_keep, dir_breath_cb,
     ]
 
     def _collect(*vals) -> Dict[str, Any]:
@@ -885,7 +888,7 @@ def render(ctx: AppContext):
          lora_cfm_run, lora_cfm_ckpt, lora_cfm_scale,
          pol_on, pol_presence, pol_exciter,
          dir_on, dir_backend, dir_character, dir_route, dir_scale,
-         dir_bon_n, dir_bon_keep) = vals
+         dir_bon_n, dir_bon_keep, dir_breath_on) = vals
         raw = _collect(*core)
         raw["emo_control_method"] = W.emo_mode_index(raw["emo_control_method"])
         # 记下本次参数快照，供「预设管理」页的「保存当前参数」使用
@@ -932,7 +935,8 @@ def render(ctx: AppContext):
                     progress=progress,
                     bon_n=int(dir_bon_n or 0),
                     bon_keep=bool(dir_bon_keep),
-                    lora_run=str(lora_run or ""))
+                    lora_run=str(lora_run or ""),
+                    breath=bool(dir_breath_on))
             else:
                 res = INF.generate(eng, req, progress=progress)
         except EngineError as e:
@@ -1738,7 +1742,7 @@ def render(ctx: AppContext):
         lora_cfm_run_dd, lora_cfm_ckpt_dd, lora_cfm_scale_sl,
         polish_cb, polish_presence, polish_exciter, remember_cb,
         director_cb, dir_backend, dir_character, dir_route, dir_scale_sl,
-        dir_bon, dir_bon_keep,
+        dir_bon, dir_bon_keep, dir_breath_cb,
     ]
 
     def _live_snapshot(*vals) -> Dict[str, Any]:
@@ -1749,7 +1753,8 @@ def render(ctx: AppContext):
          dsamp, temp, topp, topk, beams, rpen, lpen, mmel,
          lrun, lckpt, lscale, crun, cckpt, cscale,
          pon, ppre, pexc, remember_on,
-         d_on, d_backend, d_char, d_route, d_scale, d_bon, d_bkeep) = vals
+         d_on, d_backend, d_char, d_route, d_scale, d_bon, d_bkeep,
+         d_breath) = vals
         return {
             "voice_name": voice_name or "",
             "prompt_audio": pa, "emo_audio": ea,
@@ -1780,6 +1785,7 @@ def render(ctx: AppContext):
             "director_pause_scale": float(d_scale or 1.0),
             "director_bon": int(d_bon or 0),
             "director_bon_keep": bool(d_bkeep),
+            "director_breath": bool(d_breath),
             "_remember": bool(remember_on),
         }
 
@@ -1857,7 +1863,7 @@ def render(ctx: AppContext):
         lora_cfm_run_dd, lora_cfm_ckpt_dd, lora_cfm_scale_sl,
         polish_cb, polish_presence, polish_exciter,
         director_cb, dir_route, dir_character, dir_scale_sl,
-        dir_bon, dir_bon_keep,
+        dir_bon, dir_bon_keep, dir_breath_cb,
         unlock_cap_cb, extrapolate_cb,
     ]
 
@@ -1907,6 +1913,7 @@ def render(ctx: AppContext):
             gr.update(value=float(P.get("director_pause_scale").default)),  # 停顿系数
             gr.update(value=int(P.get("director_bon").default)),           # 择优N
             gr.update(value=bool(P.get("director_bon_keep").default)),     # 保留候选
+            gr.update(value=bool(P.get("director_breath").default)),       # 吸气(默认关)
             gr.update(value=bool(P.get("emo_unlock_vector_cap").default)),  # 解锁上限
             gr.update(value=bool(P.get("emo_extrapolate").default)),     # 外推
         ]
