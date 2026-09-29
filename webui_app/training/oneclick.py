@@ -954,18 +954,27 @@ def stage_optimize(dataset: str, opt: OneClickOptions,
         _lu = []
         for _u in DS.load_meta(dataset):
             _ap = _u.audio_abs(ds_dir)
-            if _ap and os.path.isfile(_ap):
+            # 只测 wav：数据集里的 mp3/m4a 原件（不可训练的超长源）会让
+            # sf.write(PCM_16) 抛 Invalid combination —— 一个坏文件曾把
+            # 整个锚定阶段取消（实测 2026-09-29 19:01 的运行）
+            if (_ap and os.path.isfile(_ap)
+                    and _ap.lower().endswith(".wav")):
                 _lu.append(AL.measure_loudness(_ap))
         _anchor = AL.anchor_gain(_lu, target_dbfs=float(opt.loudness_target_db))
         if _anchor["n"]:
             for _u in DS.load_meta(dataset):
                 _ap = _u.audio_abs(ds_dir)
-                if not (_ap and os.path.isfile(_ap)):
+                if not (_ap and os.path.isfile(_ap)
+                        and _ap.lower().endswith(".wav")):
                     continue
-                _y, _sr = AL.load_audio(_ap)
-                _y2 = AL.apply_anchor(_y, _anchor)
-                if not _np.allclose(_y, _y2):
-                    AL.save_audio(_ap, _y2, _sr)
+                try:
+                    _y, _sr = AL.load_audio(_ap)
+                    _y2 = AL.apply_anchor(_y, _anchor)
+                    if not _np.allclose(_y, _y2):
+                        AL.save_audio(_ap, _y2, _sr)
+                except Exception as _fe:
+                    LOG.get_logger("oneclick.optimize").warning(
+                        "响度锚定跳过 %s：%s", _u.id, _fe)
             _fp = AL.loudness_fingerprint(_lu)
             out["loudness"] = {
                 "mode": "median_anchor", "n": _anchor["n"],

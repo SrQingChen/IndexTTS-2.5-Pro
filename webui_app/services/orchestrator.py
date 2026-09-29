@@ -87,6 +87,7 @@ def perform(
     bon_n: int = 0,
     bon_keep: bool = False,
     lora_run: str = "",
+    continuity: bool = True,
 ) -> Dict[str, Any]:
     """表演块编排（v2）：把台本行合并成「表演块」再逐块合成拼接。
 
@@ -177,14 +178,16 @@ def perform(
         return max(1, int(len(text) / 1.6) + 1)   # 中文 ≈1.6 字/token 兜底
 
     def _merge_blocks() -> List[Dict[str, Any]]:
-        """台本行 → 表演块：情绪相同的相邻行合并，≤120 文本 token。
+        """台本行 → 表演块：情绪相同的相邻行合并，预算 = min(120 token,
+        **40 字符**)。
 
-        与官方 split_text_by_tokens 同预算；情绪突变 / 预算到顶断块。
-        **省略号/破折号结尾强制断块**（2026-09-29）：那是戏剧性停顿拍，
-        必须成为块边界才能拿到台本的长停顿——留在块内会被模型读成
-        普通逗号级停顿（实测「……」比句内停顿还短）。
-        块内文本一次合成调用 —— 这是「块内零人工静音、节奏交还模型」
-        的机制保证。
+        40 字符上限是关键（2026-09-29 用户猜想证实）：8GB 卡上引擎的
+        低显存模式对 >40 字的文本会**自行按标点再分块**（连逗号都切，
+        块间垫 interval_silence）——那会绕过编排器在块内埋下隐藏的碎片
+        化。把块压到 ≤40 字，低显存路径永远不触发，块内始终是一次合成。
+        与官方 split_text_by_tokens 同 token 预算；情绪突变 / 预算到顶 /
+        **省略号破折号结尾**断块（戏剧性停顿拍必须是块边界才能拿到台本
+        长停顿）。块间接缝由滚动参考续合成（_rolling_prompt）弥合。
         """
         blocks: List[Dict[str, Any]] = []
         cur: Optional[Dict[str, Any]] = None
@@ -195,10 +198,14 @@ def perform(
                 blocks.append(cur)
                 cur = None
 
-        for ln in script.lines:
+        def _feed(ln) -> None:
+            """一行进块（含 40 字/token 双预算与戏剧拍断块）。"""
+            nonlocal cur
             cost = _count_tokens(ln.text)
-            if (cur is not None and ln.emotion == cur["emotion"]
-                    and cur["tokens"] + cost <= 120):
+            fits = (cur is not None and ln.emotion == cur["emotion"]
+                    and cur["tokens"] + cost <= 120
+                    and len(cur["text"]) + len(ln.text) + 1 <= 40)
+            if fits:
                 cur["lines"].append(ln)
                 cur["tokens"] += cost
                 cur["intensity"] = max(cur["intensity"], ln.intensity)
@@ -208,17 +215,101 @@ def perform(
                 _close()
                 cur = {"emotion": ln.emotion, "lines": [ln], "tokens": cost,
                        "intensity": ln.intensity, "text": ln.text}
-            # 戏剧性停顿拍：……/—— 结尾的行绝不与后文同块
+            # 戏剧性停顿拍：……/—— 结尾绝不与后文同块
             if cur is not None and cur["text"].endswith(("……", "…", "——", "—")):
                 _close()
+
+        from webui_app.services.director import ScriptLine as _SL
+        import re as _re
+
+        for ln in script.lines:
+            # 长行守卫：>40 字的单行（LLM 台本常见）先按强标点拆成子行，
+            # 否则它会成为一个 >40 字的块、触发引擎低显存的内部再分块
+            if len(ln.text) > 40:
+                parts = [p for p in _re.split(
+                    r"(?<=[。！？!?…；;])", ln.text) if p]
+                # 强标点不够用时回退逗号级（子块由滚动参考弥合，仍好于
+                # 触发引擎低显存的内部再分块——那里没有续接上下文）
+                finer = []
+                for p in parts:
+                    if len(p) <= 40:
+                        finer.append(p)
+                        continue
+                    acc = ""
+                    for q in [x for x in _re.split(r"(?<=[，,、])", p) if x]:
+                        if acc and len(acc) + len(q) > 40:
+                            finer.append(acc)
+                            acc = q
+                        else:
+                            acc += q
+                    if acc:
+                        finer.append(acc)
+                parts = finer
+                chunks, cur_p = [], ""
+                for p in parts:
+                    if cur_p and len(cur_p) + len(p) > 40:
+                        chunks.append(cur_p)
+                        cur_p = p
+                    else:
+                        cur_p += p
+                if cur_p:
+                    chunks.append(cur_p)
+                for ci, ch in enumerate(chunks):
+                    _feed(_SL(text=ch, emotion=ln.emotion,
+                              intensity=ln.intensity,
+                              pause_after_ms=(ln.pause_after_ms
+                                              if ci == len(chunks) - 1 else 0),
+                              note=ln.note))
+                continue
+            _feed(ln)
         if cur is not None:
             blocks.append(cur)
         return blocks
 
     blocks = _merge_blocks()
     n = len(blocks)
-    log.info("表演块合并：%d 行 → %d 块（≤120 token/块，情绪一致）",
+    log.info("表演块合并：%d 行 → %d 块（≤40 字/块，情绪一致，低显存路径不触发）",
              len(script.lines), n)
+
+    # ---- 滚动参考续合成（continuity，2026-09-29 用户猜想的正式实现） ----
+    # 第 N 块的音色参考 = [原参考尾部(≤3s) + 上一块成品音频(≤11s)]，
+    # 窗口 ≤14s、**结尾是上一块**（最新语境在末尾：GPT 的 w2v-BERT 条件是
+    # 时序分布的、CFM 的 ref_mel 是前缀续写——两者都能拿到「刚说完那句」
+    # 的语速/语调/收束，跨块语气因此接得上；MoonCast/VoiceStar 式前缀
+    # 续接在本引擎的零改动实现）。每块写**独立临时文件**：引擎的参考
+    # 缓存按路径命中，同路径换内容会被旧缓存骗过。
+    def _rolling_prompt(prev_wav: str, base_ref: str, bi: int) -> str:
+        try:
+            ref_y, ref_sr = AL.load_audio(base_ref)
+            prev_y, _ = AL.load_audio(prev_wav)
+            if ref_sr != SR:
+                import librosa
+                ref_y = librosa.resample(ref_y, orig_sr=ref_sr, target_sr=SR)
+            ref_tail = ref_y[-int(3.0 * SR):]
+            prev_tail = prev_y[-int(11.0 * SR):]
+            f = int(0.015 * SR)
+            a = ref_tail.copy()
+            b = prev_tail.copy()
+            if len(a) > f and len(b) > f:
+                a[-f:] *= np.linspace(1.0, 0.0, f, dtype=np.float32)
+                b[:f] *= np.linspace(0.0, 1.0, f, dtype=np.float32)
+            mixed = np.concatenate([a, b])
+            # **定长 14.0s**（不足前补零）：块音频长度各异，若参考长度跟着
+            # 变，CFM/DiT 每个新输入形状都会触发一次 cuDNN 自动调优
+            # （实测冷引擎上每形状 +30~70s，三块 216s 就是这么来的）。
+            # 定长后所有块的参考张量形状恒定，只调优一次。
+            fixed = int(14.0 * SR)
+            if len(mixed) > fixed:
+                mixed = mixed[-fixed:]
+            elif len(mixed) < fixed:
+                mixed = np.concatenate(
+                    [np.zeros(fixed - len(mixed), dtype=np.float32), mixed])
+            p = os.path.join(run_dir, f"prompt_blk{bi:04d}.wav")
+            AL.save_audio(p, mixed, SR)
+            return p
+        except Exception as e:
+            log.warning("滚动参考构建失败（块 %d 回退原参考）：%s", bi, e)
+            return base_ref
 
     def _score_one(path: str, text: str, emo_ref: str) -> float:
         r = _scorer.score(path, text, base["spk_audio_prompt"],
@@ -227,6 +318,7 @@ def perform(
             return -1.0
         return float(r["reward"])
 
+    prev_chosen: Optional[str] = None
     try:
         for bi, blk in enumerate(blocks):
             if progress:
@@ -248,6 +340,16 @@ def perform(
             emo_ref_path = entry.audio_path if entry is not None else ""
             blk_text = blk["text"]
 
+            # 滚动参考：第 2+ 块把上一块成品拼进音色参考（跨块语气续接）
+            used_rolling = False
+            if continuity and bi > 0 and prev_chosen:
+                blk_ref = _rolling_prompt(prev_chosen,
+                                          str(base.get("spk_audio_prompt") or ""),
+                                          bi)
+                used_rolling = (blk_ref != base.get("spk_audio_prompt"))
+            else:
+                blk_ref = str(base.get("spk_audio_prompt") or "")
+
             # ---- 合成：单候选，或 BoN 的 N 个候选（块级） ----
             cand_paths: List[str] = []
             cand_seeds: List[int] = []
@@ -259,10 +361,10 @@ def perform(
                 kw = dict(base)
                 kw["text"] = blk_text
                 kw["output_path"] = cpath
-                # 块内零人工静音的保证：块 ≤120 token 时官方不会再切，
-                # 即便计数误差触发了内部分段，也把垫音压到最小
-                kw["interval_silence"] = min(int(base.get("interval_silence", 200)
-                                                 or 200), 120)
+                kw["spk_audio_prompt"] = blk_ref
+                # 块 ≤40 字 ⇒ 引擎低显存路径（>40 字触发）永不命中；
+                # 万一有超长单句漏网，内部垫 0 也好过叠一层人工静音
+                kw["interval_silence"] = 0
                 kw.update(emo_kw)
                 if progress and bon_n > 0:
                     try:
@@ -361,12 +463,14 @@ def perform(
                 "emo_ref": entry.name if entry else "",
                 "emo_alpha": (emo_kw["emo_alpha"] if entry is not None else None),
                 "target_lufs": block_lufs,
+                "rolling_ref": used_rolling,
                 "samples": int(wav.shape[0]),
                 "lines": [l.text for l in blk["lines"]],
             }
             if bon_n > 1:
                 info["bon"] = bon_info
             line_infos.append(info)
+            prev_chosen = cand_paths[chosen_k]
 
         # ---- 拼接：块间停顿（按边界等级）+ 直连时 30ms 交叉淡化 ----
         # 块间垫**数字零**：实际使用会在停顿段垫 BGM，零底最干净；人声的

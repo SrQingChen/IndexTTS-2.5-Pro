@@ -38,13 +38,22 @@ class _Cfg:
 
 
 class _StubEngine:
-    """记录每次 infer 的 kwargs，产 0.5s 静音 wav。"""
+    """记录每次 infer 的 kwargs，产 0.5s 静音 wav。
+    spk_audio_prompt 若指向临时滚动参考（会被 run_dir 清理），
+    调用时备份一份到 <cache>/prompts_keep/ 供事后断言。"""
 
     def __init__(self, cfg):
         self.cfg = cfg
         self.calls = []
+        self.keep_dir = os.path.join(cfg.cache_dir, "prompts_keep")
+        os.makedirs(self.keep_dir, exist_ok=True)
 
     def infer(self, progress=None, **kw):
+        import shutil as _sh
+        pp = str(kw.get("spk_audio_prompt") or "")
+        if "prompt_blk" in pp and os.path.isfile(pp):
+            _sh.copy2(pp, os.path.join(self.keep_dir,
+                                       os.path.basename(pp)))
         self.calls.append(kw)
         path = kw["output_path"]
         sf.write(path, np.zeros(int(SR * LINE_SEC), dtype=np.int16), SR,
@@ -254,6 +263,62 @@ def main() -> int:
     expect8 = 2 * LINE_SEC + 250 / 1000.0 + 0.16   # +首尾余白 160ms
     check("块间停顿按等级插入", abs(d8 - expect8) < 0.02,
           f"{d8:.3f}s ≈ {expect8:.3f}s")
+
+    print("== 9. 块 ≤40 字 / 长行守卫 / 滚动参考续合成 ==")
+    from webui_app.services.director import ScriptLine as SL
+    # 5 句同情绪 × 10 字 → 40 字上限应拆成 ~2 块(而非 1 块 50 字)
+    eng10 = _StubEngine(_Cfg_populate(tmp))
+    sc10 = DirectorScript(lines=[
+        SL(text=f"第{i}句十个字的话呢。", emotion="calm", intensity=0.4,
+           pause_after_ms=240) for i in range(1, 6)])
+    res10 = ORC.perform(eng10, req, sc10, route=False)
+    check("同情绪长内容拆成多块且每块 ≤40 字",
+          len(eng10.calls) >= 2
+          and all(len(c["text"]) <= 40 for c in eng10.calls),
+          f"{len(eng10.calls)} 块 {[len(c['text']) for c in eng10.calls]}")
+    check("低显存触发条件(>40字)永不为真",
+          all(len(c["text"]) <= 40 for c in eng10.calls))
+    # 单条 >40 字的 LLM 行被守卫拆分
+    eng11 = _StubEngine(_Cfg_populate(tmp))
+    sc11 = DirectorScript(lines=[SL(
+        text="这是一段特别长的台词，超过了四十个字符的上限，"
+             "所以守卫会在句号处把它拆开，成为多个子行再合并成块。",
+        emotion="calm", intensity=0.4, pause_after_ms=300)])
+    res11 = ORC.perform(eng11, req, sc11, route=False)
+    check(">40 字单行被拆成 ≤40 字的块",
+          all(len(c["text"]) <= 40 for c in eng11.calls)
+          and len(eng11.calls) >= 2,
+          f"{[len(c['text']) for c in eng11.calls]}")
+    # 滚动参考:第 2+ 块的 spk_audio_prompt ≠ 原参考,且为临时文件
+    eng12 = _StubEngine(_Cfg_populate(tmp))
+    sc12 = DirectorScript(lines=[
+        SL(text="第一块平静叙述。", emotion="calm", intensity=0.4,
+           pause_after_ms=240),
+        SL(text="第二块突然爆发！", emotion="angry", intensity=0.8,
+           pause_after_ms=240)])   # 情绪突变 → 必为两块
+    res12 = ORC.perform(eng12, req, sc12, route=False)
+    p1 = eng12.calls[0]["spk_audio_prompt"]
+    p2 = eng12.calls[1]["spk_audio_prompt"]
+    p2_keep = os.path.join(eng12.keep_dir, os.path.basename(p2))
+    check("块1 用原参考", p1 == spk, p1)
+    check("块2 参考换成滚动参考(含上一块音频)",
+          p2 != spk and "prompt_blk" in p2 and os.path.isfile(p2_keep), p2)
+    import soundfile as _sfx
+    check("滚动参考 ≤14s(引擎 15s 窗口内)",
+          _sfx.info(p2_keep).duration <= 14.5,
+          f"{_sfx.info(p2_keep).duration:.1f}s")
+    data12 = _json.load(open(res12["director"]["sidecar"], encoding="utf-8"))
+    check("台本记录 rolling_ref", data12["lines"][0].get("rolling_ref") is False
+          and data12["lines"][1].get("rolling_ref") is True)
+    # continuity=False → 全部用原参考
+    eng13 = _StubEngine(_Cfg_populate(tmp))
+    ORC.perform(eng13, req, sc12, route=False, continuity=False)
+    check("关 continuity 时全部用原参考",
+          eng13.calls[0]["spk_audio_prompt"] == spk
+          and eng13.calls[1]["spk_audio_prompt"] == spk)
+    # interval_silence 恒 0(低显存内部分块永不垫音)
+    check("interval_silence=0", all(c["interval_silence"] == 0
+                                    for c in eng12.calls))
 
     print("== 8. 省略号强制断块（戏剧性停顿拍） ==")
     eng9 = _StubEngine(_Cfg_populate(tmp))

@@ -81,8 +81,11 @@ def main() -> int:
     check("angry 句命中路由", res2["director"]["routed"] >= 1,
           f"routed={res2['director']['routed']}/"
           f"{res2['director']['fallback']}")
-    check("路由版时长 ≈ 无路由版", abs(res2["audio_duration"] - dur1) < 3.0,
-          f"{res2['audio_duration']:.2f}s vs {dur1:.2f}s")
+    # 情感路由会合法地改变语速（愤怒参考→急促，自身参考→平缓），
+    # 阈值只拦病理性 runaway（>40% 相对差），不拦表演差异
+    _rel = abs(res2["audio_duration"] - dur1) / max(dur1, res2["audio_duration"])
+    check("路由版时长无病理漂移（<40% 相对差）", _rel < 0.40,
+          f"{res2['audio_duration']:.2f}s vs {dur1:.2f}s（相对 {_rel:.0%}）")
     data = json.load(open(res2["director"]["sidecar"], encoding="utf-8"))
     routed_lines = [l for l in data["lines"] if l["emo_ref"]]
     check("台本记录了命中的参考与逐句 alpha",
