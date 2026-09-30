@@ -961,6 +961,7 @@ def stage_optimize(dataset: str, opt: OneClickOptions,
                     and _ap.lower().endswith(".wav")):
                 _lu.append(AL.measure_loudness(_ap))
         _anchor = AL.anchor_gain(_lu, target_dbfs=float(opt.loudness_target_db))
+        _lu_post: List[float] = []
         if _anchor["n"]:
             for _u in DS.load_meta(dataset):
                 _ap = _u.audio_abs(ds_dir)
@@ -972,10 +973,13 @@ def stage_optimize(dataset: str, opt: OneClickOptions,
                     _y2 = AL.apply_anchor(_y, _anchor)
                     if not _np.allclose(_y, _y2):
                         AL.save_audio(_ap, _y2, _sr)
+                    # 指纹必须测**锚定后**的电平（实测教训：测锚定前会让
+                    # 推理目标整体偏移 −5dB 且与训练数据不一致）
+                    _lu_post.append(AL.rms_dbfs(_y2))
                 except Exception as _fe:
                     LOG.get_logger("oneclick.optimize").warning(
                         "响度锚定跳过 %s：%s", _u.id, _fe)
-            _fp = AL.loudness_fingerprint(_lu)
+            _fp = AL.loudness_fingerprint(_lu_post or _lu)
             out["loudness"] = {
                 "mode": "median_anchor", "n": _anchor["n"],
                 "median_db": _anchor["median_db"],

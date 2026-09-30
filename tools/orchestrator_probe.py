@@ -56,8 +56,11 @@ class _StubEngine:
                                        os.path.basename(pp)))
         self.calls.append(kw)
         path = kw["output_path"]
-        sf.write(path, np.zeros(int(SR * LINE_SEC), dtype=np.int16), SR,
-                 subtype="PCM_16")
+        # 低幅噪声而非纯静音：滚动参考会把上一块音频拼进 prompt，
+        # 静音块会让"无零填充"断言被桩自身的假数据污染
+        sf.write(path, (np.random.default_rng(42).normal(
+            0, 0.05, int(SR * LINE_SEC)) * 32767).astype(np.int16),
+            SR, subtype="PCM_16")
         return path
 
 
@@ -314,8 +317,8 @@ def main() -> int:
     _quiet_ratio = float(np.mean(_rms < 1e-4))
     check("滚动参考无零填充段(静音占比<10%)", _quiet_ratio < 0.10,
           f"quiet={_quiet_ratio:.1%}")
-    check("滚动参考定长 14.0s(±0.1)", abs(len(_ry) / _rsr - 14.0) < 0.1,
-          f"{len(_ry)/_rsr:.2f}s")
+    check("滚动参考长度 ≤14.0s(短素材允许短,不补零)",
+          len(_ry) / _rsr <= 14.0 + 0.05, f"{len(_ry)/_rsr:.2f}s")
     data12 = _json.load(open(res12["director"]["sidecar"], encoding="utf-8"))
     check("台本记录 rolling_ref", data12["lines"][0].get("rolling_ref") is False
           and data12["lines"][1].get("rolling_ref") is True)

@@ -1287,11 +1287,14 @@ SPEC_BANDS = [(0, 300), (300, 1000), (1000, 3000), (3000, 6000),
 
 
 def band_profile(y_or_path, sr: Optional[int] = None) -> Dict[str, Any]:
+    # 数组入参未给 sr 时按项目输出采样率(22050)处理
     """长时频谱画像：6 频段能量占比(%) + 谱质心。只统计语音活跃帧。"""
     if isinstance(y_or_path, str):
         y, sr = load_audio(y_or_path)
     else:
         y = np.asarray(y_or_path, dtype=np.float32)
+        if sr is None:
+            sr = 22050
     y = np.asarray(y, dtype=np.float32)
     if len(y) < sr * 0.3:
         return {}
@@ -1383,3 +1386,25 @@ def dataset_band_profile(paths: List[str]) -> Dict[str, Any]:
              for i in range(len(SPEC_BANDS))]
     cen = round(float(np.mean([p["centroid"] for p in profs])), 1)
     return {"bands": bands, "centroid": cen, "n": len(profs)}
+
+
+def smooth_loudness_sequence(targets: List[float],
+                             max_step_db: float = 2.5,
+                             anchor_db: Optional[float] = None) -> List[float]:
+    """对逐块目标响度序列做**限步平滑**（2026-09-30 用户听感修复）。
+
+    独立采样在宽分布角色上会造成相邻块 ±9dB 的跳变（听感「忽高忽低」，
+    混 BGM 后像抽吸/空间感）。规则：
+        · 首块钉在分布中位（anchor_db 或序列均值）；
+        · 后续块的目标只能相对前一块移动 ≤max_step_db（超出即钳到边界）；
+        · 保留采样出来的**相对形状**（爆发块仍最响），只削尖峰跳变。
+    """
+    if not targets:
+        return targets
+    base = float(anchor_db if anchor_db is not None
+                 else sum(targets) / len(targets))
+    out = [base]
+    for t in targets[1:]:
+        prev = out[-1]
+        out.append(float(np.clip(t, prev - max_step_db, prev + max_step_db)))
+    return out

@@ -320,33 +320,63 @@ def perform(
     # 稀释 CAMPPlus/w2v 条件（实测闷/房间感的来源之一）。每块独立临时
     # 文件：引擎参考缓存按路径命中，同路径换内容会被旧缓存骗过。
     def _rolling_prompt(prev_wav: str, base_ref: str, bi: int) -> str:
+        """块 N 参考 = [参考连续段 | 60ms 交叉淡化 | 上一块尾部]，定长 14.0s。
+
+        2026-09-30 重构（v1 的平铺拼接被听感证伪）：不再「3s 参考尾 + 平铺
+        重复参考」——重复内容与无淡化的平铺接缝会污染 w2v/CAMPPlus 条件
+        （用户听到的「空间音效/忽高忽低」嫌疑之一）。现在：
+          · 参考只取**一条连续段**（尾部对齐，不重复）；
+          · 上一块占尾部（最新语境在末尾，CFM 前缀续写吃到它）；
+          · 两段先做**电平匹配**（±6dB 限幅），再 60ms 等功率交叉淡化；
+          · 定长 14.0s（cuDNN 形状恒定）；素材实在太短才前补零（罕见）。
+        """
         try:
             ref_y, ref_sr = AL.load_audio(base_ref)
             prev_y, _ = AL.load_audio(prev_wav)
             if ref_sr != SR:
                 import librosa
                 ref_y = librosa.resample(ref_y, orig_sr=ref_sr, target_sr=SR)
-            ref_tail = ref_y[-int(3.0 * SR):]
-            prev_tail = prev_y[-int(11.0 * SR):]
-            f = int(0.015 * SR)
-            a = ref_tail.copy()
-            b = prev_tail.copy()
-            if len(a) > f and len(b) > f:
-                a[-f:] *= np.linspace(1.0, 0.0, f, dtype=np.float32)
-                b[:f] *= np.linspace(0.0, 1.0, f, dtype=np.float32)
-            mixed = np.concatenate([a, b])
-            # **定长 14.0s**（形状恒定 → cuDNN 只调优一次；不定长时每新
-            # 形状 +30~70s，实测三块 216s）。不足时**用参考音频补满前面**：
-            # 绝不补零——静音占大头的参考会稀释 CAMPPlus/w2v 条件
-            # （闷/房间感来源之一）。
             fixed = int(14.0 * SR)
+            xf = int(0.060 * SR)
+
+            prev_tail = prev_y[-int(11.0 * SR):]
+            ref_part = ref_y[max(0, len(ref_y) - (fixed - len(prev_tail))):]
+            # 参考不够填 → 拉长上一块的占用；两者合计仍不足 14s 就**短着用**
+            # ——绝不补零（静音参考稀释条件是实测过的病）。代价是这种罕见
+            # 场景多一次 cuDNN 形状调优；正常素材（参考≥6s）恒为 14.0s。
+            if len(ref_part) + len(prev_tail) < fixed:
+                prev_tail = prev_y[-(fixed - len(ref_part)):]                     if fixed - len(ref_part) <= len(prev_y) else prev_y
+
+            # 段间电平匹配（按各自语音 RMS，±6dB 限幅）—— 电平差会让
+            # 交叉淡化处出现台阶，条件特征读到「音量突变」
+            def _srms(x):
+                if not len(x):
+                    return 1e-4
+                fr = int(SR * 0.025)
+                n = len(x) // fr
+                r = np.sqrt(np.mean(
+                    x[:n * fr].reshape(n, fr) ** 2, axis=1) + 1e-12)
+                act = np.percentile(r, 60)
+                return max(float(act), 1e-4)
+            gain = float(np.clip(_srms(ref_part) / _srms(prev_tail),
+                                 10 ** (-6 / 20), 10 ** (6 / 20)))
+            prev_tail = prev_tail * gain
+
+            f = min(xf, len(ref_part) // 2, len(prev_tail) // 2)
+            a, b = ref_part.copy(), prev_tail.copy()
+            if f > 0:
+                # 等功率（余弦）交叉淡化：不相干素材拼接听感更平滑
+                a[-f:] *= np.cos(np.linspace(0, np.pi / 2, f)) ** 1
+                b[:f] *= np.sin(np.linspace(0, np.pi / 2, f)) ** 1
+            mixed = np.concatenate([a, b])
             if len(mixed) > fixed:
                 mixed = mixed[-fixed:]
-            elif len(mixed) < fixed:
-                pad_need = fixed - len(mixed)
-                filler = ref_y if len(ref_y) >= pad_need else np.tile(
-                    ref_y, pad_need // max(1, len(ref_y)) + 1)
-                mixed = np.concatenate([filler[-pad_need:], mixed])
+            # 首尾 5ms 微淡化（防文件边界 click）
+            e = int(0.005 * SR)
+            if len(mixed) > 2 * e:
+                mixed = mixed.copy()
+                mixed[:e] *= np.linspace(0, 1, e, dtype=np.float32)
+                mixed[-e:] *= np.linspace(1, 0, e, dtype=np.float32)
             p = os.path.join(run_dir, f"prompt_blk{bi:04d}.wav")
             AL.save_audio(p, mixed, SR)
             return p
@@ -360,6 +390,16 @@ def perform(
         if not r.get("ok") or r.get("reward") is None:
             return -1.0
         return float(r["reward"])
+
+    # 逐块目标响度：先采完整序列再做**限步平滑**（首块=中位，相邻 ≤2.5dB）
+    # —— 独立采样在宽分布角色上会 ±9dB 跳变，听感「忽高忽低」/混响抽吸
+    block_targets: List[Optional[float]] = [None] * n
+    if _loudness_fp:
+        _raw = [AL.sample_target_loudness(_loudness_fp, b["intensity"], _rng)
+                for b in blocks]
+        block_targets = AL.smooth_loudness_sequence(
+            _raw, max_step_db=2.5,
+            anchor_db=float(_loudness_fp.get("median", -20.0)))
 
     prev_chosen: Optional[str] = None
     try:
@@ -485,10 +525,8 @@ def perform(
             # 爆发块从响端、平静块从轻端 —— "这句该响那句该轻"来自角色本人
             # 的习惯（run.json 的 loudness_fingerprint），不是随机抖动。
             # 无指纹（旧 run / 纯底座）时返回 -20，行为与从前一致。
-            block_lufs = None
-            if _loudness_fp:
-                block_lufs = AL.sample_target_loudness(
-                    _loudness_fp, blk["intensity"], _rng)
+            block_lufs = block_targets[bi] if _loudness_fp else None
+            if block_lufs is not None:
                 y = wav.astype(np.float32) / 32768.0
                 y = AL.apply_block_loudness(y, block_lufs)
                 wav = np.clip(y * 32767.0, -32767, 32767).astype(np.int16)

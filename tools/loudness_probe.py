@@ -131,8 +131,11 @@ def main() -> int:
           all(-32 <= v <= -22 for v in _lv), f"{[round(v,1) for v in _lv][:3]}")
 
     print("== 5. 频谱画像与包络匹配（不饱满/缺频段根治件） ==")
-    # 闷源(220Hz 单音=能量全在 0-1k) vs 亮目标(多谐波)
-    _dull = _tone(1.5, 0.4)
+    # 闷源(强低频+极弱高频——真实"闷人声"的形状;纯正弦无高频可提升,
+    # 那是增益不是谐波发生器,测试用例必须含可被抬升的弱高频) vs 亮目标
+    _tt = np.arange(int(1.5 * SR)) / SR
+    _dull = (0.4 * np.sin(2 * np.pi * 220 * _tt)
+             + 0.004 * np.sin(2 * np.pi * 5600 * _tt)).astype(np.float32)
     _bright = (0.3 * np.sin(2 * np.pi * 220 * np.arange(int(1.5 * SR)) / SR)
                + 0.15 * np.sin(2 * np.pi * 1320 * np.arange(int(1.5 * SR)) / SR)
                + 0.08 * np.sin(2 * np.pi * 5600 * np.arange(int(1.5 * SR)) / SR)
@@ -145,8 +148,8 @@ def main() -> int:
           and "centroid" in _cp0)
     hi0 = sum(_cp0["bands"][3:])      # 3k 以上占比
     hi1 = sum(_cp1["bands"][3:])
-    check("闷源匹配后高频占比显著抬升", hi1 > hi0 * 1.5,
-          f"{hi0:.1f}% → {hi1:.1f}%")
+    check("闷源匹配后高频占比显著抬升(≥1.5×)", hi1 > hi0 * 1.5,
+          f"{hi0:.2f}% → {hi1:.2f}%")
     check("匹配不改时长且限幅生效（质心抬但不越界）",
           len(_y_m) == len(_dull)
           and _cp1["centroid"] > _cp0["centroid"]
