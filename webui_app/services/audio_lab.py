@@ -758,6 +758,23 @@ def _trim(y: np.ndarray, sr: int, thresh_db: float) -> np.ndarray:
     return y[a:b]
 
 
+def cap_interior_pauses(y: np.ndarray, sr: int, cap_ms: float,
+                        thresh_db: float = -40.0) -> np.ndarray:
+    """公开封装：把波形**内部**超过 cap_ms 的静音压缩到 cap_ms。
+
+    推理输出侧的对称刀（训练素材封顶的同一技术）：模型在逗号处生成
+    的 500~660ms 停顿被压到人味区间，语音与收音衰减一个采样点不动。
+    cap_ms<=0 时原样返回。int16/float 均可，返回保持原 dtype。
+    """
+    if not cap_ms or float(cap_ms) <= 0 or len(y) < sr // 4:
+        return y
+    was_int = np.issubdtype(y.dtype, np.integer)
+    yf = y.astype(np.float32) / 32768.0 if was_int else y
+    y2, _n = _cap_pauses(yf, sr, thresh_db, float(cap_ms))
+    return (np.clip(y2 * 32767.0, -32767, 32767).astype(np.int16)
+            if was_int else y2)
+
+
 def _cap_pauses(y: np.ndarray, sr: int, thresh_db: float,
                 cap_ms: float) -> tuple:
     """把片段**内部**超过 cap_ms 的静音压缩到 cap_ms。返回 (波形, 压缩处数)。

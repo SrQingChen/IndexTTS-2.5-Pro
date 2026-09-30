@@ -175,6 +175,24 @@ reward 依赖 SenseVoice/emotion2vec（首次从 ModelScope 下载约 2 GB）。
     ))
 
     reg(P(
+        key="director_pause_cap_ms", group="director", label="块内停顿封顶 (ms)",
+        kind="slider", default=300, minimum=0, maximum=600, step=50,
+        summary="对每个合成块内部的静音做封顶：超过它的停顿压缩到该时长。",
+        info="模型在逗号处仍可能生成 500~660ms 停顿（真人 150~250ms）——"
+             "这是输出侧的硬保证。0=关闭。块边界的台本停顿不受影响",
+        affects="句内停顿时长上限；收音与下一字的衔接（只压静音中段，"
+                "语音与衰减不动）",
+        detail_md="""
+**输出侧对称刀**：训练素材封顶（400ms）管的是「模型学什么」，但底模
+先验仍会让生成冒出长停顿——实测新模型逗号处 500~660ms。本参数对每
+个合成块做同样的静音封顶：只从**静音中段**剪掉超出部分（切口在纯静音
+里，语音与收音衰减不动），块边界的台本停顿（等级带控制）不受影响。
+
+300ms ≈ 句号级下限；想在块内也保留句号感可调到 400。
+""",
+    ))
+
+    reg(P(
         key="director_breath", group="director", label="块边界插入吸气（实验）",
         kind="checkbox", default=False, experimental=True,
         summary="在块间停顿处按概率插入角色本人的吸气采样（贴下一句开口）。",

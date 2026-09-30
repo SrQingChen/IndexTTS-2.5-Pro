@@ -47,6 +47,15 @@ def available() -> bool:
         return False
 
 
+def _cached_ckpt_bin() -> Optional[str]:
+    """找已缓存的 AudioSR basic 权重（huggingface 快照目录）。"""
+    import glob
+    hits = glob.glob(os.path.expanduser(
+        "~/.cache/huggingface/hub/models--haoheliu--audiosr_basic/"
+        "snapshots/*/pytorch_model.bin"))
+    return hits[0] if hits else None
+
+
 def _pick_device() -> str:
     try:
         import torch
@@ -81,7 +90,30 @@ def _get_model():
     log.info("加载 AudioSR(basic) → %s（首次会经 %s 下载权重约 1GB）",
              device, os.environ.get("HF_ENDPOINT"))
     try:
-        _STATE["model"] = P.build_model(model_name="basic", device=device)
+        try:
+            _STATE["model"] = P.build_model(model_name="basic", device=device)
+        except Exception as e_first:
+            # 权重已缓存时联网校验（revision HEAD/cas-bridge 下载）仍可能
+            # 超时——build_model 无条件调 download_checkpoint，因此这里把
+            # download_checkpoint 短路到本地缓存文件再重试一次。
+            if "timeout" not in str(e_first).lower() and "connection" not in str(
+                    e_first).lower():
+                raise
+            _cached = _cached_ckpt_bin()
+            if not _cached:
+                raise
+            log.warning("联网校验超时，改用本地缓存权重重试：%s", _cached)
+            _real_dc = P.download_checkpoint
+
+            def _cached_dc(checkpoint_name="basic", **_kw):
+                return _cached
+
+            P.download_checkpoint = _cached_dc
+            try:
+                _STATE["model"] = P.build_model(model_name="basic",
+                                                device=device)
+            finally:
+                P.download_checkpoint = _real_dc
     except Exception as e:
         raise AudioSRError(
             f"AudioSR 加载失败：{type(e).__name__}: {e}（权重下载走 "
@@ -182,8 +214,24 @@ def enhance_file(path: str, out_path: Optional[str] = None,
     chunk_n = int(CHUNK_SEC * in_sr)
     starts = list(range(0, max(1, len(y)), hop))
     pieces: List = []
+    # 显存预检+轮询：引擎刚卸载时驱动释放有延迟，等最多 10s；
+    # 仍不足则明确报错——绝不静默回退 CPU 爬行（那看起来像卡死）。
+    import torch as _torch
+    for _ in range(10):
+        try:
+            if not _torch.cuda.is_available():
+                break
+            free, _t = _torch.cuda.mem_get_info(0)
+            if free / (1024 ** 3) >= VRAM_NEED_GB:
+                break
+            _torch.cuda.empty_cache()
+            time.sleep(1.0)
+        except Exception:
+            break
+
     with _LOCK:
         model = _get_model()
+        device = _STATE.get("device", "?")
         tmpdir = tempfile.mkdtemp(prefix="audiosr_chunk_")
         try:
             for ci, st in enumerate(starts):
@@ -251,4 +299,4 @@ def enhance_file(path: str, out_path: Optional[str] = None,
     except Exception:
         pass
     return {"ok": True, "path": out_path, "seconds": round(dt, 1),
-            "sr": 48000, "chunks": len(pieces)}
+            "sr": 48000, "chunks": len(pieces), "device": device}

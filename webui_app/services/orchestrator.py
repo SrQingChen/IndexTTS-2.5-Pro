@@ -89,6 +89,7 @@ def perform(
     lora_run: str = "",
     continuity: bool = True,
     breath: bool = False,
+    pause_cap_ms: int = 300,
 ) -> Dict[str, Any]:
     """表演块编排（v2）：把台本行合并成「表演块」再逐块合成拼接。
 
@@ -520,6 +521,14 @@ def perform(
                             pass
 
             wav = _read_mono_int16(cand_paths[chosen_k])
+
+            # ---- 块内停顿封顶（输出侧对称刀，2026-09-30）----
+            # 模型在逗号处仍会生成 500~660ms 停顿（训练封顶管素材、
+            # 底模先验管不着）——对块内静音做同样的中段压缩。块边界的
+            # 台本停顿在拼接层，不受影响。
+            if pause_cap_ms and int(pause_cap_ms) > 0:
+                wav = AL.cap_interior_pauses(wav, SR, int(pause_cap_ms),
+                                         thresh_db=-40.0)
 
             # ---- 逐块响度（响度指纹迁移）：从角色自己的响度分布采样目标 ----
             # 爆发块从响端、平静块从轻端 —— "这句该响那句该轻"来自角色本人
