@@ -442,6 +442,21 @@ def render(ctx: AppContext):
                              "0.05~0.15 是安全区；再高会明显失真")
                 polish_md = gr.Markdown(
                     T.hint("生成后这里会显示谱质心前后对比 —— 「亮了没有」有客观数字。"))
+                with gr.Accordion("✨ 超分 48k（AudioSR · 治「老式喇叭」）",
+                                  open=False):
+                    gr.HTML(T.hint(
+                        "22.05k 输出在 <b>11kHz 以上是物理空白</b>，提亮/激励只是"
+                        "心理声学补偿。AudioSR 从低频谱<b>重建真实高频</b>到 48kHz"
+                        "（低频原样直通，对音色最友好）。需要 ~5.5GB 显存，"
+                        "会自动先卸载引擎（用完可一键重载）。首次运行经镜像下载"
+                        "权重约 1GB。"))
+                    with gr.Row():
+                        sr_btn = gr.Button("✨ 对当前结果超分", variant="primary",
+                                           size="sm", scale=2)
+                        sr_steps_sl = gr.Slider(10, 100, 35, step=5,
+                                                label="扩散步数", scale=1,
+                                                info="35 足够；越大越慢")
+                    sr_out = gr.HTML("")
 
             # ---------- 文本 ----------
             with gr.Column(elem_classes=["ix-section"]):
@@ -1029,6 +1044,46 @@ def render(ctx: AppContext):
         on_generate, inputs=all_inputs,
         outputs=[out_audio, out_info, sb, lora_state_html, polish_md],
     )
+
+    # ---------- ✨ AudioSR 超分（对当前结果） ----------
+
+    @LOG.ui_guard("synthesize.on_superres", slow_sec=5.0)
+    def on_superres(path, steps):
+        from webui_app.services import audio_sr as SR
+        from webui_app.services import audio_lab as AL
+        if not path or not os.path.isfile(str(path)):
+            return gr.update(), T.err("先「生成」一次，对当前结果做超分。"), gr.update()
+        if not SR.available():
+            return gr.update(), T.err(
+                "audiosr 未安装（注意 --no-deps，不能让它替换 torch）：见 "
+                "webui_app/services/audio_sr.py 顶部注释的安装命令。"), gr.update()
+        unloaded = False
+        if eng.loaded:
+            gr.Info("超分需要显存：先卸载推理引擎（稍后可一键重载）…")
+            try:
+                eng.unload()
+                unloaded = True
+            except Exception as e:
+                return gr.update(), T.err(f"引擎卸载失败：{e}"), gr.update()
+        try:
+            r = SR.enhance_file(str(path), ddim_steps=int(steps or 35))
+        except Exception as e:
+            return gr.update(), T.err(f"超分失败：{type(e).__name__}: {e}"), \
+                ctx.status_html()
+        b0 = AL.band_profile(str(path))
+        b1 = AL.band_profile(r["path"])
+        rep = (f"✅ 已超分到 48k：`{os.path.basename(r['path'])}` · "
+               f"{r['seconds']}s"
+               + (f"（引擎已卸载，点「加载模型」可恢复）" if unloaded else "")
+               + f"<br>谱质心 {b0.get('centroid', 0):.0f} → "
+               f"<b>{b1.get('centroid', 0):.0f} Hz</b> · 3k 以上能量 "
+               f"{sum(b0.get('bands', [])[3:]):.1f}% → "
+               f"<b>{sum(b1.get('bands', [])[3:]):.1f}%</b>")
+        gr.Info("超分完成")
+        return r["path"], T.tip(rep), ctx.status_html()
+
+    sr_btn.click(on_superres, inputs=[out_audio, sr_steps_sl],
+                 outputs=[out_audio, sr_out, sb])
 
     # ---------- 导演模式：预演台本 / API 配置 / 角色名联动 ----------
 

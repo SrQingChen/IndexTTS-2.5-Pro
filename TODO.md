@@ -1141,3 +1141,31 @@ orchestrator_probe **50/50**（滚动参考静音占比 <10%、定长 14.0s±0.1
 orchestrator **50/50** · loudness **23/23** · director 31/31 · oneclick 273 ·
 synth_state 35 · build 过。真机验收与频谱 A/B 仍顺延（用户直播）。
 **用户侧仍是那一步：重跑一键三连**（新指纹锚定后测+spectral_profile）。
+
+## 阶段 14 · AudioSR 后置超分落地 + 指纹免重训回填（2026-09-30）
+
+用户批准路线 1(AudioSR),并确认后置方案无需重训——正确,且更进一步:
+**连一键三连都不用重跑**:指纹可从现有数据集事后计算。已回填
+oneclick_20260929-2034(响度 -20.04 锚定后测 + 频谱画像)进 2 个 run.json。
+全数据集画像证实:数据集(1177Hz)与音色库参考(1028Hz)都偏闷——「老式
+喇叭」主战场在后置超分,参考画像匹配只做小幅修正。
+
+### 交付
+
+| 件 | 说明 |
+|---|---|
+| `services/audio_sr.py` | AudioSR(basic) 懒加载单例;HF 镜像兜底;显存不够回落 CPU 并明示;`enhance_file` → 48kHz PCM_16(峰值保护),日志报质心/3k+ 前后对比;`release_all` |
+| 依赖安装纪律 | **audiosr 必须 --no-deps**(官方依赖会把 torch 2.8+cu128 换成 2.14、删 transformers 4.52——dry-run 实锤);轻依赖逐个补齐(torchlibrosa/einops/progressbar2/unidecode/phonemizer/ftfy/regex/timm/torchvision 0.23+cu128),导入链全通 |
+| 合成页「✨ 超分 48k」 | 对当前结果一键超分;显存互斥自动先卸引擎(提示可重载);步数滑条(默认 35,官方 200 太慢);报告质心/3k+ 前后数据 |
+
+### 验收
+
+audio_sr_probe **9/9**(未安装报错文案/--no-deps 提示、桩模型懒加载/48k/
+单例/释放、输入校验)· build/ui_output 过 · orchestrator 50 · loudness 23。
+合计 **26 套 / 1644 项**。真机超分首跑(权重下载 ~1GB + 实际推理)顺延到
+用户空闲。
+
+### 用户侧
+
+空闲后:合成页「生成」→「✨ 对当前结果超分」(首次下载权重)→ A/B 试听;
+建议先对同一条做 未处理/仅超分/超分+提亮 三版对比定口味。
