@@ -193,6 +193,56 @@ reward 依赖 SenseVoice/emotion2vec（首次从 ModelScope 下载约 2 GB）。
     ))
 
     reg(P(
+        key="director_stress", group="director", label="词级重音",
+        kind="checkbox", default=True,
+        summary="按 LLM/规则标注的重读词，对合成音频的对应区间施加局部增益。",
+        info="每句 ≤2 词、默认 +2dB、余弦爬坡；规则后端用焦点词典"
+             "（不/没/太/最…），LLM 后端由模型语义标注",
+        affects="词级强调；「该重读的词没有重读」是可测的真人/合成差异",
+        detail_md="""
+**链路**：导演层标注重读词 → 字符时间映射器定位音频区间（静音感知
+比例映射，中文音节近等时）→ 局部增益（余弦爬坡防台阶、峰值保护）。
+
+研究：合成语音在重音处的 intensity/duration 线索系统性偏离真人
+（Speech Prosody 2026）——这是与停顿/音域并列的第三条超音段线索。
+""",
+        pitfall_md="每句超过 2 个重音词会变「话剧腔」。",
+    ))
+
+    reg(P(
+        key="director_stress_gain", group="director", label="重音增益 (dB)",
+        kind="slider", default=2.0, minimum=0.0, maximum=4.0, step=0.5,
+        summary="重读词区间的局部增益。",
+        info="1.5~2.5 是自然区；超过 3 明显做作",
+        affects="词级对比度",
+    ))
+
+    reg(P(
+        key="director_f0_restore", group="director", label="F0 音域恢复",
+        kind="checkbox", default=True,
+        summary="把每句的音高分布向角色本人的 F0 指纹靠拢并适度扩张"
+                "（WORLD 重合成，谱包络不动=音色不变）。",
+        info="合成语音的音域普遍比真人窄——句级 F0 变化提升自然度"
+             "（Vojtech 2019:与位置合韵与否无关）；强度越高目标音域越宽",
+        affects="句内音高起伏（抑扬顿挫的「扬」）",
+        detail_md="""
+**机制**：new_f0 = 角色中位 × (原F0/原中位)^k，k=目标波动/原波动
+（半音域，只扩不缩 ≤1.6×）。角色指纹 = 训练素材的 F0 统计
+（pyworld harvest，随 run.json 交付）。原波动已达标时 k=1 自动不动。
+""",
+        pitfall_md="逐帧偏移限 ±3 半音；WORLD 重合成音质略逊于 BigVGAN "
+                   "原输出——听感不满意就关掉这个开关。",
+    ))
+
+    reg(P(
+        key="director_f0_expand", group="director", label="F0 扩张上限 (×)",
+        kind="slider", default=1.3, minimum=1.0, maximum=1.6, step=0.1,
+        summary="音域扩张倍率上限（k = 目标波动/原波动，夹在此值内）。",
+        info="1.3 保守自然；1.5+ 戏剧化（对白慎用）",
+        affects="句内音高起伏幅度",
+    ))
+
+    reg(P(
         key="director_breath", group="director", label="块边界插入吸气（实验）",
         kind="checkbox", default=False, experimental=True,
         summary="在块间停顿处按概率插入角色本人的吸气采样（贴下一句开口）。",

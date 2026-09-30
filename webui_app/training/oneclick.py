@@ -1001,6 +1001,37 @@ def stage_optimize(dataset: str, opt: OneClickOptions,
             except Exception as _se:
                 LOG.get_logger("oneclick.optimize").warning(
                     "频谱画像计算失败（跳过）：%s", _se)
+
+        # ---- S2.6 F0 指纹（音域恢复用，pyworld harvest,子采样 ≤40 条）----
+        try:
+            _wavs = [_u.audio_abs(ds_dir) for _u in DS.load_meta(dataset)
+                     if (_u.audio_abs(ds_dir) or "").lower().endswith(".wav")
+                     and os.path.isfile(_u.audio_abs(ds_dir))]
+            import random as _rnd
+            _rnd.seed(1234)
+            if len(_wavs) > 40:
+                _wavs = _rnd.sample(_wavs, 40)
+            _stats = [AL.f0_stats(AL.load_audio(_w)[0], 22050)
+                      for _w in _wavs]
+            _stats = [x for x in _stats if x]
+            if len(_stats) >= 3:
+                import numpy as _np2
+                _f0fp = {
+                    "n": len(_stats),
+                    "median": round(float(_np2.median(
+                        [x["median"] for x in _stats])), 1),
+                    "std_st": round(float(_np2.mean(
+                        [x["std_st"] for x in _stats])), 2),
+                    "p10": round(float(_np2.percentile(
+                        [x["median"] for x in _stats], 10)), 1),
+                    "p90": round(float(_np2.percentile(
+                        [x["median"] for x in _stats], 90)), 1),
+                }
+                DS.write_marker(dataset, "f0", _f0fp)
+                out["f0"] = _f0fp
+        except Exception as _e2:
+            LOG.get_logger("oneclick.optimize").warning(
+                "F0 指纹计算失败（跳过）：%s", _e2)
             tail += (f" · 响度锚定 {_anchor['gain_db']:+.1f}dB"
                      f"（中位 {_anchor['median_db']:.1f}，相对响度保留）")
     except Exception as _e:
@@ -1616,6 +1647,7 @@ def stage_train(dataset: str, engine, tuning: Dict[str, Any],
     try:
         _fp = DS.read_marker(dataset, "loudness")
         _sp2 = DS.read_marker(dataset, "spectral")
+        _f0fp = DS.read_marker(dataset, "f0")
         for row in results:
             if not row.get("run"):
                 continue
@@ -1624,6 +1656,8 @@ def stage_train(dataset: str, engine, tuning: Dict[str, Any],
                 _kw2.update(loudness_fingerprint=_fp, dataset_loudness=_fp)
             if _sp2:
                 _kw2["spectral_profile"] = _sp2
+            if _f0fp:
+                _kw2["f0_fingerprint"] = _f0fp
             if _kw2:
                 RN.update_run(row["run"], **_kw2)
     except Exception as _e:

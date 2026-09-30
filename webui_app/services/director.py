@@ -88,12 +88,17 @@ class ScriptLine:
     intensity: float = 0.5         # 0~1
     pause_after_ms: int = 300      # 最后一句会被编排器忽略
     note: str = ""
+    stress: List[str] = field(default_factory=list)   # 重读词（≤2 个）
 
     def clamp(self) -> "ScriptLine":
         self.emotion = self.emotion if self.emotion in EMO_VECTOR_KEYS else "calm"
         self.intensity = max(0.05, min(1.0, float(self.intensity or 0.5)))
         self.pause_after_ms = int(max(0, min(3000, int(self.pause_after_ms or 0))))
         self.text = (self.text or "").strip()
+        # stress 词必须真实存在于 text（LLM 幻觉词在映射器里找不到会静默
+        # 丢增益——不如入库时就滤掉）
+        self.stress = [str(w) for w in (self.stress or [])
+                       if w and str(w) in self.text][:2]
         return self
 
     def to_dict(self):
@@ -261,6 +266,21 @@ def _guess_emotion(line: str) -> tuple:
     return emo, round(inten, 2)
 
 
+# 焦点重读词词典（规则后端的 stress 标记；中文焦点常落在否定词/
+# 程度副词/指示词上——真正的语义焦点由 LLM 后端标注）
+_STRESS_LEXICON = ["不", "没", "别", "很", "太", "最", "更", "必须", "一定",
+                   "绝对", "永远", "都", "也", "才", "就", "竟", "居然"]
+
+
+def _mark_stress(line: str) -> List[str]:
+    """规则重读标记：词典词优先（≤2 个），否则不标（短语末已由模型延长）。"""
+    hits = [w for w in _STRESS_LEXICON if w in line and len(line) >= 4]
+    if not hits:
+        return []
+    hits.sort(key=lambda w: line.index(w))
+    return hits[:2]
+
+
 def _pause_for(line: str, emotion: str, rng: random.Random,
                scale: float = 1.0) -> int:
     """句后停顿 = 标点基表 × 情绪修饰 × ±15% 抖动，再夹进该标点的
@@ -286,6 +306,7 @@ def rules_direct(text: str, seed: int = 0, pause_scale: float = 1.0) -> Director
         lines.append(ScriptLine(
             text=s, emotion=emo, intensity=inten,
             pause_after_ms=_pause_for(s, emo, rng, scale=pause_scale),
+            stress=_mark_stress(s),
             note="rules",
         ).clamp())
     if not lines and (text or "").strip():
@@ -319,8 +340,10 @@ _SYSTEM_PROMPT = """你是一位资深配音导演，负责把剧本台词拆成
    （编排器会把情绪连续的句子合并成一块连续合成，句内节奏由模型自然
    处理，句内停顿标记会被忽略）。真人配音的停顿是稀缺的、不均匀的，
    绝不要每句都填停顿。
+6. 每句标注 stress：从该句原文里挑 1~2 个**应重读的词**（原文中的连续
+   子串，通常是动词/形容词/情绪焦点词），JSON 里是数组；找不到就给 []。
 只输出 JSON，不要多余文字，格式：
-{"lines":[{"text":"...","emotion":"...","intensity":0.6,"pause_after_ms":350,"note":"可选备注"}]}"""
+{"lines":[{"text":"...","emotion":"...","intensity":0.6,"pause_after_ms":350,"stress":["词"],"note":"可选备注"}]}"""
 
 
 def _api_call(cfg: Dict[str, Any], text: str, character: str) -> str:
@@ -375,12 +398,14 @@ def _parse_api_script(raw_response: str, max_lines: int = 400) -> List[ScriptLin
         t = str(d.get("text") or "").strip()
         if not t:
             continue
+        st = d.get("stress")
         out.append(ScriptLine(
             text=t,
             emotion=str(d.get("emotion") or "calm").strip().lower(),
             intensity=float(d.get("intensity") or 0.5),
             pause_after_ms=int(float(d.get("pause_after_ms") or 300)),
             note=str(d.get("note") or "")[:80],
+            stress=[str(x) for x in st] if isinstance(st, list) else [],
         ).clamp())
     if not out:
         raise DirectorError("lines 里没有有效句子（text 全空）")

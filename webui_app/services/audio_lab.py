@@ -1425,3 +1425,217 @@ def smooth_loudness_sequence(targets: List[float],
         prev = out[-1]
         out.append(float(np.clip(t, prev - max_step_db, prev + max_step_db)))
     return out
+
+
+# ---------------------------------------------------------------------------
+# 词级重音 + F0 音域恢复（2026-09-30 · 超音段四件套的最后两件）
+# ---------------------------------------------------------------------------
+
+_PUNCT_CHARS = "。！？…；：，、,.!?;:-—"
+
+
+def char_time_spans(text: str, duration: float,
+                    silences: List[tuple]) -> List[tuple]:
+    """文本每字符 → 音频时间区间 (start_s, end_s)。
+
+    模型：相邻静音段之间的音频窗口 = 一个短语的语音；短语按标点切分后
+    与窗口**按顺序**对应；短语内按字符数比例分配（中文音节近等时）。
+    标点字符自身挂在短语尾部（含其后的静音）。
+
+    静音窗口数与短语数不一致时（ASR/导演合并拆分）按比例贪心对齐：
+    多余窗口并入相邻短语。兜底：无静音信息时整段均匀。
+    返回与 text 等长的 [(start, end)]，全为秒。
+    """
+    n = len(text or "")
+    if n == 0 or duration <= 0:
+        return []
+    runs = sorted([(float(a), float(a) + float(d))
+                   for a, d in (silences or []) if 0.1 <= float(a)
+                   and float(a) + float(d) <= duration])
+    # 短语切分（标点粘在前段尾）
+    phrases: List[str] = []
+    cur = ""
+    for ch in text:
+        cur += ch
+        if ch in _PUNCT_CHARS and len(cur) >= 1:
+            phrases.append(cur)
+            cur = ""
+    if cur:
+        phrases.append(cur)
+    if not phrases:
+        phrases = [text]
+
+    # 窗口 = 相邻静音之间的语音区段
+    windows: List[tuple] = []
+    prev_end = 0.0
+    for a, b in runs:
+        if a - prev_end >= 0.15:
+            windows.append((prev_end, a))
+        prev_end = max(prev_end, b)
+    if duration - prev_end >= 0.15:
+        windows.append((prev_end, duration))
+    if not windows:
+        windows = [(0.0, duration)]
+
+    # 短语 ↔ 窗口 贪心顺序对齐：短语总数 > 窗口数时，多个短语共享窗口
+    # （按字符占比切窗口）；短语总数 < 窗口数时，一个窗口摊多个短语——
+    # 统一按「字符占比 × 窗口总语音」分摊，保证覆盖全部窗口。
+    char_spans: List[tuple] = []
+    phrase_char_counts = [len(p) for p in phrases]
+    total_chars = sum(phrase_char_counts)
+    win_total = sum(b - a for a, b in windows)
+    win_char_share = win_total / max(1, total_chars)   # 每字符摊的窗口秒数
+
+    pi = 0                                             # 当前窗口索引
+    pos_in_win = 0.0                                   # 当前窗口内已消费秒数
+    for p in phrases:
+        w_start, w_end = windows[min(pi, len(windows) - 1)]
+        w_len = w_end - w_start
+        p_len = len(p)
+        p_share = p_len * win_char_share
+        # 短语跨窗口：消费当前窗口剩余+后续窗口
+        p_start = w_start + pos_in_win
+        consumed = 0.0
+        ci = 0
+        for ch in p:
+            span = win_char_share
+            cs = w_start + pos_in_win + consumed
+            ce = min(cs + span, w_end)
+            char_spans.append((cs, max(ce, cs + 1e-4)))
+            consumed += span
+            if w_start + pos_in_win + consumed >= w_end - 1e-6:
+                pi += 1
+                if pi >= len(windows):
+                    # 窗口用尽：剩余字符平摊最后窗口的时长
+                    rest = (p_len - ci - 1) * win_char_share
+                    last_s = char_spans[-1][1]
+                    for _ in range(p_len - ci - 1):
+                        char_spans.append((last_s, last_s + win_char_share))
+                    break
+                w_start, w_end = windows[pi]
+                w_len = w_end - w_start
+                pos_in_win = 0.0
+                consumed = 0.0
+            ci += 1
+        pos_in_win += p_share
+        if pos_in_win >= w_len - 1e-6 and pi < len(windows) - 1:
+            pi += 1
+            pos_in_win = 0.0
+    # 补齐长度（防御）
+    while len(char_spans) < n:
+        last = char_spans[-1] if char_spans else (0.0, duration)
+        char_spans.append(last)
+    return [(round(a, 4), round(b, 4)) for a, b in char_spans[:n]]
+
+
+def apply_stress_gains(y: np.ndarray, sr: int,
+                       stress_spans: List[tuple],
+                       gain_db: float = 2.0,
+                       ramp_ms: float = 80.0) -> np.ndarray:
+    """对重音词的音频区间施加局部增益（余弦爬坡，防台阶）。
+
+    stress_spans: [(start_s, end_s)]（已按时间排序、去重叠）。
+    gain_db ≤ 0 时原样返回。峰值保护 -1dBFS。
+    """
+    import numpy as _np
+    g = 10 ** (float(gain_db) / 20.0)
+    if g <= 1.001 or not stress_spans:
+        return y
+    out = y.astype(np.float32).copy()
+    ramp = max(1, int(sr * float(ramp_ms) / 1000.0))
+    for a_s, b_s in stress_spans:
+        a = max(0, int(a_s * sr) - ramp // 2)
+        b = min(len(out), int(b_s * sr) + ramp // 2)
+        if b - a < ramp * 2:
+            continue
+        seg = out[a:b]
+        env = _np.ones(b - a, dtype=np.float32)
+        env[:ramp] *= _np.linspace(1.0, g, ramp)
+        env[-ramp:] *= _np.linspace(g, 1.0, ramp)
+        env[ramp:-ramp] = g
+        seg2 = seg * env
+        peak = float(_np.max(_np.abs(seg2))) if len(seg2) else 0.0
+        if peak > 10 ** (-1.0 / 20.0):
+            seg2 *= (10 ** (-1.0 / 20.0) / peak)
+        out[a:b] = seg2
+    return out.astype(y.dtype)
+
+
+def f0_stats(y: np.ndarray, sr: int) -> Dict[str, Any]:
+    """一段语音的 F0 统计（半音域）：{median, std_st, voiced_ratio}。
+
+    用 pyworld harvest（快、浊音判定稳）。std 在半音域（对音高尺度
+    不变）—— 这是「音域宽窄」的正确度量。浊音不足 0.25s 返回 {}。
+    """
+    try:
+        import pyworld as pw
+        y64 = np.asarray(y, dtype=np.float64)
+        if len(y64) < sr // 4:
+            return {}
+        f0, _t = pw.harvest(y64, sr, f0_floor=70.0, f0_ceil=600.0)
+        voiced = f0[f0 > 0]
+        if len(voiced) < max(20, sr // 800):
+            return {}
+        med = float(np.median(voiced))
+        semis = 12.0 * np.log2(voiced / med)
+        return {
+            "median": round(med, 1),
+            "std_st": round(float(np.std(semis)), 2),
+            "voiced_ratio": round(float(len(voiced) / len(f0)), 3),
+        }
+    except Exception:
+        return {}
+
+
+def restore_f0_range(y: np.ndarray, sr: int, fp: Dict[str, Any],
+                     intensity: float = 0.5, max_shift_st: float = 3.0,
+                     max_expand: float = 1.6) -> Dict[str, Any]:
+    """把一段语音的 F0 分布向角色指纹靠拢并适度扩张（WORLD 重合成）。
+
+    new_f0_i = 目标中位 × (原F0_i / 原中位)^k，k = 目标std/原std（半音域）
+    只扩不缩（k≥1），中位对中位；逐帧偏移限 ±max_shift_st 半音。
+    强度抬目标波动（爆发块的音域本来就宽）。指纹缺失/原波动已达标/
+    浊音不足时原样返回。
+    """
+    import numpy as _np
+    try:
+        import pyworld as pw
+    except Exception as e:
+        return {"ok": False, "error": f"pyworld 未安装：{e}"}
+    if not fp or float(fp.get("median", 0)) <= 0:
+        return {"ok": False, "error": "无指纹"}
+    y64 = np.asarray(y, dtype=np.float64)
+    if len(y64) < sr // 4:
+        return {"ok": False, "error": "音频太短"}
+    f0, _t = pw.harvest(y64, sr, f0_floor=70.0, f0_ceil=600.0)
+    voiced = f0 > 0
+    if int(voiced.sum()) < max(20, sr // 800):
+        return {"ok": False, "error": "浊音帧不足"}
+    med = float(np.median(f0[voiced]))
+    semis = 12.0 * _np.log2(f0[voiced] / med)
+    orig_std = float(_np.std(semis))
+    t_med = float(fp.get("median", med))
+    t_std = float(fp.get("std_st", orig_std)) * (
+        1.0 + 0.3 * float(np.clip(intensity, 0.0, 1.0)))
+    if orig_std < 0.3:
+        k = 1.0
+    else:
+        k = float(_np.clip(t_std / orig_std, 1.0, float(max_expand)))
+    shift_med = float(_np.clip(
+        12.0 * _np.log2(max(t_med, 1.0) / max(med, 1.0)),
+        -float(max_shift_st), float(max_shift_st)))
+
+    new_f0 = f0.copy()
+    frame_shift = shift_med + (k - 1.0) * semis          # 浊音帧
+    frame_shift = _np.clip(frame_shift, -max_shift_st, max_shift_st)
+    new_f0[voiced] = f0[voiced] * 2.0 ** (frame_shift / 12.0)
+
+    sp, ap = pw.cheaptrick(y64, f0, _t, sr), pw.d4c(y64, f0, _t, sr)
+    y2 = pw.synthesize(new_f0, sp, ap, sr, frame_period=5.0)
+    y2 = _np.asarray(y2, dtype=np.float32)[:len(y)]
+    if len(y2) < len(y):
+        y2 = _np.concatenate([y2, _np.zeros(len(y) - len(y2), np.float32)])
+    return {"ok": True, "k": round(k, 3),
+            "shift_med_st": round(shift_med, 2),
+            "orig_std": round(orig_std, 2), "target_std": round(t_std, 2),
+            "y": y2}

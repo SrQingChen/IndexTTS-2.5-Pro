@@ -1203,3 +1203,20 @@ audio_sr_probe **9/9**(未安装报错文案/--no-deps 提示、桩模型懒加�
 | AudioSR 离线加载 | 权重已缓存时联网校验仍可能超时（HF_HUB_OFFLINE 运行时设置无效——import 时固化）→ 短路 download_checkpoint 直用本地缓存重试（真机验证通过） |
 
 验收：loudness_probe 23/23 · orchestrator 50/50 · audio_sr 9/9 · build 过。
+
+## 阶段 15 · 词级重音 + F0 音域恢复（超音段四件套收官，2026-09-30）
+
+调研确认的最后两个维度，全部落地并带可控开关：
+
+| 件 | 机制 | 开关 |
+|---|---|---|
+| 词级重音 | 导演层（LLM schema 或规则焦点词典）标注重读词 → **字符时间映射器**（静音感知比例，复用块内封顶的静音检测）定位音频区间 → 局部增益（默认 +2dB、余弦爬坡 80ms、峰值保护、去重叠） | `director_stress` + `director_stress_gain`(0~4dB) |
+| F0 音域恢复 | WORLD 分解→**只改 F0**（谱包络不动=音色不变）→ 重合成。new_f0 = 角色中位 × (原F0/原中位)^k，k=目标std/原std（半音域、只扩不缩 ≤1.6×、强度越高越宽）；指纹 pyworld harvest 随 run.json 交付；原波动已达标自动不动 | `director_f0_restore` + `director_f0_expand`(1.0~1.6) |
+
+链序：块内停顿封顶 → F0 恢复 → 块响度(指纹) → **词级重音**（最后施加以保精确 dB）。
+
+### 验收
+
+loudness_probe **23/23**（F0: std 0.71→4.09 半音、中位保持 196.6；重音精确 +2.00dB、非重音区不动）·
+orchestrator 50/50 · director 31/31 · oneclick 273 · synth_state 35 · audio_sr 9/9 ·
+build/ui_output 过。真机 A/B 留给用户。

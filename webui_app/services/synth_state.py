@@ -73,7 +73,7 @@ INT_KEYS = {"top_k", "num_beams", "max_mel_tokens",
             "max_text_tokens_per_segment", "director_bon"}
 BOOL_KEYS = {"text_normalization", "use_random", "do_sample",
              "director_enable", "director_route_emo", "director_bon_keep",
-             "director_breath",
+             "director_breath", "director_stress", "director_f0_restore",
              "emo_unlock_vector_cap", "emo_extrapolate"}
 # 本项目自有的、官方预设格式之外的配置（记忆机制保存，配置档不保存）
 EXTRA_KEYS: List[str] = ["lora_scale", "polish_on", "polish_presence",
@@ -82,10 +82,13 @@ EXTRA_KEYS: List[str] = ["lora_scale", "polish_on", "polish_presence",
                          "director_enable", "director_character",
                          "director_route_emo", "director_pause_scale",
                          "director_bon", "director_bon_keep",
-                         "director_breath",
+                         "director_breath", "director_stress_gain",
+                         "director_f0_expand", "director_pause_cap_ms",
                          "emo_unlock_vector_cap", "emo_extrapolate"]
 FLOAT_KEYS |= {"lora_scale", "polish_presence", "polish_exciter",
-               "lora_cfm_scale", "director_pause_scale"}
+               "lora_cfm_scale", "director_pause_scale",
+               "director_stress_gain", "director_f0_expand",
+               "director_pause_cap_ms"}
 
 # 数值范围钳制（与合成页控件一致，防手改 json 注入离谱值）
 _CLAMP: Dict[str, Tuple[float, float]] = {

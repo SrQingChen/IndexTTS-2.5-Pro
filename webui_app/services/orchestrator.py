@@ -90,6 +90,10 @@ def perform(
     continuity: bool = True,
     breath: bool = False,
     pause_cap_ms: int = 300,
+    stress_enable: bool = True,
+    stress_gain_db: float = 2.0,
+    f0_restore: bool = True,
+    f0_expand_max: float = 1.4,
 ) -> Dict[str, Any]:
     """表演块编排（v2）：把台本行合并成「表演块」再逐块合成拼接。
 
@@ -127,11 +131,13 @@ def perform(
     # 响度指纹：挂载的 GPT run 训练时随 run.json 交付的数据集响度分布。
     # 逐块目标响度从它采样（爆发响/平静轻），没有指纹则保持旧行为。
     _loudness_fp: Dict[str, Any] = {}
+    _f0_fp: Dict[str, Any] = {}
     if lora_run:
         try:
             from webui_app.training import runs as _RN
             _rj = _RN.read_run(lora_run) or {}
             _loudness_fp = dict(_rj.get("loudness_fingerprint") or {})
+            _f0_fp = dict(_rj.get("f0_fingerprint") or {})
         except Exception:
             _loudness_fp = {}
     if _loudness_fp:
@@ -211,12 +217,15 @@ def perform(
                 cur["lines"].append(ln)
                 cur["tokens"] += cost
                 cur["intensity"] = max(cur["intensity"], ln.intensity)
+                cur["stress_words"] = list(dict.fromkeys(
+                    cur.get("stress_words", []) + list(ln.stress)))
                 joiner = "" if cur["text"][-1:] in "。！？…！？.!?\"" else "。"
                 cur["text"] = cur["text"] + joiner + ln.text
             else:
                 _close()
                 cur = {"emotion": ln.emotion, "lines": [ln], "tokens": cost,
-                       "intensity": ln.intensity, "text": ln.text}
+                       "intensity": ln.intensity, "text": ln.text,
+                       "stress_words": list(ln.stress)}
             # 戏剧性停顿拍：……/—— 结尾绝不与后文同块
             if cur is not None and cur["text"].endswith(("……", "…", "——", "—")):
                 _close()
@@ -527,8 +536,21 @@ def perform(
             # 底模先验管不着）——对块内静音做同样的中段压缩。块边界的
             # 台本停顿在拼接层，不受影响。
             if pause_cap_ms and int(pause_cap_ms) > 0:
-                wav = AL.cap_interior_pauses(wav, SR, int(pause_cap_ms),
-                                         thresh_db=-40.0)
+                wav = AL.cap_interior_pauses(wav.astype(np.float32) / 32768.0,
+                                             SR, int(pause_cap_ms),
+                                             thresh_db=-40.0)
+                wav = np.clip(wav * 32767.0, -32767,
+                              32767).astype(np.int16)
+
+            # ---- F0 音域恢复（WORLD 重合成，向角色指纹靠拢并扩张）----
+            if f0_restore and _f0_fp:
+                y = wav.astype(np.float32) / 32768.0
+                rr = AL.restore_f0_range(y, SR, _f0_fp,
+                                         intensity=blk["intensity"],
+                                         max_expand=float(f0_expand_max))
+                if rr.get("ok") and len(rr.get("y", [])) == len(wav):
+                    wav = np.clip(rr["y"] * 32767.0, -32767,
+                                  32767).astype(np.int16)
 
             # ---- 逐块响度（响度指纹迁移）：从角色自己的响度分布采样目标 ----
             # 爆发块从响端、平静块从轻端 —— "这句该响那句该轻"来自角色本人
@@ -539,6 +561,52 @@ def perform(
                 y = wav.astype(np.float32) / 32768.0
                 y = AL.apply_block_loudness(y, block_lufs)
                 wav = np.clip(y * 32767.0, -32767, 32767).astype(np.int16)
+
+            # ---- 词级重音（LLM/规则标注 + 字符时间映射 + 局部增益）----
+            stressed: List[str] = []
+            if stress_enable and stress_gain_db > 0 and blk.get("stress_words"):
+                try:
+                    _y = wav.astype(np.float32) / 32768.0
+                    _fr = int(SR * 0.025)
+                    _nn = len(_y) // _fr
+                    _sil = []
+                    if _nn >= 2:
+                        _rms = np.sqrt(np.mean(
+                            _y[:_nn * _fr].reshape(_nn, _fr) ** 2,
+                            axis=1) + 1e-12)
+                        _db = 20 * np.log10(_rms + 1e-10)
+                        _q = _db < -40.0
+                        _i2 = 0
+                        while _i2 < _nn:
+                            if _q[_i2]:
+                                _j2 = _i2
+                                while _j2 < _nn and _q[_j2]:
+                                    _j2 += 1
+                                if (_j2 - _i2) * 0.025 >= 0.12:
+                                    _sil.append((_i2 * 0.025,
+                                                 (_j2 - _i2) * 0.025))
+                                _i2 = _j2
+                            else:
+                                _i2 += 1
+                    _spans = AL.char_time_spans(blk_text, len(_y) / SR, _sil)
+                    _cand = []
+                    for w in blk["stress_words"]:
+                        idx = blk_text.find(w)
+                        if 0 <= idx and idx + len(w) <= len(_spans):
+                            _cand.append((_spans[idx][0],
+                                          _spans[idx + len(w) - 1][1], w))
+                    _cand.sort()
+                    _last_end = -1.0
+                    for a, b, w in _cand:
+                        if a >= _last_end:
+                            stressed.append(w)
+                            _last_end = b
+                    if _cand:
+                        wav = AL.apply_stress_gains(
+                            wav, SR, [(a, b) for a, b, _w in _cand],
+                            gain_db=float(stress_gain_db))
+                except Exception as e:
+                    log.warning("重音定位失败（跳过）：%s", e)
 
             wavs.append(wav)
             # 块后停顿 = 块末行的 pause_after_ms（导演层已按标点/情绪给量）；
@@ -552,6 +620,8 @@ def perform(
                 "emo_alpha": (emo_kw["emo_alpha"] if entry is not None else None),
                 "target_lufs": block_lufs,
                 "rolling_ref": used_rolling,
+                "stress": stressed,
+                "f0_restored": bool(f0_restore and _f0_fp),
                 "samples": int(wav.shape[0]),
                 "lines": [l.text for l in blk["lines"]],
             }

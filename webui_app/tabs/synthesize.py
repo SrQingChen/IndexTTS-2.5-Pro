@@ -646,6 +646,19 @@ def render(ctx: AppContext):
                         dir_pausecap_sl = W.make_component(
                             "director_pause_cap_ms",
                             value=int(ST.get("director_pause_cap_ms", 300)))
+                        dir_stress_cb = W.make_component(
+                            "director_stress",
+                            value=bool(ST.get("director_stress", True)))
+                    with gr.Row():
+                        dir_stressgain_sl = W.make_component(
+                            "director_stress_gain",
+                            value=float(ST.get("director_stress_gain", 2.0)))
+                        dir_f0cb = W.make_component(
+                            "director_f0_restore",
+                            value=bool(ST.get("director_f0_restore", True)))
+                        dir_f0exp_sl = W.make_component(
+                            "director_f0_expand",
+                            value=float(ST.get("director_f0_expand", 1.3)))
                     with gr.Accordion("🔌 LLM API 配置（OpenAI 兼容）",
                                       open=False) as api_acc:
                         _api_cfg = DR.load_api_config()
@@ -807,6 +820,8 @@ def render(ctx: AppContext):
         polish_cb, polish_presence, polish_exciter,
         director_cb, dir_backend, dir_character, dir_route, dir_scale_sl,
         dir_bon, dir_bon_keep, dir_breath_cb, dir_pausecap_sl,
+        dir_stress_cb, dir_stressgain_sl, dir_f0cb, dir_f0exp_sl,
+        dir_stress_cb, dir_stressgain_sl, dir_f0cb, dir_f0exp_sl,
     ]
 
     def _collect(*vals) -> Dict[str, Any]:
@@ -907,7 +922,8 @@ def render(ctx: AppContext):
          lora_cfm_run, lora_cfm_ckpt, lora_cfm_scale,
          pol_on, pol_presence, pol_exciter,
          dir_on, dir_backend, dir_character, dir_route, dir_scale,
-         dir_bon_n, dir_bon_keep, dir_breath_on, dir_pausecap) = vals
+         dir_bon_n, dir_bon_keep, dir_breath_on, dir_pausecap,
+         dir_stress_on, dir_stressgain, dir_f0on, dir_f0exp) = vals
         raw = _collect(*core)
         raw["emo_control_method"] = W.emo_mode_index(raw["emo_control_method"])
         # 记下本次参数快照，供「预设管理」页的「保存当前参数」使用
@@ -956,7 +972,11 @@ def render(ctx: AppContext):
                     bon_keep=bool(dir_bon_keep),
                     lora_run=str(lora_run or ""),
                     breath=bool(dir_breath_on),
-                    pause_cap_ms=int(dir_pausecap or 0))
+                    pause_cap_ms=int(dir_pausecap or 0),
+                    stress_enable=bool(dir_stress_on),
+                    stress_gain_db=float(dir_stressgain or 2.0),
+                    f0_restore=bool(dir_f0on),
+                    f0_expand_max=float(dir_f0exp or 1.4))
             else:
                 res = INF.generate(eng, req, progress=progress)
         except EngineError as e:
@@ -1815,7 +1835,7 @@ def render(ctx: AppContext):
          lrun, lckpt, lscale, crun, cckpt, cscale,
          pon, ppre, pexc, remember_on,
          d_on, d_backend, d_char, d_route, d_scale, d_bon, d_bkeep,
-         d_breath, d_pausecap) = vals
+         d_breath, d_pausecap, d_stress, d_sgain, d_f0on, d_f0exp) = vals
         return {
             "voice_name": voice_name or "",
             "prompt_audio": pa, "emo_audio": ea,
@@ -1847,6 +1867,10 @@ def render(ctx: AppContext):
             "director_bon": int(d_bon or 0),
             "director_bon_keep": bool(d_bkeep),
             "director_breath": bool(d_breath),
+            "director_stress": bool(d_stress),
+            "director_stress_gain": float(d_sgain or 2.0),
+            "director_f0_restore": bool(d_f0on),
+            "director_f0_expand": float(d_f0exp or 1.3),
             "director_pause_cap_ms": int(d_pausecap),
             "_remember": bool(remember_on),
         }
@@ -1926,6 +1950,7 @@ def render(ctx: AppContext):
         polish_cb, polish_presence, polish_exciter,
         director_cb, dir_route, dir_character, dir_scale_sl,
         dir_bon, dir_bon_keep, dir_breath_cb, dir_pausecap_sl,
+        dir_stress_cb, dir_stressgain_sl, dir_f0cb, dir_f0exp_sl,
         unlock_cap_cb, extrapolate_cb,
     ]
 
@@ -1977,6 +2002,10 @@ def render(ctx: AppContext):
             gr.update(value=bool(P.get("director_bon_keep").default)),     # 保留候选
             gr.update(value=bool(P.get("director_breath").default)),       # 吸气(默认关)
             gr.update(value=int(P.get("director_pause_cap_ms").default)),  # 块内停顿封顶
+            gr.update(value=bool(P.get("director_stress").default)),       # 词级重音
+            gr.update(value=float(P.get("director_stress_gain").default)), # 重音增益
+            gr.update(value=bool(P.get("director_f0_restore").default)),   # F0 恢复
+            gr.update(value=float(P.get("director_f0_expand").default)),   # F0 扩张
             gr.update(value=bool(P.get("emo_unlock_vector_cap").default)),  # 解锁上限
             gr.update(value=bool(P.get("emo_extrapolate").default)),     # 外推
         ]
