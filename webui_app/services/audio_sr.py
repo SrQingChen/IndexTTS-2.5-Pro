@@ -112,16 +112,57 @@ def release_all() -> Dict[str, Any]:
     return out
 
 
+CHUNK_SEC = 5.0            # 官方建议 ≤5.12s（>10.24s 会性能劣化——
+                           # 真机实测：16s 整条灌入时 11k 以上几乎不重建）
+CHUNK_OVERLAP_SEC = 0.25
+
+
+def _flatten(wav) -> "np.ndarray":
+    """AudioSR 返回形状实测为 (1,1,T)：必须**完全展平**到 1 维 ——
+    只降一维的 (1,T) 会被 soundfile 当成「T 个声道的单帧」而报
+    Format not recognised（真机首跑踩过）。"""
+    import numpy as np
+    arr = np.asarray(wav)
+    while arr.ndim > 1:
+        arr = (arr.mean(axis=0) if arr.shape[0] > 1
+               else arr.reshape(arr.shape[-1]))
+    return arr.astype(np.float32)
+
+
+def _enhance_chunk(model, y: "np.ndarray", in_sr: int, tmp_path: str,
+                   ddim_steps: int, guidance_scale: float, seed: int
+                   ) -> "np.ndarray":
+    """一段（≤5s）→ 48kHz 超分波形；按输入时长精确裁剪（AudioSR 会补零
+    到块边界——真机实测 16.37s 进 20.48s 出）。"""
+    import numpy as np
+    import soundfile as sf
+    from audiosr import pipeline as P
+    sf.write(tmp_path, y, in_sr, subtype="PCM_16")
+    wav = P.super_resolution(model, tmp_path, seed=seed,
+                             guidance_scale=guidance_scale,
+                             ddim_steps=int(ddim_steps))
+    out = _flatten(wav)
+    expect = int(len(y) * 48000 / in_sr)
+    if len(out) >= expect:
+        out = out[:expect]
+    else:                       # 理论不该短；防御性补零保持对齐
+        out = np.concatenate([out, np.zeros(expect - len(out),
+                                            dtype=np.float32)])
+    return out
+
+
 def enhance_file(path: str, out_path: Optional[str] = None,
                  ddim_steps: int = 35, guidance_scale: float = 3.5,
                  seed: int = 42) -> Dict[str, Any]:
-    """一条 22.05k 音频 → 48kHz 超分。返回 {ok, path, seconds, sr}。
+    """任意长度音频 → 48kHz 超分（分块 + 交叉淡化拼接）。
 
-    ddim_steps 默认 35（官方 200 太慢；35-50 在语音上质量差异小、
-    速度快 4-6 倍）。输出单声道 48k PCM_16。
+    ddim_steps 默认 35（官方 200 太慢；35-50 在语音上质量差异小）。
+    输入按 CHUNK_SEC 分块（官方 >10.24s 性能劣化的规避），块间
+    50ms 等功率淡化拼接；输出单声道 48k PCM_16、时长与输入严格一致。
     """
     import numpy as np
     import soundfile as sf
+    import tempfile
 
     if not os.path.isfile(path):
         raise AudioSRError(f"输入不存在：{path}")
@@ -132,37 +173,82 @@ def enhance_file(path: str, out_path: Optional[str] = None,
     log = LOG.get_logger("audio_sr")
     from webui_app.services import audio_lab as AL
     t0 = time.perf_counter()
+
+    y, in_sr = sf.read(path, dtype="float32")
+    if y.ndim > 1:
+        y = y.mean(axis=1)
+
+    hop = int((CHUNK_SEC - CHUNK_OVERLAP_SEC) * in_sr)
+    chunk_n = int(CHUNK_SEC * in_sr)
+    starts = list(range(0, max(1, len(y)), hop))
+    pieces: List = []
     with _LOCK:
         model = _get_model()
+        tmpdir = tempfile.mkdtemp(prefix="audiosr_chunk_")
         try:
-            from audiosr import pipeline as P
-            wav = P.super_resolution(
-                model, path, seed=seed, guidance_scale=guidance_scale,
-                ddim_steps=int(ddim_steps))
-            _STATE["infers"] += 1
-        except Exception as e:
-            raise AudioSRError(
-                f"超分推理失败：{type(e).__name__}: {e}") from e
+            for ci, st in enumerate(starts):
+                seg = y[st: st + chunk_n]
+                if len(seg) < int(0.2 * in_sr):
+                    # 尾巴太短并进上一块（避免超短块质量差）
+                    if pieces:
+                        prev_st = starts[ci - 1]
+                        seg = y[prev_st: st + len(seg)]
+                        pieces.pop()
+                    if len(seg) < int(0.2 * in_sr):
+                        continue
+                try:
+                    out = _enhance_chunk(
+                        model, seg, in_sr,
+                        os.path.join(tmpdir, f"c{ci:03d}.wav"),
+                        ddim_steps, guidance_scale, seed + ci)
+                    _STATE["infers"] += 1
+                    pieces.append(out)
+                except Exception as e:
+                    raise AudioSRError(
+                        f"超分推理失败（块 {ci + 1}/{len(starts)}）："
+                        f"{type(e).__name__}: {e}") from e
+        finally:
+            import shutil
+            shutil.rmtree(tmpdir, ignore_errors=True)
 
-    arr = np.asarray(wav)
-    if arr.ndim == 1:
-        y = arr.astype(np.float32)
-    else:
-        y = arr.mean(axis=0).astype(np.float32)
-    peak = float(np.max(np.abs(y))) if len(y) else 0.0
+    # 拼接：**整个重叠段**做等功率交叉淡化。首版只淡 50ms、剩余 200ms
+    # 重叠被双重追加（每条接缝 0.2s 重影）——真机复盘抓出的 bug。
+    ov = int(CHUNK_OVERLAP_SEC * 48000)
+    total = None
+    for p in pieces:
+        if total is None:
+            total = p.copy()
+            continue
+        w = min(ov, len(total), len(p))
+        if w > 0:
+            ramp_c = np.cos(np.linspace(0, np.pi / 2, w))
+            ramp_s = np.sin(np.linspace(0, np.pi / 2, w))
+            blended = (total[-w:] * ramp_c + p[:w] * ramp_s)
+            total = np.concatenate([total[:-w], blended, p[w:]])
+        else:
+            total = np.concatenate([total, p])
+    y_out = total if total is not None else np.zeros(1, np.float32)
+
+    expect_total = int(len(y) * 48000 / in_sr)
+    if len(y_out) > expect_total:
+        y_out = y_out[:expect_total]
+    elif len(y_out) < expect_total:
+        y_out = np.concatenate([y_out, np.zeros(
+            expect_total - len(y_out), dtype=np.float32)])
+    peak = float(np.max(np.abs(y_out))) if len(y_out) else 0.0
     if peak > 10 ** (-1.0 / 20.0):
-        y = y * (10 ** (-1.0 / 20.0) / peak)
-    sf.write(out_path, y, 48000, subtype="PCM_16")
+        y_out = y_out * (10 ** (-1.0 / 20.0) / peak)
+    sf.write(out_path, np.asarray(y_out, dtype=np.float32), 48000,
+             subtype="PCM_16")
 
     dt = time.perf_counter() - t0
     try:
         b0 = AL.band_profile(path)
         b1 = AL.band_profile(out_path)
-        log.info("超分完成：%s · %.1fs · 质心 %.0f→%.0f Hz · 3k+ %.1f%%→%.1f%%",
-                 os.path.basename(out_path), dt,
-                 b0.get("centroid", 0), b1.get("centroid", 0),
-                 sum(b0.get("bands", [])[3:]), sum(b1.get("bands", [])[3:]))
+        log.info("超分完成：%d 块 · %s · %.1fs · 质心 %.0f→%.0f Hz",
+                 len(pieces), os.path.basename(out_path), dt,
+                 b0.get("centroid", 0), b1.get("centroid", 0))
     except Exception:
         pass
     return {"ok": True, "path": out_path, "seconds": round(dt, 1),
-            "sr": 48000}
+            "sr": 48000, "chunks": len(pieces)}
