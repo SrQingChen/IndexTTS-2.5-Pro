@@ -27,6 +27,7 @@ from webui_app.services import emotion_bank as EBK
 from webui_app.services import inference as INF
 from webui_app.services import orchestrator as ORC
 from webui_app.services import pronunciation as PR
+from webui_app.services import progress_hub as PH
 from webui_app.services import synth_state as SS
 from webui_app import logging_setup as LOG
 from webui_app.services import voice_bank
@@ -667,7 +668,7 @@ def render(ctx: AppContext):
                     with gr.Row():
                         dir_pausecap_sl = W.make_component(
                             "director_pause_cap_ms",
-                            value=int(ST.get("director_pause_cap_ms", 300)))
+                            value=int(ST.get("director_pause_cap_ms", 220)))
                         dir_stress_cb = W.make_component(
                             "director_stress",
                             value=bool(ST.get("director_stress", True)))
@@ -1039,30 +1040,39 @@ def render(ctx: AppContext):
 
         try:
             progress(0.05, desc="准备中…")
-            if dir_on:
-                # 导演模式：文本 → 台本 → 逐句合成拼接
-                backend = "api" if str(dir_backend) == "api" else "rules"
-                sc = DR.direct((req.text or ""), backend=backend,
-                               character=str(dir_character or ""),
-                               seed=INF.resolve_seed(req.seed),
-                               pause_scale=float(dir_scale or 1.0))
-                res = ORC.perform(
-                    eng, req, sc,
-                    route=bool(dir_route),
-                    character=str(dir_character or ""),
-                    extrapolate=bool(req.emo_extrapolate),
-                    progress=progress,
-                    bon_n=int(dir_bon_n or 0),
-                    bon_keep=bool(dir_bon_keep),
-                    lora_run=str(lora_run or ""),
-                    breath=bool(dir_breath_on),
-                    pause_cap_ms=int(dir_pausecap or 0),
-                    stress_enable=bool(dir_stress_on),
-                    stress_gain_db=float(dir_stressgain or 2.0),
-                    f0_restore=bool(dir_f0on),
-                    f0_expand_max=float(dir_f0exp or 1.4))
-            else:
-                res = INF.generate(eng, req, progress=progress)
+            # 进度落盘 + 心跳（与一键三连同款体验）：长合成在 indextts.log
+            # 里有 [xx%] 阶段流水，静默 >15s 心跳报「仍在进行」——浏览器
+            # 切走后也能从日志区分「在工作」和「卡死了」。
+            _lp = PH.LoggedProgress(LOG.get_logger("synth"),
+                                    user_progress=progress)
+            _lp.start()
+            try:
+                if dir_on:
+                    # 导演模式：文本 → 台本 → 逐句合成拼接
+                    backend = "api" if str(dir_backend) == "api" else "rules"
+                    sc = DR.direct((req.text or ""), backend=backend,
+                                   character=str(dir_character or ""),
+                                   seed=INF.resolve_seed(req.seed),
+                                   pause_scale=float(dir_scale or 1.0))
+                    res = ORC.perform(
+                        eng, req, sc,
+                        route=bool(dir_route),
+                        character=str(dir_character or ""),
+                        extrapolate=bool(req.emo_extrapolate),
+                        progress=_lp,
+                        bon_n=int(dir_bon_n or 0),
+                        bon_keep=bool(dir_bon_keep),
+                        lora_run=str(lora_run or ""),
+                        breath=bool(dir_breath_on),
+                        pause_cap_ms=int(dir_pausecap or 0),
+                        stress_enable=bool(dir_stress_on),
+                        stress_gain_db=float(dir_stressgain or 2.0),
+                        f0_restore=bool(dir_f0on),
+                        f0_expand_max=float(dir_f0exp or 1.4))
+                else:
+                    res = INF.generate(eng, req, progress=_lp)
+            finally:
+                _lp.stop()
         except EngineError as e:
             gr.Error(str(e))
             return (gr.update(), T.err(f"<b>合成失败</b>：{e}"),

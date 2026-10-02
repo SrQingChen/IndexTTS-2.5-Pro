@@ -125,6 +125,34 @@ def main() -> int:
               _b16.astype(np.float32) / 32768.0) + 20.0) < 0.1,
           f"{AL.rms_dbfs(_b16.astype(np.float32) / 32768.0):.1f}")
 
+    # ---- 3c. 软停顿封顶回归（2026-10-02 句内停顿过长事故）----
+    # 模型生成的停顿带气声/吸气，实测能量主体在 -40~-30dB：旧阈值
+    # -40dB 判不出来 → 完全逃过封顶（成品软停顿最长 0.98s）。判定线
+    # 提到 -30dB 抓住全部软停顿；时长下限 + 只截中段保护语音内容。
+    _sr_l = SR
+    _speech = _tone(0.8, 0.5)
+    # RMS 恰为 -33dBFS 的「气声停顿」：正弦幅度 = 10^(-33/20)×√2
+    # —— 介于新旧判定线之间：-40dB 判不出、-30dB 判得出
+    _gap = (10 ** (-33 / 20.0) * np.sqrt(2.0) *
+            np.sin(2 * np.pi * 120 * np.arange(int(0.5 * _sr_l)) / _sr_l)
+            ).astype(np.float32)
+    _y_soft = np.concatenate([_speech, _gap, _speech])
+    _capped = AL.cap_interior_pauses(_y_soft, _sr_l, 220, thresh_db=-30.0)
+    check("软停顿（-33dB）被 -30dB 判定线抓住并压到 220ms",
+          len(_capped) <= len(_y_soft) - int(0.2 * _sr_l),
+          f"{len(_y_soft)/_sr_l:.2f}s → {len(_capped)/_sr_l:.2f}s")
+    _missed = AL.cap_interior_pauses(_y_soft, _sr_l, 220, thresh_db=-40.0)
+    check("对照组：旧阈值 -40dB 判不出软停顿（事故机理复现）",
+          len(_missed) == len(_y_soft),
+          f"{len(_missed)/_sr_l:.2f}s（未压缩）")
+    _hard = np.concatenate([
+        _speech, np.zeros(int(0.5 * _sr_l), np.float32), _speech])
+    _capped2 = AL.cap_interior_pauses(_hard, _sr_l, 220, thresh_db=-30.0)
+    check("数字静音照常封顶且语音/衰减不动",
+          len(_capped2) <= len(_hard) - int(0.2 * _sr_l)
+          and len(_capped2) >= len(_hard) - int(0.3 * _sr_l),
+          f"{len(_hard)/_sr_l:.2f}s → {len(_capped2)/_sr_l:.2f}s")
+
     print("== 4. 呼吸库（检测/建库/插入决策） ==")
     from webui_app.services import breath_bank as BB
     # 合成"吸气":低幅高频噪声 0.3s → 语音 0.8s
