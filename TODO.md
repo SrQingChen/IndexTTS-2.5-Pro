@@ -1471,3 +1471,46 @@ Interspeech 2007 / PMC8874014 / PMC10374040）。两者叠加造成「句内
 
 loudness **35/35** · oneclick 280 · synth_state 35 · progress 8 ·
 build/ui_output 过。真机 replay 确认层级恢复。需重启 WebUI 生效。
+
+## 阶段 22 · 末字截断 + 日志窗 + 音色联动 + 缓存可见性（2026-10-02 深夜）
+
+### A. 末字截断：BoN 挑中了 GPT 偶发截尾的候选
+
+取证：用户最后一次合成（181727）末字被截。成品尾部 pad 掩盖现场，
+追到 BON 备份块——blk_0001_best 在 -14.8dB 浊音中**直接接数字零**
+（引擎原始输出就截了）。历史块全部有自然收尾 → **非系统性**，是该
+候选的 GPT 偶发提前 EOS。SenseVoice 转写**容错补全**缺尾音的句子
+（「我就是讨厌这样的生存方式。」照常认出），reward 的 WER 项扣不到
+分——坏候选 reward 0.94 照样登顶。
+
+修复：orchestrator 加模块级 `_tail_truncation_penalty(path)`——正常
+候选结尾必有收束衰减，最后 100ms 仍在语音电平（>-25dB）即判截断罚
+0.30（只影响候选间相对排序）。实测：硬切夹具 0.30、正常收尾 0.0。
+
+### B. 过程日志窗（实时）
+
+输出区下方新增「过程日志（实时）」Textbox：on_generate 把进度行写进
+`ctx.shared["synth_log"]`（deque maxlen=150，AnyIO 写 / Timer 读线程
+安全），`gr.Timer(1.0).tick` 每秒拉取显示——项目里已有 3 处 Timer 先
+例。LoggedProgress 加可选 `sink` 参数（进度+心跳同步写入）。失败/
+成功分支也补日志行，有始有终。
+
+### C. 音色 → 导演角色名联动修复
+
+`on_voice_to_character` 旧逻辑「dir_character 里有自定义名时尊重之、
+直接早返回」实测挡死了联动（用户每次换音色角色名都不跟）。选音色是
+明确意图信号：去掉挡板，总是同步角色名 + 刷档案；同名早退仅保留
+「不重刷档案」（保住手动调过的 LoRA 强度）。
+
+### D. 导演台本缓存可见性
+
+取证：缓存**一直在生效**（15:34/16:47/17:28/18:07 四次「台本缓存命
+中」0 开销），18:17 那次 5.6s 是改了台词必跑（key=文本+角色+停顿系
+数）。慢的主体是 BoN 合成不是导演层。改进：perform 返回的 director
+dict 加 `cache_hit`，完成信息新增「导演台本」行——「⚡ 缓存命中」vs
+「🤖 LLM 重新生成」肉眼可见。
+
+### 验收
+
+尾部惩罚专项 2/2 · progress 8 · loudness 35/35 · oneclick 280 ·
+synth_state 35 · build/ui_output 过。需重启 WebUI 生效。

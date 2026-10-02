@@ -34,8 +34,32 @@ from webui_app.services.engine import EngineError, TTSEngine
 SR = 22050  # 官方输出采样率（int16 单声道）
 
 
+def _tail_truncation_penalty(path: str) -> float:
+    """候选末字被截的惩罚（BoN 专用，2026-10-02）。
+
+    AR 模型偶发 EOS 提前，末字在语音中戛然而止（实测某候选尾部
+    -14.8dB 直接接数字零）。SenseVoice 转写会**容错补全**缺尾音的
+    句子，reward 的 WER 项扣不到分 —— 坏候选照样可能被选中。用
+    波形尾部检查兜底：正常候选结尾必有收束衰减，最后 100ms 仍在
+    语音电平（>-25dB）即判截断。只影响候选间相对排序，保守罚分。
+    模块级便于探针直测。
+    """
+    try:
+        import soundfile as sf
+        y, sr = sf.read(path, dtype="float32")
+        if y.ndim > 1:
+            y = y.mean(axis=1)
+        n = int(min(0.10, len(y) / sr) * sr)
+        if n < int(0.05 * sr):
+            return 0.0
+        tail = y[-n:]
+        rms = 20.0 * np.log10(np.sqrt(np.mean(tail ** 2)) + 1e-12)
+        return 0.30 if rms > -25.0 else 0.0
+    except Exception:
+        return 0.0
+
+
 def _read_mono_int16(path: str) -> np.ndarray:
-    """读一个官方输出的 wav → (T,) int16。失败抛 EngineError。"""
     try:
         import soundfile as sf
         data, sr = sf.read(path, dtype="int16", always_2d=False)
@@ -399,7 +423,7 @@ def perform(
                           emo_ref_path=(emo_ref or None))
         if not r.get("ok") or r.get("reward") is None:
             return -1.0
-        return float(r["reward"])
+        return float(r["reward"]) - _tail_truncation_penalty(path)
 
     # 逐块目标响度：先采完整序列再做**限步平滑**（首块=中位，相邻 ≤2.5dB）
     # —— 独立采样在宽分布角色上会 ±9dB 跳变，听感「忽高忽低」/混响抽吸
@@ -745,6 +769,9 @@ def perform(
             "backend": script.backend, "n": n, "routed": routed,
             "fallback": fallback, "bon_n": bon_n,
             "lines_in": len(script.lines),
+            # 台本缓存命中（cached_api_direct 的 note 标记）——UI 显示
+            # 「缓存命中/LLM 重新生成」，让省掉的 LLM 调用肉眼可见。
+            "cache_hit": (script.note == "cache-hit"),
             "bon_kept": sum(1 for x in line_infos
                             if (x.get("bon") or {}).get("best_path")),
             "avg_pause_ms": (sum(x["pause_after_ms"] for x in line_infos[:-1])

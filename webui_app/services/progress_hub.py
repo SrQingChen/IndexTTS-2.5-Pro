@@ -43,16 +43,27 @@ class LoggedProgress:
 
     def __init__(self, log: Any, user_progress: Optional[ProgressFn] = None,
                  heartbeat_idle: float = 15.0, period: float = 5.0,
-                 info_every: float = 5.0):
+                 info_every: float = 5.0, sink: Optional[Any] = None):
         self._log = log
         self._user = user_progress
         self._idle = float(heartbeat_idle)
         self._period = float(period)
         self._info_every = float(info_every)
+        # sink：可选择的行缓冲（如 collections.deque(maxlen=N)），每条进度
+        # 与心跳同步写入 —— 给 UI 的实时日志窗（gr.Timer 轮询）供料。
+        # append 必须线程安全（AnyIO 回调线程 + 心跳线程都会写）。
+        self._sink = sink
         self._last = {"t": time.time(), "msg": "启动", "frac": 0.0,
                       "info_t": 0.0}
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
+
+    def _push(self, line: str) -> None:
+        if self._sink is not None:
+            try:
+                self._sink.append(line)
+            except Exception:
+                pass
 
     # -- 作为 progress 回调使用 -------------------------------------------
     def __call__(self, frac: float, msg: str = "", **kw) -> None:
@@ -69,6 +80,7 @@ class LoggedProgress:
             self._log.info("[%3.0f%%] %s", float(frac) * 100, msg)
         else:
             self._log.debug("[%3.0f%%] %s", float(frac) * 100, msg)
+        self._push(f"[{float(frac) * 100:3.0f}%] {msg}")
         if self._user is not None:
             try:
                 if kw:
@@ -103,5 +115,8 @@ class LoggedProgress:
             idle = time.time() - self._last["t"]
             if idle < self._idle:
                 continue
+            line = (f"…仍在进行 · 已静默 {idle:.0f} 秒 · "
+                    f"最后进度：{self._last['msg']}")
             self._log.info("…仍在进行 · 已静默 %.0f 秒 · 最后进度：%s",
                            idle, self._last["msg"])
+            self._push(line)

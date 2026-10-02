@@ -725,6 +725,14 @@ def render(ctx: AppContext):
                     label="超分 48k 结果（仅勾选「自动超分」或手动超分后产出）",
                     type="filepath", show_download_button=True)
                 out_info = gr.HTML("")
+                # 实时过程日志：on_generate 把进度行写进 ctx.shared 的
+                # 缓冲，这里用 Timer 每秒半拉一次 —— 与一键三连的日志
+                # 体验对齐，浏览器切走回来也能看到全过程。
+                synth_log_out = gr.Textbox(
+                    label="过程日志（实时）", lines=9, max_lines=16,
+                    interactive=False, autoscroll=True,
+                    placeholder="点「生成」后这里会实时打印合成各阶段的进度…",
+                    elem_id="ix-synth-log")
 
         # =================================================================
         # 右栏
@@ -1013,6 +1021,12 @@ def render(ctx: AppContext):
         # 自动超分的产出走第 6 个输出（out_audio_sr）；提前 return 的分支
         # 也要带上它（gr.update() = 不动第二个输出窗）。
         sr_out_val = gr.update()
+        # 本次任务的实时日志缓冲：LoggedProgress 写、gr.Timer 轮询显示。
+        # deque 线程安全（AnyIO 回调线程写、Timer 线程读），限长防长任务
+        # 无界增长。
+        from collections import deque as _deque
+        _log_sink = _deque(maxlen=150)
+        ctx.shared["synth_log"] = _log_sink
 
         if not eng.loaded:
             gr.Warning("模型尚未加载，正在自动加载…（首次约 20~30 秒）")
@@ -1021,6 +1035,7 @@ def render(ctx: AppContext):
                 eng.load()
             except EngineError as e:
                 gr.Error(str(e))
+                _log_sink.append(f"✗ 引擎加载失败：{e}")
                 return (gr.update(),
                         T.err(f"<b>加载失败</b>：{e}"),
                         ctx.status_html(),
@@ -1033,6 +1048,7 @@ def render(ctx: AppContext):
             lora_cfm_run, lora_cfm_ckpt, lora_cfm_scale)
         if not lora_ok:
             gr.Error(lora_note.replace("<br>", " "))
+            _log_sink.append(f"✗ {lora_note.replace('<br>', ' ')}")
             return (gr.update(),
                     T.err(f"<b>未合成</b>：{lora_note}"),
                     ctx.status_html(), _lora_state_html(eng), gr.update(),
@@ -1044,7 +1060,7 @@ def render(ctx: AppContext):
             # 里有 [xx%] 阶段流水，静默 >15s 心跳报「仍在进行」——浏览器
             # 切走后也能从日志区分「在工作」和「卡死了」。
             _lp = PH.LoggedProgress(LOG.get_logger("synth"),
-                                    user_progress=progress)
+                                    user_progress=progress, sink=_log_sink)
             _lp.start()
             try:
                 if dir_on:
@@ -1075,11 +1091,13 @@ def render(ctx: AppContext):
                 _lp.stop()
         except EngineError as e:
             gr.Error(str(e))
+            _log_sink.append(f"✗ 合成失败：{e}")
             return (gr.update(), T.err(f"<b>合成失败</b>：{e}"),
                     ctx.status_html(), _lora_state_html(eng), gr.update(),
                     sr_out_val)
         except Exception as e:
             gr.Error(f"{type(e).__name__}: {e}")
+            _log_sink.append(f"✗ 合成失败：{type(e).__name__}: {e}")
             return (gr.update(),
                     T.err(f"<b>合成失败</b>：{type(e).__name__}: {e}"),
                     ctx.status_html(), _lora_state_html(eng), gr.update(),
@@ -1107,6 +1125,10 @@ def render(ctx: AppContext):
                          f'{d.get("lines_in", d["n"])} 行 → {d["n"]} 块 · '
                          f'`{d["backend"]}` 后端 · 块间均停顿 '
                          f'{d["avg_pause_ms"]:.0f} ms（块内零人工静音）'))
+            rows.append(("导演台本",
+                         "⚡ 缓存命中（同文本/角色/停顿系数，0 开销）"
+                         if d.get("cache_hit")
+                         else "🤖 LLM 重新生成（改台词后首次必跑，之后命中缓存）"))
             if d.get("bon_n"):
                 rows.append(("逐句择优",
                              f'每句 {d["bon_n"]} 候选 · reward 重排'
@@ -1158,6 +1180,8 @@ def render(ctx: AppContext):
                 "逐块独立合成后拼接。块与块之间韵律不接续是正常现象，不是 bug。"
                 "缓解办法见「参数手册 → 显存策略 → 低显存自动分块」。")
 
+        _log_sink.append(f"✅ 合成完成 · 共 {res.get('audio_duration', 0):.1f}s 音频")
+
         # ---- 自动超分（勾选「生成后自动超分」时）----
         # 一条龙：卸引擎 → AudioSR 48k → 卸 AudioSR → 重载引擎。产出进
         # 第二个输出窗，原始 22k 结果原样保留在第一个窗（对比听）。
@@ -1177,6 +1201,16 @@ def render(ctx: AppContext):
 
         return (out_audio_value, info, ctx.status_html(),
                 _lora_state_html(eng), pol_report, sr_out_val)
+
+    def _poll_synth_log():
+        d = ctx.shared.get("synth_log")
+        if not d:
+            return gr.update()      # 没有任务在跑：不动日志窗
+        return "\n".join(d)
+
+    _synth_log_timer = gr.Timer(value=1.0, active=True)
+    _synth_log_timer.tick(_poll_synth_log, inputs=None,
+                          outputs=[synth_log_out])
 
     gen_btn.click(
         on_generate, inputs=all_inputs,
@@ -1274,21 +1308,22 @@ def render(ctx: AppContext):
         return tuple(gr.update() for _ in range(_PROFILE_OUTS - 1))
 
     def on_voice_to_character(voice_name, current):
-        """选音色库条目 → 带出角色名 → **串联带入该角色的双通道档案**。
+        """选音色库条目 → **总是**同步角色名 → 串联带入该角色的双通道档案。
 
         必须在这里串联：gr.update 程序化设值不会触发 dir_character.change
         （本工程的既知约定），只绑 change 的话走「选音色」这条主路径时
-        档案永远不生效。角色名没变时不动档案（避免覆盖手动调整）。
+        档案永远不生效。
+
+        2026-10-02：去掉「用户自定义角色名优先」的挡板 —— 用户实测选了
+        音色但角色名不跟（旧逻辑在 dir_character 里有非音色库名时直接
+        早返回），导致导演台命名与音色不匹配。选音色是明确的意图信号，
+        总是同步；同名早退仅用于不重刷档案（保住手动调过的 LoRA 强度）。
         """
         v = (voice_name or "").strip()
         cur = (current or "").strip()
         if not v:
             return (gr.update(), *_noop_profile_outs())
-        if cur and cur not in voice_bank.names():
-            # 用户自定义的角色名，尊重之；但若与所选音色同名仍刷一次档案
-            if v != cur:
-                return (gr.update(), *_noop_profile_outs())
-        elif v == cur:
+        if v == cur:
             return (gr.update(), *_noop_profile_outs())
         ups, status = _profile_apply_updates(v)
         if ups is None:
