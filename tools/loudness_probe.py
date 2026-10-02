@@ -180,17 +180,22 @@ def main() -> int:
           abs(len(_blk1) - len(_t3) - (0.30 - 0.02) * SR) < 0.05 * SR,
           f"截了 {(len(_blk1) - len(_t3)) / SR:.2f}s")
 
-    # ---- 3e. 块内停顿配额制（2026-10-02 散感彻底根治回归）----
-    # 产品规范（用户原话）：短句内 0 个明显停顿、长句最多 1 处。
-    # 实测引擎输出 44~53 停顿/分钟（参考 28 + AR 先验放大），
-    # 时长封顶治了长治不了多 —— 配额制治数量。
+    # ---- 3e. 块内停顿「门槛-配额-时长」治理（2026-10-02 第四轮）----
+    # 去气口版本的教训：无门槛移除静音把 25~100ms 的塞音闭合/词间隙也删了
+    # （每块 10+ 个，实测实锤）→ 字被削、每字独立合成。现三治理：
+    # min_run 150ms 门槛保结构 + 配额管数量 + 配额外压 35ms 微气口。
     _qy = np.concatenate([
         _tone(1.0, 0.5), np.zeros(int(0.30 * SR), np.float32),
         _tone(0.5, 0.5), np.zeros(int(0.40 * SR), np.float32),
         _tone(0.8, 0.5), np.zeros(int(0.25 * SR), np.float32),
         _tone(0.6, 0.5)])
+    # 塞音闭合夹具：语音里嵌 0.06/0.09s 的闭合段（正常语音结构）
+    _qy_closure = np.concatenate([
+        _tone(0.4, 0.5), np.zeros(int(0.06 * SR), np.float32),
+        _tone(0.4, 0.5), np.zeros(int(0.09 * SR), np.float32),
+        _tone(0.4, 0.5)])
 
-    def _sil_ge80(v):
+    def _sil_ge(v, min_ms):
         fr = int(SR * 0.025)
         n = len(v) // fr
         ee = np.sqrt(np.mean(v[: n * fr].reshape(n, fr) ** 2, axis=1)
@@ -203,7 +208,7 @@ def main() -> int:
                 jj = ii
                 while jj < n and qq[jj]:
                     jj += 1
-                if (jj - ii) * 0.025 >= 0.08:
+                if (jj - ii) * 0.025 * 1000 >= min_ms:
                     cnt += 1
                 ii = jj
             else:
@@ -214,32 +219,33 @@ def main() -> int:
           AL.pause_quota(12) == 0 and AL.pause_quota(13) == 1
           and AL.pause_quota(27) == 1 and AL.pause_quota(28) == 2
           and AL.pause_quota(40) == 2)
+    _rc = AL.normalize_intra_pauses(_qy_closure, SR, text_chars=11,
+                                    cap_ms=220)
+    # 帧化粒度：25ms 帧测量静音会短 20-25ms（60ms 量成 ~50ms），
+    # 阈值取 45ms；长度不变才是保护生效的硬证据
+    check("塞音闭合保护：60/90ms 闭合段原样保留（去气口事故回归）",
+          _sil_ge(_rc, 45) == 2 and len(_rc) == len(_qy_closure),
+          f"处理后 {_sil_ge(_rc, 45)} 个 · 长度 {len(_qy_closure)/SR:.2f}"
+          f"→{len(_rc)/SR:.2f}s")
     _r0 = AL.normalize_intra_pauses(_qy, SR, text_chars=11, cap_ms=220)
-    check("短句（11字）块内停顿清零（去气口）",
-          _sil_ge80(_r0) == 0,
-          f"剩 {_sil_ge80(_r0)} 个 ≥80ms 停顿")
-    # 去气口不引入异常跳变：纯正弦夹具上交叉淡化会叠加两段不同相位的
-    # 正弦（斜率≤2×，预期物理），放 2.5× 余量；真机的绝对阈值不可用
-    # （22k 齿音段相邻跳变本可达峰值 180%）
-    _jump_in = float(np.max(np.abs(np.diff(_qy))))
-    _jump_out = float(np.max(np.abs(np.diff(_r0))))
-    check("去气口不引入异常跳变（≤2.5×输入）",
-          _jump_out < 2.5 * _jump_in + 1e-4,
-          f"maxΔ {_jump_in:.4f} → {_jump_out:.4f}")
+    check("短句（11字）模型停顿全部压到微气口（无 ≥80ms 残留）",
+          _sil_ge(_r0, 80) == 0,
+          f"剩 {_sil_ge(_r0, 80)} 个 ≥80ms")
     _len_shrink = (len(_qy) - len(_r0)) / SR
-    check("超配额停顿被整体移除（时长收缩 ≈ 0.95s 静音）",
-          0.85 < _len_shrink < 1.05, f"收缩 {_len_shrink:.2f}s")
+    # 0.30+0.40+0.25 = 0.95s 静音，各压到 35ms：收缩 ≈ 0.845s
+    check("配额外停顿压到 35ms 微气口（时长收缩 ≈ 0.85s）",
+          0.75 < _len_shrink < 0.95, f"收缩 {_len_shrink:.2f}s")
     _r1 = AL.normalize_intra_pauses(_qy, SR, text_chars=20, cap_ms=220)
     check("中句（20字）保留恰好 1 个停顿",
-          _sil_ge80(_r1) == 1)
+          _sil_ge(_r1, 80) == 1)
     _r2 = AL.normalize_intra_pauses(_qy, SR, text_chars=35, cap_ms=220)
     check("长句（35字）保留恰好 2 个停顿",
-          _sil_ge80(_r2) == 2)
+          _sil_ge(_r2, 80) == 2)
     _r16 = AL.normalize_intra_pauses(
         (_qy * 32767).astype(np.int16), SR, text_chars=11, cap_ms=220)
-    check("配额制 int16 直传正常（尺度陷阱防复发）",
-          _r16.dtype == np.int16 and _sil_ge80(
-              _r16.astype(np.float32) / 32768.0) == 0)
+    check("int16 直传正常（尺度陷阱防复发）",
+          _r16.dtype == np.int16 and _sil_ge(
+              _r16.astype(np.float32) / 32768.0, 80) == 0)
 
     print("== 4. 呼吸库（检测/建库/插入决策） ==")
     from webui_app.services import breath_bank as BB

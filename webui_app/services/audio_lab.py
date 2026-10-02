@@ -1635,21 +1635,24 @@ def pause_quota(n_chars: int) -> int:
 
 def normalize_intra_pauses(y: np.ndarray, sr: int, text_chars: int,
                            cap_ms: float = 220.0,
-                           blend_ms: float = 30.0,
+                           floor_ms: float = 35.0,
+                           min_run_ms: float = 150.0,
                            thresh_db: float = -30.0) -> np.ndarray:
-    """块内停顿「数量+时长+衔接」三治理（2026-10-02 第三轮：连贯感）。
+    """块内停顿「门槛-配额-时长」三治理（2026-10-02 第四轮：修去气口误伤）。
 
-    超配额的微停顿不再「压短留洞」——那会留下 [词A衰减尾][静音][词B
-    起音] 的「两次说话」结构（用户听感：一句话内两个词完全不像一次
-    说出来的）。语音学事实：真人句内停顿优先表现为**末音节延长**而
-    非静音切段（hesitation phonetics）。改用播客工业的去气口（debreathe）
-    技术：整段移除静音 run，两侧 30ms **等功率交叉淡化**——词 A 的
-    衰减尾直接流入词 B 的起音，听感是「一个词拖长了一点点尾音」，
-    无跃变。配额内保留的停顿（戏剧拍）照旧中段截法压到 cap_ms，
-    留自然静音——那是有意的断句。
+    **去气口版本的教训（真机实锤）**：上一版把所有 ≥25ms 的静音段整段
+    移除——但 25~100ms 的静音是**塞音闭合**（p/t/k/d/g 闭合期）与自然
+    词间隙，是语音结构的一部分（实测每块 10+ 个）。移除它们 = 字的辅音
+    被削、词间隙清零 = 「每个字都是独立合成的」。修复：
 
-    背景（实测）：音色库参考 28 停顿/分钟语音 + AR 先验放大 → 引擎输出
-    44~53 个/分钟。首尾 50ms 不参与；int16/float 均可，返回原 dtype。
+    · **min_run_ms 门槛**：低于它的静音段完全不碰（保护正常语音结构，
+      文献：塞音闭合 30~100ms、词间隙 50~150ms）；
+    · **配额**（pause_quota）：配额内的停顿压到 cap_ms（保留的断句）；
+    · **配额外的**压到 floor_ms=35ms（防粘连微气口，不归零也不留大洞，
+      中段截 + 5ms 切口淡化；调型收束无法在音频域消除，留微隙缓冲）。
+
+    背景：参考 28 停顿/分钟 + AR 放大 → 引擎输出 44~53 个/分钟。
+    int16/float 均可，返回保持原 dtype。
     """
     if not cap_ms or float(cap_ms) <= 0 or len(y) < sr // 4:
         return y
@@ -1666,15 +1669,18 @@ def normalize_intra_pauses(y: np.ndarray, sr: int, text_chars: int,
     edge = int(0.05 * sr)
     lo_frame = edge // hop
     hi_frame = max(lo_frame, (len(yf) - edge) // hop)
+    min_run = int(sr * float(min_run_ms) / 1000.0)
 
-    runs = []          # (start_sample, end_sample)
+    runs = []
     i = lo_frame
     while i < hi_frame:
         if quiet[i]:
             j = i
             while j < hi_frame and quiet[j]:
                 j += 1
-            runs.append((i * hop, min(len(yf), j * hop)))
+            a, b = i * hop, min(len(yf), j * hop)
+            if b - a >= min_run:          # 门槛：短段是正常语音结构，不碰
+                runs.append((a, b))
             i = j
         else:
             i += 1
@@ -1684,36 +1690,23 @@ def normalize_intra_pauses(y: np.ndarray, sr: int, text_chars: int,
     keep = set(sorted(range(len(runs)), key=lambda k: -(runs[k][1] - runs[k][0]))
                [:quota]) if quota else set()
     fade = max(1, int(0.005 * sr))
-    ov = max(2, int(sr * float(blend_ms) / 1000.0))
     out = yf
     for k in range(len(runs) - 1, -1, -1):
         a, b = runs[k]
-        if k in keep:
-            # 配额内：中段截法压到 cap_ms（保留自然静音的有意断句）
-            target = int(sr * float(cap_ms) / 1000.0)
-            if b - a <= target:
-                continue
-            mid_a = a + target // 2
-            mid_b = b - (target - target // 2)
-            out = np.concatenate([out[:mid_a], out[mid_b:]])
-            if len(out) > mid_a + fade:
-                out[mid_a:mid_a + fade] *= np.linspace(
-                    1.0, 0.0, fade, dtype=np.float32)
-            if mid_a - fade >= 0:
-                out[mid_a - fade:mid_a] *= np.linspace(
-                    0.0, 1.0, fade, dtype=np.float32)
-        else:
-            # 超配额：去气口——整段移除静音 run，两侧等功率交叉淡化
-            left = out[:a].copy()
-            right = out[b:].copy()
-            o = min(ov, len(left), len(right))
-            if o > 1:
-                w = np.linspace(0.0, np.pi / 2, o, dtype=np.float32)
-                left[-o:] = (left[-o:] * np.cos(w)
-                             + right[:o] * np.sin(w))
-                out = np.concatenate([left, right[o:]])
-            else:
-                out = np.concatenate([left, right])
+        target = int(sr * (float(cap_ms) if k in keep else float(floor_ms))
+                     / 1000.0)
+        if b - a <= target:
+            continue
+        # 中段截法：切口在静音深处，两侧 5ms 线性淡化防毛刺
+        mid_a = a + target // 2
+        mid_b = b - (target - target // 2)
+        out = np.concatenate([out[:mid_a], out[mid_b:]])
+        if len(out) > mid_a + fade:
+            out[mid_a:mid_a + fade] *= np.linspace(
+                1.0, 0.0, fade, dtype=np.float32)
+        if mid_a - fade >= 0:
+            out[mid_a - fade:mid_a] *= np.linspace(
+                0.0, 1.0, fade, dtype=np.float32)
 
     if was_int:
         return np.clip(out * 32767.0, -32767, 32767).astype(np.int16)
