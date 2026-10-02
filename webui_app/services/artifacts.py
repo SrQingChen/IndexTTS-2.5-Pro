@@ -44,14 +44,17 @@ from webui_app.services.monitor import human_size
 CATEGORIES: List[Tuple[str, str, str, str]] = [
     ("oneclick",  "🚀", "一键三连产物", "outputs/oneclick/ 下各候选的评选试听与报告"),
     ("eval",      "🧪", "A/B 评测产物", "outputs/eval/ 下的对比评测输出"),
+    ("bon",       "🎭", "BoN 候选备份", "outputs/bon/ 下逐句择优保留的最优/最差候选（对齐页 DPO 可引用）"),
     ("train_run", "🎓", "训练运行",     "training_runs/ 下的 LoRA 运行（adapter + 保险库 checkpoint + 日志）"),
     ("lora",      "📦", "LoRA 导出",    "outputs/lora/ 下导出的独立权重"),
     ("train_int", "⚙️", "训练中间文件", "outputs/train/ 下的训练中间产物"),
     ("dataset",   "🗃", "数据集",       "datasets/ 下的数据集（音频 + 文本 + 已提取特征）"),
     ("voice",     "🎙", "音色库条目",   "voice_bank/ 中保存的音色（含体检记录）"),
+    ("emotion",   "😊", "情感参考库",   "emotion_bank/ 中入库的情感参考（导演台情感路由用）"),
     ("lab",       "🔬", "工作台切片",   "outputs/lab/ 下的智能切片与降噪归一文件"),
-    ("synth",     "🔊", "合成音频",     "outputs/ 根目录下的单次合成结果"),
+    ("synth",     "🔊", "合成音频",     "outputs/ 根目录下的单次合成结果（含台本旁车）"),
     ("batch",     "🧾", "批量任务",     "outputs/tasks/ 下的批量合成产物"),
+    ("state",     "🧭", "导演台与状态", "outputs/state/ 下的台本缓存 / LLM 配置 / 参数记忆等（删除后果见各条说明）"),
     ("cache",     "💨", "缓存",         "outputs/cache/，删了下次使用会自动重建"),
 ]
 
@@ -133,9 +136,10 @@ class ScanResult:
 def scan(cfg: AppConfig) -> ScanResult:
     """盘点全部产物目录。只读磁盘，不加载任何模型。"""
     res = ScanResult(scanned_at=time.time())
-    for fn in (_scan_oneclick, _scan_eval, _scan_train_runs, _scan_lora,
-               _scan_train_int, _scan_datasets, _scan_voices, _scan_lab,
-               _scan_synth, _scan_batch, _scan_cache):
+    for fn in (_scan_oneclick, _scan_eval, _scan_bon, _scan_train_runs,
+               _scan_lora, _scan_train_int, _scan_datasets, _scan_voices,
+               _scan_emotion, _scan_lab, _scan_synth, _scan_batch,
+               _scan_state, _scan_cache):
         try:
             res.items.extend(fn(cfg))
         except Exception as e:                     # 单类失败不连累整页
@@ -330,17 +334,30 @@ def _scan_lab(cfg: AppConfig) -> List[ArtifactItem]:
 
 
 def _scan_synth(cfg: AppConfig) -> List[ArtifactItem]:
-    """outputs/ 根目录下的散装音频（单次合成的直接落盘）。"""
+    """outputs/ 根目录下的散装音频（单次合成的直接落盘）。
+
+    同名 `.script.json`（导演台旁车）并入对应 wav 条目一起计体积、
+    一起删——单独列出对用户没有意义。
+    """
     out = []
     for p in _dir_children(cfg.output_dir):
         if not os.path.isfile(p) or not p.lower().endswith((".wav", ".mp3", ".flac", ".ogg")):
             continue
         size, _n, mtime = _walk_stat(p)
+        n_files = 1
+        notes = ["单次合成输出"]
+        sidecar = os.path.splitext(p)[0] + ".script.json"
+        if os.path.isfile(sidecar):
+            s2, _n2, m2 = _walk_stat(sidecar)
+            size += s2
+            n_files += 1
+            mtime = max(mtime, m2)
+            notes.append("含导演台本旁车")
         name = os.path.basename(p)
         out.append(ArtifactItem(
             key=f"synth:{name}", kind="synth", name=name,
-            path=_rel(p), size=size, n_files=1, mtime=mtime,
-            note="单次合成输出",
+            path=_rel(p), size=size, n_files=n_files, mtime=mtime,
+            note=" · ".join(notes),
         ))
     return out
 
@@ -354,6 +371,68 @@ def _scan_batch(cfg: AppConfig) -> List[ArtifactItem]:
             key=f"batch:{name}", kind="batch", name=name,
             path=_rel(p), size=size, n_files=nfiles, mtime=mtime,
             note="批量任务产物",
+        ))
+    return out
+
+
+def _scan_bon(cfg: AppConfig) -> List[ArtifactItem]:
+    """BoN 择优保留的最优/最差候选（每块一对 wav）。
+
+    导演合成开着「保留候选」时逐次累积，33MB 级别增长；对齐页可把它们
+    构造成 DPO 偏好对，删除前确认不再需要。
+    """
+    out = []
+    for p in _dir_children(os.path.join(cfg.output_dir, "bon")):
+        size, nfiles, mtime = _walk_stat(p)
+        name = os.path.basename(p)
+        n_pairs = sum(1 for f in os.listdir(p) if f.endswith("_best.wav")) \
+            if os.path.isdir(p) else 0
+        out.append(ArtifactItem(
+            key=f"bon:{name}", kind="bon", name=name,
+            path=_rel(p), size=size, n_files=nfiles, mtime=mtime,
+            note=(f"{n_pairs} 块 best/worst 对 · 可供对齐页构造偏好对"
+                  if n_pairs else "候选备份"),
+        ))
+    return out
+
+
+def _scan_emotion(cfg: AppConfig) -> List[ArtifactItem]:
+    """情感参考库条目（导演台情感路由的素材）。"""
+    from webui_app.services import emotion_bank as EB
+    out = []
+    for e in EB.list_entries():
+        p = e.audio_path
+        size, nfiles, mtime = _walk_stat(p) if p and os.path.isfile(p) \
+            else (0, 0, 0.0)
+        out.append(ArtifactItem(
+            key=f"emotion:{e.name}", kind="emotion", name=e.name,
+            path=_rel(p) if p else _rel(EB.BANK_DIR), size=size,
+            n_files=max(1, nfiles), mtime=mtime or time.time(),
+            note=f"{e.character} · {e.emotion}" if getattr(e, "character", "") else e.emotion,
+        ))
+    return out
+
+
+def _scan_state(cfg: AppConfig) -> List[ArtifactItem]:
+    """outputs/state/ 下的导演台与界面状态文件。逐文件列出（各自后果不同）。"""
+    state_dir = os.path.join(cfg.output_dir, "state")
+    notes = {
+        "director_cache.json": "导演台本缓存 · 删后同台词首次重新请求 LLM",
+        "director_config.json": "LLM API 配置 · 删后需在导演台重填 base_url/key/model",
+        "synthesis_state.json": "合成页参数记忆 · 删后界面恢复默认值",
+        "lora_profiles.json":  "角色双通道档案 · 删后需重新存档",
+        "last_prompt.wav":     "参考音频缓存 · 删后自动重建",
+    }
+    out = []
+    for p in _dir_children(state_dir):
+        if not os.path.isfile(p):
+            continue
+        name = os.path.basename(p)
+        size, _n, mtime = _walk_stat(p)
+        out.append(ArtifactItem(
+            key=f"state:{name}", kind="state", name=name,
+            path=_rel(p), size=size, n_files=1, mtime=mtime,
+            note=notes.get(name, "状态文件"),
         ))
     return out
 
@@ -382,14 +461,17 @@ def _root_of(cfg: AppConfig, kind: str) -> Optional[str]:
     return {
         "oneclick":  os.path.join(cfg.output_dir, "oneclick"),
         "eval":      os.path.join(cfg.output_dir, "eval"),
+        "bon":       os.path.join(cfg.output_dir, "bon"),
         "train_run": os.path.join(PROJECT_ROOT, "training_runs"),
         "lora":      cfg.lora_dir,
         "train_int": cfg.train_dir,
         "dataset":   cfg.dataset_dir,
         "voice":     os.path.join(PROJECT_ROOT, "voice_bank"),
+        "emotion":   os.path.join(PROJECT_ROOT, "emotion_bank"),
         "lab":       os.path.join(cfg.output_dir, "lab"),
         "synth":     cfg.output_dir,
         "batch":     cfg.tasks_dir,
+        "state":     os.path.join(cfg.output_dir, "state"),
         "cache":     cfg.cache_dir,
     }.get(kind)
 
@@ -475,6 +557,15 @@ def delete_items(cfg: AppConfig, keys: List[str]) -> Dict[str, Any]:
                     deleted.append(key)
                 continue
 
+            if kind == "emotion":
+                # 与 voice 同款：走索引同步删除，不留悬空条目
+                from webui_app.services import emotion_bank as EB
+                if not EB.remove(name):
+                    skipped.append(key)
+                else:
+                    deleted.append(key)
+                continue
+
             # ---- 通用文件/目录删除（带白名单校验） ----
             if kind == "cache" and name == "__all__":
                 target, root, keep_root = cfg.cache_dir, cfg.cache_dir, True
@@ -496,6 +587,15 @@ def delete_items(cfg: AppConfig, keys: List[str]) -> Dict[str, Any]:
             size = _walk_stat(target)[0]
             ok = _remove(target, keep_root=keep_root)
             if ok:
+                # synth 的导演台旁车随主音频一起删（扫描时已并入计体积）
+                if kind == "synth":
+                    sidecar = os.path.splitext(target)[0] + ".script.json"
+                    if os.path.isfile(sidecar):
+                        size += _walk_stat(sidecar)[0]
+                        try:
+                            os.remove(sidecar)
+                        except OSError:
+                            pass
                 deleted.append(key)
                 freed += size
             else:

@@ -75,6 +75,22 @@ def main() -> int:
         open(lab, "wb").write(b"\0" * 1024)
         open(syn, "wb").write(b"\0" * 1024)
 
+        # 新类（2026-10-02 补齐）：BoN 备份 / 导演台与状态 / 情感参考
+        bon = os.path.join(cfg.output_dir, "bon", f"{prefix}_bon")
+        os.makedirs(bon, exist_ok=True)
+        open(os.path.join(bon, "blk_0000_best.wav"), "wb").write(b"\0" * 2048)
+        open(os.path.join(bon, "blk_0000_worst.wav"), "wb").write(b"\0" * 2048)
+        state_dir = os.path.join(cfg.output_dir, "state")
+        os.makedirs(state_dir, exist_ok=True)
+        open(os.path.join(state_dir, f"{prefix}_cache.json"), "w",
+             encoding="utf-8").write("{}")
+        from webui_app.services import emotion_bank as EB
+        emo_wav = os.path.join(cfg.output_dir, "lab", f"{prefix}_emo.wav")
+        open(emo_wav, "wb").write(b"\0" * 512)
+        _emo = EB.add(character="探针", emotion="happy", audio_path=emo_wav,
+                      note="清理探针临时情感参考", analyze_audio=False)
+        emo_name = _emo.name      # 实际条目名 = safe(角色)_(情绪)
+
         # 假训练 run：一个 done（可删）一个 running（必须拒删）
         from webui_app.training import runs as RN
         done_run, busy_run = f"{prefix}_done", f"{prefix}_busy"
@@ -100,7 +116,8 @@ def main() -> int:
                    f"train_int:{prefix}_ti", f"lab:{prefix}_seg.wav",
                    f"synth:{prefix}_out.wav", f"train_run:{done_run}",
                    f"train_run:{busy_run}", f"dataset:{ds_name}",
-                   f"voice:{prefix}"}
+                   f"voice:{prefix}", f"bon:{prefix}_bon",
+                   f"state:{prefix}_cache.json", f"emotion:{emo_name}"}
 
         # --------------------------------------------------------------
         # 1) 扫描
@@ -108,8 +125,12 @@ def main() -> int:
         r = AR.scan(cfg)
         keys = {i.key for i in r.items}
         missing = planted - keys
-        check("扫描发现全部 11 类假产物", not missing, f"缺: {sorted(missing)}")
+        check("扫描发现全部 14 类假产物", not missing, f"缺: {sorted(missing)}")
         by = {i.key: i for i in r.items}
+        check("BoN 备份 note 标注 best/worst 对数",
+              "1 块" in by[f"bon:{prefix}_bon"].note)
+        check("情感参考条目带 角色×情绪 标注",
+              "探针" in by[f"emotion:{emo_name}"].note)
         check("一键三连产物带 origin 标记",
               by[f"oneclick:{prefix}_oc"].origin == "一键三连")
         check("一键三连报告目录 note 标注含报告",
@@ -205,6 +226,9 @@ def main() -> int:
         vb = locals().get("VB")
         if vb is not None:
             vb.remove(prefix)
+        eb = locals().get("EB")
+        if eb is not None and locals().get("emo_name"):
+            eb.remove(emo_name)
 
     print("\n" + "=" * 64)
     print(f"  通过 {len(PASS)} 项 · 失败 {len(FAIL)} 项")

@@ -1625,3 +1625,19 @@ synth_state 35 · progress 8 · build/ui_output 过。需重启 WebUI。
 
 loudness **46/46**（3e 更新去气口判据）· oneclick 280 · synth_state 35 ·
 progress 8 · build/ui_output 过。需重启 WebUI。
+
+## 阶段 26 · 清理页盘点补全（2026-10-02）
+
+用户：导演台存储的产物也进清理页，其他没显示的都补上。对照 outputs/
+实测盘点，补 3 个类别 + 1 处并入：
+
+| 类别 | 内容 | 说明 |
+|---|---|---|
+| 🎭 BoN 候选备份 | outputs/bon/（29 个目录 33MB）| 逐句择优保留的 best/worst 对，note 标注对数（对齐页 DPO 可引用）|
+| 😊 情感参考库 | emotion_bank/ 条目 | 角色×情绪标注；删除走 EB.remove 同步索引 |
+| 🧭 导演台与状态 | outputs/state/ 逐文件 | 每个文件标注删除后果（台本缓存/LLM 配置/参数记忆/角色档案/参考缓存）|
+| 合成旁车并入 | *.script.json | 并入同名 wav 条目计体积、一起删 |
+
+实测扫描 124 项（bon 29/state 5/emotion 1/synth 旁车 ✓）。安全模型不变：
+白名单根 + realpath 越权校验 + 索引同步删除。cleanup_probe 20/20
+（plant/planted 断言扩到 14 类）· build · oneclick 280 · loudness 46/46。
