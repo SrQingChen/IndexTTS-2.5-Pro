@@ -543,6 +543,8 @@ def perform(
                               32767).astype(np.int16)
 
             # ---- F0 音域恢复（WORLD 重合成，向角色指纹靠拢并扩张）----
+            f0_applied = False
+            f0_note = ""
             if f0_restore and _f0_fp:
                 y = wav.astype(np.float32) / 32768.0
                 rr = AL.restore_f0_range(y, SR, _f0_fp,
@@ -551,6 +553,9 @@ def perform(
                 if rr.get("ok") and len(rr.get("y", [])) == len(wav):
                     wav = np.clip(rr["y"] * 32767.0, -32767,
                                   32767).astype(np.int16)
+                    f0_applied = True
+                f0_note = str(rr.get("error") or
+                              (f"k={rr.get('k')}" if rr.get("ok") else ""))
 
             # ---- 逐块响度（响度指纹迁移）：从角色自己的响度分布采样目标 ----
             # 爆发块从响端、平静块从轻端 —— "这句该响那句该轻"来自角色本人
@@ -621,7 +626,8 @@ def perform(
                 "target_lufs": block_lufs,
                 "rolling_ref": used_rolling,
                 "stress": stressed,
-                "f0_restored": bool(f0_restore and _f0_fp),
+                "f0_restored": f0_applied,
+                "f0_note": f0_note,
                 "samples": int(wav.shape[0]),
                 "lines": [l.text for l in blk["lines"]],
             }

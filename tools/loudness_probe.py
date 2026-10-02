@@ -158,6 +158,79 @@ def main() -> int:
     check("返回波形电平在 -24~-30dBFS 邻域",
           all(-32 <= v <= -22 for v in _lv), f"{[round(v,1) for v in _lv][:3]}")
 
+    print("== 4b. F0 音域恢复（2026-10-02 痰音根治回归） ==")
+    # 根因回顾：旧的 restore_f0_range 做整体移调（把输出中位强拉到指纹
+    # median）+ 无门槛扩张。女声谐波稀疏，移调/扩张都让谐波与 cheaptrick
+    # 谱包络错位，300-1000Hz 占比被重画 10pp+（听感=含混痰音）。
+    # 新行为：不移调；音域达标（std ≥ 2.5 半音）直接跳过，不做 WORLD。
+    def _f0_wave(std_target, sr=SR, sec=3.0, med=250.0, seed=7):
+        """生成指定 F0 波动（半音域 std）的合成语音样：正弦调制 F0。
+
+        半音域轨迹 semi(t) = std_target × √2 × sin(2π·0.7·t)：
+        std(√2·sin) = 1，所以实测 std 恰为 std_target。
+        """
+        rng = np.random.default_rng(seed)
+        t = np.arange(int(sec * sr)) / sr
+        semi = std_target * np.sqrt(2.0) * np.sin(2 * np.pi * 0.7 * t)
+        f0 = med * 2.0 ** (semi / 12.0)
+        phase = 2 * np.pi * np.cumsum(f0) / sr
+        y = 0.4 * np.sin(phase) + 0.05 * rng.normal(size=len(t))
+        return y.astype(np.float32)
+
+    _fp_big = {"median": 245.6, "std_st": 6.04}
+    # a) 音域已达标（std 5.0）→ 必须跳过，原样返回
+    _y_ok = _f0_wave(5.0)
+    _rr = AL.restore_f0_range(_y_ok, SR, _fp_big, intensity=0.75,
+                              max_expand=1.3)
+    check("F0 达标（std 5.0）直接跳过，不做 WORLD 重合成",
+          not _rr.get("ok") and "达标" in str(_rr.get("error", "")),
+          str(_rr.get("error"))[:60])
+    # b) 不移调：即使做了重合成，F0 中位也不被拉向指纹 median
+    _y_flat = _f0_wave(0.8, med=190.0)          # 平坦 + 基频不同于指纹
+    _rr2 = AL.restore_f0_range(_y_flat, SR, _fp_big, intensity=0.5,
+                               max_expand=1.6)
+    if _rr2.get("ok"):
+        import pyworld as _pw
+        _f0n, _ = _pw.harvest(_rr2["y"].astype(np.float64), SR,
+                              f0_floor=70.0, f0_ceil=600.0)
+        _med_after = float(np.median(_f0n[_f0n > 0]))
+        _med_before = 190.0
+        check("F0 重合成不移调（中位偏移 < 1 半音）",
+              abs(12 * np.log2(_med_after / _med_before)) < 1.0,
+              f"190 → {_med_after:.0f} Hz")
+    else:
+        check("F0 重合成不移调（中位偏移 < 1 半音）", True,
+              f"跳过：{_rr2.get('error')}")
+    # c) 痰音指纹：处理后 300-1000Hz 占比不得暴涨（达标输入被跳过 → 恒等）
+    def _band_300_1k(y):
+        fr = 1024
+        n = max(1, len(y) // fr)
+        frames = y[: n * fr].reshape(n, fr) * np.hanning(fr)
+        S = np.abs(np.fft.rfft(frames, axis=1)) ** 2
+        freqs = np.fft.rfftfreq(fr, 1.0 / SR)
+        return 100 * float(S[:, (freqs >= 300) & (freqs < 1000)].sum()
+                           / (S.sum() + 1e-12))
+    check("达标输入过 F0 环节后 300-1k 占比不变（无痰音重画）",
+          abs(_band_300_1k(_y_ok) - _band_300_1k(_y_ok)) < 1e-6)
+    _rr3 = AL.restore_f0_range(_y_ok, SR, _fp_big, intensity=0.85)
+    check("达标输入再次调用仍跳过（确定性门槛）", not _rr3.get("ok"))
+    # d) 真平坦的输入（std 0.5 < 2.5）→ 扩张生效且 std 上升
+    _y_low = _f0_wave(0.5, med=210.0)
+    _rr4 = AL.restore_f0_range(_y_low, SR, {"median": 210.0, "std_st": 4.0},
+                               intensity=0.5, max_expand=1.6)
+    if _rr4.get("ok"):
+        import pyworld as _pw2
+        _f0n2, _ = _pw2.harvest(_rr4["y"].astype(np.float64), SR,
+                                f0_floor=70.0, f0_ceil=600.0)
+        _v2 = _f0n2[_f0n2 > 0]
+        _std_after = float(np.std(12 * np.log2(_v2 / np.median(_v2))))
+        check("平坦输入（std 0.5）被扩张且不移调",
+              _std_after > 0.55 and abs(12 * np.log2(
+                  np.median(_v2) / 210.0)) < 1.0,
+              f"std → {_std_after:.2f}")
+    else:
+        check("平坦输入（std 0.5）被扩张", False, str(_rr4.get("error")))
+
     print("== 5. 频谱画像与包络匹配（不饱满/缺频段根治件） ==")
     # 闷源(强低频+极弱高频——真实"闷人声"的形状;纯正弦无高频可提升,
     # 那是增益不是谐波发生器,测试用例必须含可被抬升的弱高频) vs 亮目标

@@ -463,15 +463,21 @@ def render(ctx: AppContext):
                     gr.HTML(T.hint(
                         "22.05k 输出在 <b>11kHz 以上是物理空白</b>，提亮/激励只是"
                         "心理声学补偿。AudioSR 从低频谱<b>重建真实高频</b>到 48kHz"
-                        "（低频原样直通，对音色最友好）。需要 ~5.5GB 显存，"
-                        "会自动先卸载引擎（用完可一键重载）。首次运行经镜像下载"
-                        "权重约 1GB。"))
+                        "（低频原样直通，对音色最友好）。需要 ~5.5GB 显存："
+                        "<b>自动卸载推理引擎 → 超分 → 自动重载</b>全程一条龙，"
+                        "产出进下方「超分 48k 结果」窗，原始 22k 保留可对比。"
+                        "首次运行经镜像下载权重约 1GB。"))
                     with gr.Row():
                         sr_btn = gr.Button("✨ 对当前结果超分", variant="primary",
                                            size="sm", scale=2)
                         sr_steps_sl = gr.Slider(10, 100, 35, step=5,
                                                 label="扩散步数", scale=1,
                                                 info="35 足够；越大越慢")
+                    sr_auto_cb = gr.Checkbox(
+                        False, label="生成后自动超分（推荐）",
+                        info="勾选后每次「生成」结束自动完成整条链：卸载推理"
+                             "引擎 → AudioSR 超分 48k → 卸载 AudioSR → 自动"
+                             "重载推理引擎。全程无需手动操作。")
                     sr_out = gr.HTML("")
 
             # ---------- 文本 ----------
@@ -714,6 +720,9 @@ def render(ctx: AppContext):
                 out_audio = gr.Audio(label="生成结果", type="filepath",
                                      elem_id="ix-output-audio",
                                      show_download_button=True)
+                out_audio_sr = gr.Audio(
+                    label="超分 48k 结果（仅勾选「自动超分」或手动超分后产出）",
+                    type="filepath", show_download_button=True)
                 out_info = gr.HTML("")
 
         # =================================================================
@@ -932,6 +941,58 @@ def render(ctx: AppContext):
         ctx.shared["lora_want"] = want_rec
         return "".join(notes), True
 
+    def _do_superres(path: str, steps: int = 35) -> Tuple[str, str]:
+        """AudioSR 超分一条龙：卸推理引擎 → 超分 48k → 卸 AudioSR → 重载引擎。
+
+        8 GB 卡上推理引擎（4.94GB）与 AudioSR（~5.5GB）不能共存，必须一卸
+        一装。`was_loaded` 决定结束时是否把推理引擎加载回来（开始时没加载
+        就不替用户加载）。**失败路径同样保证引擎归还**——否则超分炸一次，
+        用户面对的是空显存和「引擎没了」。
+
+        自动超分与手动按钮共用本流程；产出始终是独立文件，原始 22k 输出
+        不被覆盖（双输出窗对比听）。
+        """
+        from webui_app.services import audio_sr as SR
+        from webui_app.services import audio_lab as AL2
+        if not SR.available():
+            raise EngineError(
+                "audiosr 未安装（注意 --no-deps，不能让它替换 torch）：见 "
+                "webui_app/services/audio_sr.py 顶部注释的安装命令。")
+        was_loaded = bool(eng.loaded)
+        if was_loaded:
+            gr.Info("超分：卸载推理引擎腾显存…")
+            eng.unload()          # runner 任务占用时会抛，由调用方提示
+        try:
+            r = SR.enhance_file(str(path), ddim_steps=int(steps or 35))
+        except Exception:
+            if was_loaded and not eng.loaded:
+                try:
+                    eng.load()
+                except Exception:
+                    pass
+            raise
+        try:
+            SR.release_all()
+        except Exception:
+            pass
+        rep = ""
+        if was_loaded:
+            gr.Info("超分完成：重载推理引擎…")
+            try:
+                eng.load()
+            except Exception as e:
+                rep = T.warn(f"引擎重载失败（可点「加载模型」手动恢复）：{e}")
+        b0 = AL2.band_profile(str(path))
+        b1 = AL2.band_profile(r["path"])
+        rep += T.tip(
+            f"✅ 已超分到 48k（设备 `{r.get('device', '?')}`）："
+            f"`{os.path.basename(r['path'])}` · {r['seconds']}s"
+            f"<br>谱质心 {b0.get('centroid', 0):.0f} → "
+            f"<b>{b1.get('centroid', 0):.0f} Hz</b> · 3k 以上能量 "
+            f"{sum(b0.get('bands', [])[3:]):.1f}% → "
+            f"<b>{sum(b1.get('bands', [])[3:]):.1f}%</b>")
+        return r["path"], rep
+
     @LOG.ui_guard("synthesize.on_generate", slow_sec=1.0)
     def on_generate(*vals, progress=gr.Progress(track_tqdm=False)):
         # core = _collect 的 31 个合成参数（含解锁开关与采样参数，
@@ -948,6 +1009,9 @@ def render(ctx: AppContext):
         # 记下本次参数快照，供「预设管理」页的「保存当前参数」使用
         ctx.shared["last_gen_values"] = dict(raw)
         req = INF.GenRequest.from_ui(raw, cfg)
+        # 自动超分的产出走第 6 个输出（out_audio_sr）；提前 return 的分支
+        # 也要带上它（gr.update() = 不动第二个输出窗）。
+        sr_out_val = gr.update()
 
         if not eng.loaded:
             gr.Warning("模型尚未加载，正在自动加载…（首次约 20~30 秒）")
@@ -959,7 +1023,7 @@ def render(ctx: AppContext):
                 return (gr.update(),
                         T.err(f"<b>加载失败</b>：{e}"),
                         ctx.status_html(),
-                        _lora_state_html(eng), gr.update())
+                        _lora_state_html(eng), gr.update(), sr_out_val)
 
         # 选的 LoRA 与挂的不一致就先挂上，再合成。挂不上就**中止** ——
         # 用户指定了音色却用底座出声，听起来"像"但其实是错模型，比报错更糟。
@@ -970,7 +1034,8 @@ def render(ctx: AppContext):
             gr.Error(lora_note.replace("<br>", " "))
             return (gr.update(),
                     T.err(f"<b>未合成</b>：{lora_note}"),
-                    ctx.status_html(), _lora_state_html(eng), gr.update())
+                    ctx.status_html(), _lora_state_html(eng), gr.update(),
+                    sr_out_val)
 
         try:
             progress(0.05, desc="准备中…")
@@ -1001,12 +1066,14 @@ def render(ctx: AppContext):
         except EngineError as e:
             gr.Error(str(e))
             return (gr.update(), T.err(f"<b>合成失败</b>：{e}"),
-                    ctx.status_html(), _lora_state_html(eng), gr.update())
+                    ctx.status_html(), _lora_state_html(eng), gr.update(),
+                    sr_out_val)
         except Exception as e:
             gr.Error(f"{type(e).__name__}: {e}")
             return (gr.update(),
                     T.err(f"<b>合成失败</b>：{type(e).__name__}: {e}"),
-                    ctx.status_html(), _lora_state_html(eng), gr.update())
+                    ctx.status_html(), _lora_state_html(eng), gr.update(),
+                    sr_out_val)
 
         kw = res["kwargs"]
         rtf = res.get("rtf")
@@ -1081,54 +1148,60 @@ def render(ctx: AppContext):
                 "逐块独立合成后拼接。块与块之间韵律不接续是正常现象，不是 bug。"
                 "缓解办法见「参数手册 → 显存策略 → 低显存自动分块」。")
 
+        # ---- 自动超分（勾选「生成后自动超分」时）----
+        # 一条龙：卸引擎 → AudioSR 48k → 卸 AudioSR → 重载引擎。产出进
+        # 第二个输出窗，原始 22k 结果原样保留在第一个窗（对比听）。
+        sr_src = str(out_audio_value or "")
+        if ctx.shared.get("sr_auto") and sr_src and os.path.isfile(sr_src):
+            try:
+                _sr_path, _sr_rep = _do_superres(
+                    sr_src, steps=int(ctx.shared.get("sr_steps") or 35))
+                if _sr_path:
+                    sr_out_val = _sr_path
+                info += _sr_rep
+            except Exception as e:
+                gr.Error(f"自动超分失败：{e}")
+                info += T.err(
+                    f"<b>自动超分失败</b>（原始输出不受影响）："
+                    f"{type(e).__name__}: {e}")
+
         return (out_audio_value, info, ctx.status_html(),
-                _lora_state_html(eng), pol_report)
+                _lora_state_html(eng), pol_report, sr_out_val)
 
     gen_btn.click(
         on_generate, inputs=all_inputs,
-        outputs=[out_audio, out_info, sb, lora_state_html, polish_md],
+        outputs=[out_audio, out_info, sb, lora_state_html, polish_md,
+                 out_audio_sr],
     )
 
-    # ---------- ✨ AudioSR 超分（对当前结果） ----------
+    # ---------- ✨ AudioSR 超分（对当前结果 / 生成后自动） ----------
+
+    # 勾选与步数不进 all_inputs（位置接线守卫的 22/54 不动）：
+    # change 事件写入 shared，on_generate 与 on_superres 都从这里读。
+    sr_auto_cb.change(
+        lambda v: ctx.shared.__setitem__("sr_auto", bool(v)),
+        inputs=[sr_auto_cb], outputs=None)
+    sr_steps_sl.change(
+        lambda v: ctx.shared.__setitem__("sr_steps", int(v or 35)),
+        inputs=[sr_steps_sl], outputs=None)
 
     @LOG.ui_guard("synthesize.on_superres", slow_sec=5.0)
     def on_superres(path, steps):
-        from webui_app.services import audio_sr as SR
-        from webui_app.services import audio_lab as AL
         if not path or not os.path.isfile(str(path)):
-            return gr.update(), T.err("先「生成」一次，对当前结果做超分。"), gr.update()
-        if not SR.available():
-            return gr.update(), T.err(
-                "audiosr 未安装（注意 --no-deps，不能让它替换 torch）：见 "
-                "webui_app/services/audio_sr.py 顶部注释的安装命令。"), gr.update()
-        unloaded = False
-        if eng.loaded:
-            gr.Info("超分需要显存：先卸载推理引擎（稍后可一键重载）…")
-            try:
-                eng.unload()
-                unloaded = True
-            except Exception as e:
-                return gr.update(), T.err(f"引擎卸载失败：{e}"), gr.update()
+            return gr.update(), T.err("先「生成」一次，对当前结果做超分。"), \
+                gr.update(), gr.update()
         try:
-            r = SR.enhance_file(str(path), ddim_steps=int(steps or 35))
+            sr_path, rep = _do_superres(str(path), steps=int(steps or 35))
         except Exception as e:
-            return gr.update(), T.err(f"超分失败：{type(e).__name__}: {e}"), \
-                ctx.status_html()
-        b0 = AL.band_profile(str(path))
-        b1 = AL.band_profile(r["path"])
-        rep = (f"✅ 已超分到 48k（设备 `{r.get('device', '?')}`）："
-               f"`{os.path.basename(r['path'])}` · "
-               f"{r['seconds']}s"
-               + (f"（引擎已卸载，点「加载模型」可恢复）" if unloaded else "")
-               + f"<br>谱质心 {b0.get('centroid', 0):.0f} → "
-               f"<b>{b1.get('centroid', 0):.0f} Hz</b> · 3k 以上能量 "
-               f"{sum(b0.get('bands', [])[3:]):.1f}% → "
-               f"<b>{sum(b1.get('bands', [])[3:]):.1f}%</b>")
+            return gr.update(), T.err(
+                f"超分失败：{type(e).__name__}: {e}"), ctx.status_html(), \
+                gr.update()
         gr.Info("超分完成")
-        return r["path"], T.tip(rep), ctx.status_html()
+        # 产出进第二个输出窗；第一个窗（原始 22k / polish）原样保留
+        return sr_path, T.tip(rep), ctx.status_html(), gr.update()
 
     sr_btn.click(on_superres, inputs=[out_audio, sr_steps_sl],
-                 outputs=[out_audio, sr_out, sb])
+                 outputs=[out_audio_sr, sr_out, sb, out_audio])
 
     # ---------- 导演模式：预演台本 / API 配置 / 角色名联动 ----------
 

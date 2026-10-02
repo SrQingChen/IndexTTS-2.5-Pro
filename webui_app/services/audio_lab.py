@@ -1620,13 +1620,22 @@ def f0_stats(y: np.ndarray, sr: int) -> Dict[str, Any]:
 
 def restore_f0_range(y: np.ndarray, sr: int, fp: Dict[str, Any],
                      intensity: float = 0.5, max_shift_st: float = 3.0,
-                     max_expand: float = 1.6) -> Dict[str, Any]:
-    """把一段语音的 F0 分布向角色指纹靠拢并适度扩张（WORLD 重合成）。
+                     max_expand: float = 1.6,
+                     min_expand_std: float = 2.5) -> Dict[str, Any]:
+    """把一段语音的 F0 波动向角色指纹适度扩张（WORLD 重合成）。
 
-    new_f0_i = 目标中位 × (原F0_i / 原中位)^k，k = 目标std/原std（半音域）
-    只扩不缩（k≥1），中位对中位；逐帧偏移限 ±max_shift_st 半音。
-    强度抬目标波动（爆发块的音域本来就宽）。指纹缺失/原波动已达标/
-    浊音不足时原样返回。
+    2026-10-02「痰音」根治（实测谱取证 + 变量隔离实验）：
+      · **不再整体移调**（shift_med 恒为 0）。原先把输出中位强拉到指纹
+        median，是越权——音高由模型/情绪表演决定，不是要"恢复"的对象；
+        且女声谐波稀疏，移调 2~3 半音就让谐波与 cheaptrick 谱包络错位，
+        300-1000Hz 能量占比被重画 10pp+（听感=含混的痰音）。
+      · **音域已达标就不动**。WORLD 扩张本身也有谐波涂抹代价（k=1.3
+        实测 +11pp），只有输出真的平坦（std < min_expand_std 半音）才
+        值得付这个代价；达标还硬扩是纯损伤（实测达标块被强扩后
+        300-1k +12pp）。达标/跳过时原样返回 ok=False 并带原因。
+
+    扩张：new_f0_i = 原中位 × (原F0_i/原中位)^(k-1)+1，k = 目标std/原std
+    （只扩不缩，限 max_expand）。指纹缺失/浊音不足时也原样返回。
     """
     import numpy as _np
     try:
@@ -1645,20 +1654,27 @@ def restore_f0_range(y: np.ndarray, sr: int, fp: Dict[str, Any],
     med = float(np.median(f0[voiced]))
     semis = 12.0 * _np.log2(f0[voiced] / med)
     orig_std = float(_np.std(semis))
-    t_med = float(fp.get("median", med))
     t_std = float(fp.get("std_st", orig_std)) * (
         1.0 + 0.3 * float(np.clip(intensity, 0.0, 1.0)))
+    if orig_std >= float(min_expand_std):
+        return {"ok": False,
+                "error": (f"音域已达标（std {orig_std:.2f} ≥ "
+                          f"{min_expand_std:.1f} 半音，跳过重合成）"),
+                "orig_std": round(orig_std, 2),
+                "target_std": round(t_std, 2)}
     if orig_std < 0.3:
         k = 1.0
     else:
         k = float(_np.clip(t_std / orig_std, 1.0, float(max_expand)))
-    shift_med = float(_np.clip(
-        12.0 * _np.log2(max(t_med, 1.0) / max(med, 1.0)),
-        -float(max_shift_st), float(max_shift_st)))
+    if k <= 1.01:
+        return {"ok": False, "error": "目标波动不高于原波动，跳过",
+                "orig_std": round(orig_std, 2),
+                "target_std": round(t_std, 2)}
 
+    shift_med = 0.0
     new_f0 = f0.copy()
-    frame_shift = shift_med + (k - 1.0) * semis          # 浊音帧
-    frame_shift = _np.clip(frame_shift, -max_shift_st, max_shift_st)
+    frame_shift = _np.clip((k - 1.0) * semis,          # 只扩张，不移调
+                           -float(max_shift_st), float(max_shift_st))
     new_f0[voiced] = f0[voiced] * 2.0 ** (frame_shift / 12.0)
 
     sp, ap = pw.cheaptrick(y64, f0, _t, sr), pw.d4c(y64, f0, _t, sr)
@@ -1667,6 +1683,6 @@ def restore_f0_range(y: np.ndarray, sr: int, fp: Dict[str, Any],
     if len(y2) < len(y):
         y2 = _np.concatenate([y2, _np.zeros(len(y) - len(y2), np.float32)])
     return {"ok": True, "k": round(k, 3),
-            "shift_med_st": round(shift_med, 2),
+            "shift_med_st": 0.0,
             "orig_std": round(orig_std, 2), "target_std": round(t_std, 2),
             "y": y2}
