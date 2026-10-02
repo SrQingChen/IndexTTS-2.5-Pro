@@ -118,6 +118,8 @@ def perform(
     stress_gain_db: float = 2.0,
     f0_restore: bool = True,
     f0_expand_max: float = 1.4,
+    flatten_ref: bool = True,
+    flatten_cap_ms: int = 120,
 ) -> Dict[str, Any]:
     """表演块编排（v2）：把台本行合并成「表演块」再逐块合成拼接。
 
@@ -322,10 +324,39 @@ def perform(
 
     _base_ref_path = str(base.get("spk_audio_prompt") or "")
 
+    # ---- 参考韵律摊平（2026-10-02 散感/断层根因修复）----
+    # A/B 实锤（同模型同 seed 同文本仅换参考）：戏剧化参考（游戏配音，
+    # 每词组收束）→ 输出 67 停顿/分钟、1.1s 大收束；摊平参考 → 32/分钟。
+    # **引擎的词组化韵律直接克隆自参考**——输出里「每 2-4 字一组、组间
+    # 像不同合成」的调型断裂，源头在这里，任何输出侧静音手术都剪不掉。
+    # 把参考里 >flatten_cap_ms 的停顿压平（时长封顶，不动音色/频谱），
+    # 只在首次进入克隆链前做一次；滚动参考继承输出的改善，无需再处理。
+    def _flatten_ref_prosody(path: str) -> str:
+        if not flatten_ref or not path or not os.path.isfile(path):
+            return path
+        try:
+            y, sr = AL.load_audio(path)
+            if sr != SR:
+                import librosa
+                y = librosa.resample(y, orig_sr=sr, target_sr=SR)
+                sr = SR
+            y2 = AL.cap_interior_pauses(y, SR, int(flatten_cap_ms),
+                                        thresh_db=-30.0)
+            if len(y2) == len(y) and np.array_equal(y2, y):
+                return path
+            p = os.path.join(run_dir, "prompt_base_flat.wav")
+            AL.save_audio(p, y2, sr)
+            log.info("参考韵律已摊平（>%dms 停顿封顶，时长 %.2f→%.2fs）",
+                     int(flatten_cap_ms), len(y) / sr, len(y2) / sr)
+            return p
+        except Exception as e:
+            log.warning("参考韵律摊平失败（用原参考）：%s", e)
+            return path
+
     def _matched_base_ref() -> str:
-        """块 1 的（可选频谱匹配后的）参考；无画像/失败时原样返回。"""
+        """块 1 的（可选频谱匹配 + 韵律摊平后的）参考；失败时原样返回。"""
         if not (_spectral_fp and _base_ref_path):
-            return _base_ref_path
+            return _flatten_ref_prosody(_base_ref_path)
         try:
             y, sr = AL.load_audio(_base_ref_path)
             if sr != SR:
@@ -338,10 +369,10 @@ def perform(
             log.info("参考已做频谱匹配（画像质心 %s → 目标 %s Hz）",
                      AL.band_profile(y, sr).get("centroid"),
                      _spectral_fp.get("centroid"))
-            return p
+            return _flatten_ref_prosody(p)
         except Exception as e:
             log.warning("参考频谱匹配失败（用原参考）：%s", e)
-            return _base_ref_path
+            return _flatten_ref_prosody(_base_ref_path)
 
     _matched_ref = _matched_base_ref()
 
@@ -656,6 +687,7 @@ def perform(
                 "stress": stressed,
                 "f0_restored": f0_applied,
                 "f0_note": f0_note,
+                "ref_flattened": bool(flatten_ref),
                 "samples": int(wav.shape[0]),
                 "lines": [l.text for l in blk["lines"]],
             }
