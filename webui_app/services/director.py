@@ -224,6 +224,19 @@ def _quantize_band(ms: float, band: tuple, scale: float) -> int:
     return int(max(lo, min(hi, ms)))
 
 
+def comma_pause_band(scale: float = 1.0) -> tuple:
+    """逗号级停顿的等级带 (lo_ms, hi_ms)，随停顿系数等比缩放。
+
+    块内停顿治理（audio_lab.normalize_intra_pauses 的标点感知模式）与
+    拼接层共用这一个真源：逗号无论是在块边界（台本 pause_after_ms 按
+    带量化）还是在块内部（模型自发实现），落进同一条带，「词间<逗号≤
+    句间」的层级在两条路径上都成立。
+    """
+    s = max(0.1, min(3.0, float(scale or 1.0)))
+    lo, hi = _PAUSE_BAND["，"]
+    return int(max(80, lo * s)), int(min(2000, hi * s))
+
+
 _SENT_SPLIT_RE = re.compile(r'([^。！？!?…；;\n]*[。！？!?…]+|[^。！？!?…；;\n]*[；;\n]+|[^。！？!?…；;\n]+)')
 
 

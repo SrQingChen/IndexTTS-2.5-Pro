@@ -303,7 +303,10 @@ def main() -> int:
     p1 = eng12.calls[0]["spk_audio_prompt"]
     p2 = eng12.calls[1]["spk_audio_prompt"]
     p2_keep = os.path.join(eng12.keep_dir, os.path.basename(p2))
-    check("块1 用原参考", p1 == spk, p1)
+    # 2026-10-02 参考韵律摊平（阶段28）后，块 1 的参考可能是摊平副本
+    # （prompt_base_flat/matched）而非原路径——断言按「基础参考」语义走
+    check("块1 用（可选摊平后的）基础参考",
+          p1 == spk or "prompt_base" in p1, p1)
     check("块2 参考换成滚动参考(含上一块音频)",
           p2 != spk and "prompt_blk" in p2 and os.path.isfile(p2_keep), p2)
     import soundfile as _sfx
@@ -322,12 +325,13 @@ def main() -> int:
     data12 = _json.load(open(res12["director"]["sidecar"], encoding="utf-8"))
     check("台本记录 rolling_ref", data12["lines"][0].get("rolling_ref") is False
           and data12["lines"][1].get("rolling_ref") is True)
-    # continuity=False → 全部用原参考
+    # continuity=False → 不构建滚动参考，两块共用同一基础参考
     eng13 = _StubEngine(_Cfg_populate(tmp))
     ORC.perform(eng13, req, sc12, route=False, continuity=False)
-    check("关 continuity 时全部用原参考",
-          eng13.calls[0]["spk_audio_prompt"] == spk
-          and eng13.calls[1]["spk_audio_prompt"] == spk)
+    check("关 continuity 时不滚动（全部用同一基础参考）",
+          eng13.calls[0]["spk_audio_prompt"]
+          == eng13.calls[1]["spk_audio_prompt"]
+          and "prompt_blk" not in eng13.calls[1]["spk_audio_prompt"])
     # interval_silence 恒 0(低显存内部分块永不垫音)
     check("interval_silence=0", all(c["interval_silence"] == 0
                                     for c in eng12.calls))

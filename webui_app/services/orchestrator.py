@@ -28,7 +28,7 @@ from webui_app import logging_setup as LOG
 from webui_app.services import emotion_bank as EB
 from webui_app.services import audio_lab as AL
 from webui_app.services import inference as INF
-from webui_app.services.director import DirectorScript
+from webui_app.services.director import DirectorScript, comma_pause_band as _comma_band
 from webui_app.services.engine import EngineError, TTSEngine
 
 SR = 22050  # 官方输出采样率（int16 单声道）
@@ -120,6 +120,7 @@ def perform(
     f0_expand_max: float = 1.4,
     flatten_ref: bool = True,
     flatten_cap_ms: int = 120,
+    pause_scale: float = 1.0,
 ) -> Dict[str, Any]:
     """表演块编排（v2）：把台本行合并成「表演块」再逐块合成拼接。
 
@@ -593,11 +594,19 @@ def perform(
             # ≤12 字保留 0 个、13~27 字保留 1 个最长、28~40 字保留 2 个，
             # 保留的压到 cap（默认 220ms），其余压到 60ms 词间隙水平。
             # 块边界的台本停顿在拼接层，不受影响。
+            # 第五轮（2026-10-02 逗号保底位）：参考摊平后模型在逗号处的
+            # 停顿只剩 75~150ms，短块配额还会把它压到 35ms——「逗号几乎
+            # 没有停顿」。标点感知模式：块文本里每个逗号类标点按位置匹配
+            # 已实现的静音，保证落在导演逗号带（×停顿系数，与块边界同一
+            # 真源）；无标点路径行为不变。
             if pause_cap_ms and int(pause_cap_ms) > 0:
+                _pf, _pc = _comma_band(float(pause_scale or 1.0))
                 wav = AL.normalize_intra_pauses(
                     wav.astype(np.float32) / 32768.0, SR,
                     text_chars=len(blk_text),
-                    cap_ms=int(pause_cap_ms))
+                    cap_ms=int(pause_cap_ms),
+                    text=blk_text,
+                    punct_floor_ms=_pf, punct_cap_ms=_pc)
                 wav = np.clip(wav * 32767.0, -32767,
                               32767).astype(np.int16)
 

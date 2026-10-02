@@ -247,6 +247,139 @@ def main() -> int:
           _r16.dtype == np.int16 and _sil_ge(
               _r16.astype(np.float32) / 32768.0, 80) == 0)
 
+    # ---- 3f. 块内逗号保底位（2026-10-02 第五轮：逗号几乎没停顿事故）----
+    # 事故链：参考摊平(>120ms封顶)治好词组化散感 → 模型在逗号处的停顿
+    # 也缩到 75~150ms → 低于 150ms 门槛原样放行；≥150ms 的又被 ≤12 字块
+    # 配额 0 压成 35ms 微气口。修复：逗号类标点按位置匹配已实现静音，
+    # 保证落在导演逗号带内（与块边界同一真源），不占配额、不动非标点
+    # 治理、绝不向语音里插静音。
+    from webui_app.services.director import comma_pause_band as _cpb
+    _lo_ms, _hi_ms = _cpb(1.0)
+    check("逗号带真源：scale=1.0 → (120,210)；scale=0.7 下限=84（与真机旁车一致）",
+          (_lo_ms, _hi_ms) == (120, 210) and _cpb(0.7)[0] == 84,
+          f"{_cpb(0.7)}")
+
+    def _runs_ms_at(v, min_ms=40):
+        """[(start_s, dur_ms)]：与 normalize 同参（25ms 帧/10ms hop/-30dB）。
+
+        注意必须按 hop 滑窗（与 _frames_db 一致），不能整段 reshape 成
+        连续 25ms 帧——后者位置/时长全是另一套刻度（首版探针的翻车点）。
+        检出时长比实际静音短约 20~25ms（帧窗两端跨语音的帧不算静音），
+        断言阈值要留这个余量。
+        """
+        fr = int(SR * 0.025)
+        hp = int(SR * 0.01)
+        n = 1 + (len(v) - fr) // hp
+        if n <= 0:
+            return []
+        idx = np.arange(fr)[None, :] + hp * np.arange(n)[:, None]
+        ee = np.sqrt(np.mean(v[idx] ** 2, axis=1) + 1e-12)
+        ddb = 20 * np.log10(ee + 1e-12)
+        qq = ddb < -30
+        out, i = [], 0
+        while i < n:
+            if qq[i]:
+                j = i
+                while j < n and qq[j]:
+                    j += 1
+                if (j - i) * 10 >= min_ms:
+                    out.append((round(i * 0.01, 3), (j - i) * 10))
+                i = j
+            else:
+                i += 1
+        return out
+
+    # 事故案例 1：短句（11字，配额 0）里逗号实现为 75ms → 旧版原样放行
+    _txtA = "我们走吧，外面雨停了。"
+    _yA = np.concatenate([
+        _tone(0.9, 0.5), np.zeros(int(0.075 * SR), np.float32),
+        _tone(0.9, 0.5)])
+    _zA = AL.normalize_intra_pauses(
+        _yA, SR, text_chars=len(_txtA), cap_ms=220,
+        text=_txtA, punct_floor_ms=_lo_ms, punct_cap_ms=_hi_ms)
+    _rrA = _runs_ms_at(_zA)
+    check("事故案例1：75ms 逗号停顿被补插到带下限（检出 ≥90ms）",
+          len(_rrA) == 1 and _rrA[0][1] >= 90
+          and len(_zA) > len(_yA),
+          f"{_rrA} · 长度 +{(len(_zA)-len(_yA))/SR*1000:.0f}ms")
+    check("补插只加静音不切语音（两段正弦原样）",
+          np.array_equal(_zA[:int(0.9 * SR)], _yA[:int(0.9 * SR)]))
+    _oldA = AL.normalize_intra_pauses(_yA, SR, text_chars=len(_txtA),
+                                      cap_ms=220)
+    check("对照组：旧路径（无 text）75ms 原样放行（事故机理复现）",
+          len(_oldA) == len(_yA) and not _runs_ms_at(_oldA, 60))
+
+    # 事故案例 2：短句里逗号实现为 400ms → 旧版配额 0 压成 35ms；
+    # 新版截到带上限 210ms
+    _yB = np.concatenate([
+        _tone(0.9, 0.5), np.zeros(int(0.40 * SR), np.float32),
+        _tone(0.9, 0.5)])
+    _zB = AL.normalize_intra_pauses(
+        _yB, SR, text_chars=len(_txtA), cap_ms=220,
+        text=_txtA, punct_floor_ms=_lo_ms, punct_cap_ms=_hi_ms)
+    _rrB = _runs_ms_at(_zB)
+    check("事故案例2：400ms 逗号停顿截到带上限（≈210ms，不再压 35ms）",
+          len(_rrB) == 1 and 180 <= _rrB[0][1] <= 215,
+          f"{_rrB}")
+
+    # 案例 3：双逗号 + 一处无标点长停顿 —— 标点各自入带，非标点停顿
+    # 照旧走配额（20字配额 1：保留并压到 cap 220）
+    _txtC = "明明可以选择逃避，却偏要把一切，都背负起来。"
+    # 语音段时长 ∝ 段字数（8/5/5/5字 → 0.8/0.5/0.5/0.5s），保证位置估计准
+    _yC = np.concatenate([
+        _tone(0.8, 0.5), np.zeros(int(0.130 * SR), np.float32),   # 逗号1(带内)
+        _tone(0.5, 0.5), np.zeros(int(0.400 * SR), np.float32),   # 无标点(超配额)
+        _tone(0.5, 0.5), np.zeros(int(0.075 * SR), np.float32),   # 逗号2(过短)
+        _tone(0.5, 0.5)])
+    _zC = AL.normalize_intra_pauses(
+        _yC, SR, text_chars=len(_txtC), cap_ms=220,
+        text=_txtC, punct_floor_ms=_lo_ms, punct_cap_ms=_hi_ms)
+    _rrC = _runs_ms_at(_zC)
+    check("双逗号各自入带：130ms 保持带内、75ms 补到带下限（检出 ≥90ms）",
+          len(_rrC) == 3 and 90 <= _rrC[0][1] <= 135
+          and _rrC[2][1] >= 90,
+          f"{_rrC}")
+    check("无标点长停顿照旧配额治理：400ms → ≈220ms（行为不变）",
+          180 <= _rrC[1][1] <= 240, f"{_rrC[1]}")
+
+    # 案例 4：无逗号文本 + text 传入 → 与旧路径逐位一致（零回归承诺）
+    _zD1 = AL.normalize_intra_pauses(
+        _qy, SR, text_chars=20, cap_ms=220, text="我们走吧外面雨停了啊。",
+        punct_floor_ms=_lo_ms, punct_cap_ms=_hi_ms)
+    _zD2 = AL.normalize_intra_pauses(_qy, SR, text_chars=20, cap_ms=220)
+    check("无逗号路径逐位一致（标点感知零副作用）",
+          np.array_equal(_zD1, _zD2))
+
+    # 案例 5：逗号处无已实现静音（连读）→ 不向语音里插静音
+    _yE = np.concatenate([_tone(0.9, 0.5), _tone(0.9, 0.5)])
+    _zE = AL.normalize_intra_pauses(
+        _yE, SR, text_chars=len(_txtA), cap_ms=220,
+        text=_txtA, punct_floor_ms=_lo_ms, punct_cap_ms=_hi_ms)
+    check("逗号无静音可匹配 → 原样返回（绝不切语音）",
+          np.array_equal(_zE, _yE))
+
+    # 案例 6：块尾逗号（停顿=块尾静音，归拼接层管）→ 不越权处理
+    _yF = np.concatenate([
+        _tone(0.9, 0.5), np.zeros(int(0.30 * SR), np.float32)])
+    _txtF = "等她意识到我离开了，"
+    _zF1 = AL.normalize_intra_pauses(
+        _yF, SR, text_chars=len(_txtF), cap_ms=220,
+        text=_txtF, punct_floor_ms=_lo_ms, punct_cap_ms=_hi_ms)
+    _zF2 = AL.normalize_intra_pauses(_yF, SR, text_chars=len(_txtF),
+                                     cap_ms=220)
+    check("块尾逗号静音归拼接层（块内治理不越权）",
+          np.array_equal(_zF1, _zF2))
+
+    # 案例 7：int16 尺度（编排器实际传法）
+    _zG = AL.normalize_intra_pauses(
+        (_yA * 32767).astype(np.int16), SR, text_chars=len(_txtA),
+        cap_ms=220, text=_txtA,
+        punct_floor_ms=_lo_ms, punct_cap_ms=_hi_ms)
+    _rrG = _runs_ms_at(_zG.astype(np.float32) / 32768.0)
+    check("int16 直传：dtype 保持 + 逗号同样入带",
+          _zG.dtype == np.int16 and _rrG and _rrG[0][1] >= 90,
+          f"{_rrG}")
+
     print("== 4. 呼吸库（检测/建库/插入决策） ==")
     from webui_app.services import breath_bank as BB
     # 合成"吸气":低幅高频噪声 0.3s → 语音 0.8s

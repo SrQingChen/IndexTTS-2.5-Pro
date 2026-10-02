@@ -1101,7 +1101,8 @@ def render(ctx: AppContext):
                         stress_enable=bool(dir_stress_on),
                         stress_gain_db=float(dir_stressgain or 2.0),
                         f0_restore=bool(dir_f0on),
-                        f0_expand_max=float(dir_f0exp or 1.4))
+                        f0_expand_max=float(dir_f0exp or 1.4),
+                        pause_scale=float(dir_scale or 1.0))
                 else:
                     res = INF.generate(eng, req, progress=_lp)
             finally:

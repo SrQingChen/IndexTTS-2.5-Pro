@@ -1618,6 +1618,55 @@ def f0_stats(y: np.ndarray, sr: int) -> Dict[str, Any]:
         return {}
 
 
+# 逗号类标点（块内停顿「保底位」的触发记号）。句号/问号/叹号不在此列：
+# 块内强标点仍走既有配额治理（已被 21~27 轮真机验收的行为，不扩权）。
+_COMMA_MARKS = "，,、；;：:"
+
+# 标点保底位认定的最小静音段（名义值）。帧化会吞掉静音两端各约半个
+# 帧窗：75ms 的实际停顿只检出 ~60ms（6 帧×10ms hop）——名义阈值必须
+# 低于目标下限留足余量，50ms 名义 ≈ 能抓住 ≥70ms 的实际停顿。低于它的
+# 静音是塞音闭合/词间隙（语音结构），不认定为「逗号已实现」——找不到
+# 已实现的静音就跳过该标点，绝不切语音。
+_PUNCT_RUN_MS = 50.0
+
+# 标点位置 ↔ 静音段的匹配容差（秒）。按语音时长比例估计标点时刻，误差
+# 主要来自音节时长不均，实测远小于此值；超出容差视为「模型没在这里停」。
+_PUNCT_MATCH_WIN_S = 0.6
+
+
+def _punct_mark_times(text: str, quiet: np.ndarray,
+                      hop_s: float) -> List[float]:
+    """块文本中每个逗号类标点的**估计时刻**（秒）。
+
+    模型与 char_time_spans 同一假设：语音时长 ∝ 非标点字符数、标点自身
+    不占语音时间。第 k 个标点前有 p_k 比例的语音字符 → 估计时刻落在
+    累计语音时长的 p_k 处（在实测帧的浊音分布上查表，静音多的区域自动
+    摊薄字符速度，比「时长 × 字符占比」的线性估计准）。
+    """
+    marks = [i for i, ch in enumerate(text or "") if ch in _COMMA_MARKS]
+    if not marks:
+        return []
+    n_frames = len(quiet)
+    if not n_frames:
+        return []
+    is_speech_char = [ch not in _PUNCT_CHARS for ch in text]
+    total_chars = sum(is_speech_char)
+    voiced_cum = np.cumsum((~quiet).astype(np.int64))
+    total_voiced = int(voiced_cum[-1]) if n_frames else 0
+    out: List[float] = []
+    for k, m in enumerate(marks):
+        if total_chars <= 0 or total_voiced <= 0:
+            # 退化输入（全标点/全静音）：按标点序号均摊，宁可粗不能崩
+            out.append((k + 1) / (len(marks) + 1) * n_frames * hop_s)
+            continue
+        chars_before = sum(is_speech_char[:m])
+        target_v = chars_before / total_chars * total_voiced
+        f = int(np.searchsorted(voiced_cum, max(0, target_v - 0.5),
+                                side="left"))
+        out.append(min(max(f, 0), n_frames - 1) * hop_s)
+    return out
+
+
 def pause_quota(n_chars: int) -> int:
     """块内允许保留的「明显停顿」名额（产品规范，2026-10-02 用户原话：
     「每一小句内一般甚至都不需要明显断句，只有长句子可能偶然需要一处
@@ -1637,7 +1686,10 @@ def normalize_intra_pauses(y: np.ndarray, sr: int, text_chars: int,
                            cap_ms: float = 220.0,
                            floor_ms: float = 35.0,
                            min_run_ms: float = 150.0,
-                           thresh_db: float = -30.0) -> np.ndarray:
+                           thresh_db: float = -30.0,
+                           text: str = "",
+                           punct_floor_ms: float = 0.0,
+                           punct_cap_ms: float = 0.0) -> np.ndarray:
     """块内停顿「门槛-配额-时长」三治理（2026-10-02 第四轮：修去气口误伤）。
 
     **去气口版本的教训（真机实锤）**：上一版把所有 ≥25ms 的静音段整段
@@ -1651,6 +1703,18 @@ def normalize_intra_pauses(y: np.ndarray, sr: int, text_chars: int,
     · **配额外的**压到 floor_ms=35ms（防粘连微气口，不归零也不留大洞，
       中段截 + 5ms 切口淡化；调型收束无法在音频域消除，留微隙缓冲）。
 
+    **第五轮（2026-10-02 逗号保底位）**：参考摊平（>120ms 封顶）治好
+    词组化散感的同时，把模型在逗号处的停顿也压到了 75~150ms——低于
+    门槛原样放行、≥150ms 又会被 ≤12 字块的配额 0 压成 35ms 微气口，
+    听感「逗号几乎没有停顿」。text 非空且 punct_floor_ms>0 时启用标点
+    感知：块文本里每个逗号类标点（，、；：）按位置匹配到一段已实现的
+    静音，**保证它落在 [punct_floor_ms, punct_cap_ms] 带内**——短了在
+    静音中段补插（语音一个采样点不动），长了截到带内。这些段**不占**
+    配额名额、也不受 cap_ms 约束（标点是有意的停顿，封顶参数管的是无
+    标点处的幻觉停顿）。找不到已实现静音（≥50ms 名义）的标点直接跳过，
+    **绝不向语音里插静音**；首尾静音（拼接层的辖区）不参与匹配。无标点
+    路径与旧版逐位一致。
+
     背景：参考 28 停顿/分钟 + AR 放大 → 引擎输出 44~53 个/分钟。
     int16/float 均可，返回保持原 dtype。
     """
@@ -1660,6 +1724,7 @@ def normalize_intra_pauses(y: np.ndarray, sr: int, text_chars: int,
     yf = (np.asarray(y, dtype=np.float32) / 32768.0 if was_int
           else np.asarray(y, dtype=np.float32))
     quota = pause_quota(int(text_chars))
+    punct_mode = bool(text) and punct_floor_ms > 0 and punct_cap_ms > 0
 
     db, n = _frames_db(yf, sr, frame_ms=25.0, hop_ms=10.0)
     if not n:
@@ -1671,7 +1736,13 @@ def normalize_intra_pauses(y: np.ndarray, sr: int, text_chars: int,
     hi_frame = max(lo_frame, (len(yf) - edge) // hop)
     min_run = int(sr * float(min_run_ms) / 1000.0)
 
-    runs = []
+    # 静音段全集：标点模式按**帧数**收（≥5 帧 ≈ 名义 50ms——帧化会吞掉
+    # 静音两端各半帧，样本级阈值会把 75ms 实际停顿正好卡在门外，首版
+    # 探针翻车点）；旧路径保持样本级 min_run 比较不变。
+    punct_min_frames = max(1, int(np.ceil(_PUNCT_RUN_MS / 10.0)))
+    collect_min = min_run if not punct_mode else min(
+        min_run, punct_min_frames * hop)
+    runs: List[tuple] = []
     i = lo_frame
     while i < hi_frame:
         if quiet[i]:
@@ -1679,7 +1750,7 @@ def normalize_intra_pauses(y: np.ndarray, sr: int, text_chars: int,
             while j < hi_frame and quiet[j]:
                 j += 1
             a, b = i * hop, min(len(yf), j * hop)
-            if b - a >= min_run:          # 门槛：短段是正常语音结构，不碰
+            if b - a >= collect_min:
                 runs.append((a, b))
             i = j
         else:
@@ -1687,26 +1758,83 @@ def normalize_intra_pauses(y: np.ndarray, sr: int, text_chars: int,
     if not runs:
         return y
 
-    keep = set(sorted(range(len(runs)), key=lambda k: -(runs[k][1] - runs[k][0]))
+    # ---- 标点保底位：逗号类标点 ↔ 已实现静音段（按位置贪心匹配）----
+    mandated: Dict[int, tuple] = {}          # run 下标 -> (floor_n, cap_n)
+    if punct_mode:
+        hop_s = hop / sr
+        # 首尾静音段（连到分析边界）是拼接层的辖区，不参与匹配
+        interior = [k for k, (a, b) in enumerate(runs)
+                    if a > lo_frame * hop and b < hi_frame * hop]
+        used = set()
+        est_t = _punct_mark_times(text, quiet, hop_s)
+        win = int(_PUNCT_MATCH_WIN_S * sr)
+        p_floor = int(sr * float(punct_floor_ms) / 1000.0)
+        p_cap = max(p_floor, int(sr * float(punct_cap_ms) / 1000.0))
+        for t in est_t:
+            best, best_d = -1, None
+            for k in interior:
+                if k in used:
+                    continue
+                a, b = runs[k]
+                if abs((a + b) / 2 - t * sr) <= win:
+                    d = abs((a + b) / 2 - t * sr)
+                    if best_d is None or d < best_d:
+                        best, best_d = k, d
+            if best >= 0:
+                used.add(best)
+                mandated[best] = (p_floor, p_cap)
+
+    # ---- 配额治理（只在非标点段上数名额，规则本身不变）----
+    gov = [k for k in range(len(runs))
+           if k not in mandated and runs[k][1] - runs[k][0] >= min_run]
+    keep = set(sorted(gov, key=lambda k: -(runs[k][1] - runs[k][0]))
                [:quota]) if quota else set()
+
+    # ---- 统一成「编辑清单」再从后往前施工（前面区间的偏移不受影响）----
+    # edit = (a, b, target_n)：target < 段长 → 中段截；target > 段长 →
+    # 静音中段补插。标点段目标来自停顿带，配额段目标来自 cap/floor。
+    edits: List[tuple] = []
+    for k, (a, b) in enumerate(runs):
+        if k in mandated:
+            if b - a < mandated[k][0]:
+                edits.append((a, b, mandated[k][0]))          # 补插到带下限
+            elif b - a > mandated[k][1]:
+                edits.append((a, b, mandated[k][1]))          # 截到带上限
+        elif k in keep:
+            if b - a > int(sr * float(cap_ms) / 1000.0):
+                edits.append((a, b, int(sr * float(cap_ms) / 1000.0)))
+        elif k in gov:
+            if b - a > int(sr * float(floor_ms) / 1000.0):
+                edits.append((a, b, int(sr * float(floor_ms) / 1000.0)))
+
     fade = max(1, int(0.005 * sr))
     out = yf
-    for k in range(len(runs) - 1, -1, -1):
-        a, b = runs[k]
-        target = int(sr * (float(cap_ms) if k in keep else float(floor_ms))
-                     / 1000.0)
-        if b - a <= target:
-            continue
-        # 中段截法：切口在静音深处，两侧 5ms 线性淡化防毛刺
-        mid_a = a + target // 2
-        mid_b = b - (target - target // 2)
-        out = np.concatenate([out[:mid_a], out[mid_b:]])
-        if len(out) > mid_a + fade:
-            out[mid_a:mid_a + fade] *= np.linspace(
-                1.0, 0.0, fade, dtype=np.float32)
-        if mid_a - fade >= 0:
-            out[mid_a - fade:mid_a] *= np.linspace(
-                0.0, 1.0, fade, dtype=np.float32)
+    for a, b, target in sorted(edits, key=lambda e: -e[0]):
+        cur = b - a
+        if cur > target:
+            # 中段截法（与历版一致）：切口在静音深处，两侧 5ms 淡化防毛刺
+            mid_a = a + target // 2
+            mid_b = b - (target - target // 2)
+            out = np.concatenate([out[:mid_a], out[mid_b:]])
+            if len(out) > mid_a + fade:
+                out[mid_a:mid_a + fade] *= np.linspace(
+                    1.0, 0.0, fade, dtype=np.float32)
+            if mid_a - fade >= 0:
+                out[mid_a - fade:mid_a] *= np.linspace(
+                    0.0, 1.0, fade, dtype=np.float32)
+        else:
+            # 静音中段补插（只加静音不切语音）：切口两侧 5ms 淡出/淡入，
+            # 插入体是数字零——两侧本来就是 ≤-30dB 的静音，听感无跃变
+            pad = target - cur
+            mid = a + cur // 2
+            out = np.concatenate([out[:mid], np.zeros(pad, np.float32),
+                                  out[mid:]])
+            if mid - fade >= 0:
+                out[mid - fade:mid] *= np.linspace(
+                    1.0, 0.0, fade, dtype=np.float32)
+            if len(out) > mid + pad + fade:
+                out[mid + pad:mid + pad + fade] *= np.linspace(
+                    0.0, 1.0, fade, dtype=np.float32)
 
     if was_int:
         return np.clip(out * 32767.0, -32767, 32767).astype(np.int16)
