@@ -47,10 +47,16 @@ __all__ = ["MergeOptions", "MergeReport", "merge_lora_to_checkpoint",
 # ===========================================================================
 
 def resolve_mount_dir(run: str, checkpoint: str = "best") -> Tuple[str, str]:
-    """run + 档位 → (adapter 目录, 架构)。与续训/评测同一套解析约定。"""
+    """run + 档位 → (adapter 目录, 架构)。与续训/评测同一套解析约定。
+
+    checkpoint 做了 str() 收口：上游接线错位曾把**强度滑条的数值**传到这里
+    （2026-10-02 事故），数值上的 .lower() 会炸出无上下文的
+    AttributeError；收口后走的是下面的 FileNotFoundError，报错里带
+    run 与 checkpoint 的原值，一眼能看出传错了什么。
+    """
     rj = RN.read_run(run)
     arch = str(rj.get("arch") or "gpt")
-    which = (checkpoint or "best").lower()
+    which = str(checkpoint or "best").strip().lower()
     if which in ("best", "final"):
         d = RN.adapter_dir(run)
     else:

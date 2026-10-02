@@ -1293,3 +1293,39 @@ S2.5/S2.6 的四个环节（measure_loudness / apply_anchor 回写 / band_profil
 oneclick_probe **280**（新增 [17]：响度 n=切片数、原件字节原封不动、三
 marker 落盘、指纹段进度可见、44M 采样 f0_stats 不 abort）· loudness 23/23 ·
 build 过。真机重跑一键三连验收留给用户。
+
+## 阶段 18 · 合成页接线错位：LoRA 挂载 AttributeError（2026-10-02）
+
+### 症状与取证
+
+一键三连重训成功（达妮娅_gpt / 达妮娅_cfm），点生成报「GPT 通道 LoRA
+挂载失败：AttributeError: 'int' object has no attribute 'lower'」。同一时刻
+error.log 里还有 on_param_change 的 `ValueError: not enough values to
+unpack (expected 54, got 50)`——两条是同一颗雷。
+
+- `merge.resolve_mount_dir` 的 `(checkpoint or "best").lower()` 收到数值
+  → 报错点；`read_run("best")` 对不存在的 run 返回 `{}` 不抛错，所以能
+  一路走到 `.lower()`；
+- 根因：`4c06d20`（词级重音/F0 阶段）把 4 个新导演控件在
+  `synthesize.all_inputs` 里**粘贴了两遍**（57 项），而 on_generate 星号
+  解包只命名 53 个尾参。star 语义 =「最后 22 个给命名变量、多余全进
+  \*core」→ 尾部 22 个参数整体错位 4 格：`lora_run` 接到 CFM 档位
+  （"best"）、`lora_ckpt` 接到 CFM 强度滑条（1 → JSON 反序列化成 int）；
+  核心 31 参数靠 `_collect` 的 zip 截断**侥幸**正确，所以合成看似能启动；
+- 同一提交还改了 `_live_snapshot`（54 个名字）却没登记进
+  `remember_comps`（50 项）→ 参数记忆每次变化都抛异常、静默失效。
+
+### 修复
+
+| 件 | 说明 |
+|---|---|
+| 删重复行 | all_inputs 回到 53 项，尾部参数归位 |
+| remember_comps 补 4 项 | 参数记忆恢复落盘（顺序与 _live_snapshot 解包逐位一致） |
+| `_CORE_KEYS` 提为模块级 | 核心参数键的单一来源，`_collect` 复用 |
+| **渲染期接线自检** | all_inputs 无重复且 = len(_CORE_KEYS)+22；remember_comps = 54。位置接线错配从「运行期诡异 AttributeError」变成「启动即炸、信息明确」——星号解包不会替你发现错位，必须显式数 |
+| `resolve_mount_dir` 收口 | `str(checkpoint or "best").strip().lower()`——再有数值混入时报带 run/checkpoint 原值的 FileNotFoundError，而非无上下文的 AttributeError |
+
+### 验收
+
+build 过（渲染期自检生效）· ui_output 全事件绑定匹配 · synth_state 35/35。
+**注意：需重启 WebUI 才生效**（运行中的进程还是旧代码）。

@@ -76,6 +76,22 @@ def _lora_run_choices(arch: str = "") -> List[Any]:
     return out
 
 
+# 合成核心参数的语义键，顺序 = all_inputs 前 31 项 = _collect 的键。
+# 提为模块级单一来源：all_inputs 的接线自检要拿它数个数（见 render 内），
+# 以后加参数只改这一处。
+_CORE_KEYS = [
+    "spk_audio_prompt", "text", "lang", "seed", "duration_factor",
+    "text_normalization", "max_text_tokens_per_segment", "interval_silence",
+    "emo_control_method", "emo_audio_prompt", "emo_alpha",
+    "emo_vec_0", "emo_vec_1", "emo_vec_2", "emo_vec_3",
+    "emo_vec_4", "emo_vec_5", "emo_vec_6", "emo_vec_7",
+    "emo_text", "use_random",
+    "emo_unlock_vector_cap", "emo_extrapolate",
+    "do_sample", "top_p", "top_k", "temperature", "num_beams",
+    "repetition_penalty", "length_penalty", "max_mel_tokens",
+]
+
+
 def _lora_ckpt_choices(run: str) -> List[str]:
     """某个 run 可选的档位。用 list_checkpoints（不创建目录）。
 
@@ -813,30 +829,33 @@ def render(ctx: AppContext):
         unlock_cap_cb, extrapolate_cb,
         do_sample, top_p, top_k, temperature, num_beams,
         rep_pen, len_pen, max_mel,
-        # 末尾这几个不是合成参数：LoRA 双通道 6 + 后处理 3 + 导演 8。
-        # 它们必须排在 _collect 的 keys 之后，由 on_generate 单独解包（见下）。
+        # 末尾这几个不是合成参数：LoRA 双通道 6 + 后处理 3 + 导演 13 = 22。
+        # 它们必须排在 _CORE_KEYS 之后，由 on_generate 单独解包（见下）。
         lora_run_dd, lora_ckpt_dd, lora_scale_sl,
         lora_cfm_run_dd, lora_cfm_ckpt_dd, lora_cfm_scale_sl,
         polish_cb, polish_presence, polish_exciter,
         director_cb, dir_backend, dir_character, dir_route, dir_scale_sl,
         dir_bon, dir_bon_keep, dir_breath_cb, dir_pausecap_sl,
         dir_stress_cb, dir_stressgain_sl, dir_f0cb, dir_f0exp_sl,
-        dir_stress_cb, dir_stressgain_sl, dir_f0cb, dir_f0exp_sl,
     ]
+    # 接线自检（2026-10-02 事故）：on_generate 用星号解包，多余的输入会被
+    # **静默**吸进 *core —— 4 个新控件曾在这里被粘贴两遍（57 项 vs 53 个
+    # 名字），尾部 22 个参数整体错位 4 格：lora_ckpt 接到强度滑条的数值、
+    # 挂载链在 .lower() 上炸出 AttributeError。位置接线错配必须在渲染期
+    # 就炸出来，不能等到用户点生成。
+    if len(all_inputs) != len({id(c) for c in all_inputs}):
+        raise RuntimeError(
+            "all_inputs 有重复组件——这是复制粘贴事故的高发形态，"
+            "检查刚加的控件是否被列了两遍。")
+    if len(all_inputs) != len(_CORE_KEYS) + 22:
+        raise RuntimeError(
+            f"all_inputs 有 {len(all_inputs)} 项，但 _CORE_KEYS 有 "
+            f"{len(_CORE_KEYS)} 个 + on_generate 尾部命名参数 22 个。"
+            "两边必须同步增减：加了控件就要在 on_generate 的解包里加名字，"
+            "反之亦然（star 解包不会替你发现错位）。")
 
     def _collect(*vals) -> Dict[str, Any]:
-        keys = [
-            "spk_audio_prompt", "text", "lang", "seed", "duration_factor",
-            "text_normalization", "max_text_tokens_per_segment", "interval_silence",
-            "emo_control_method", "emo_audio_prompt", "emo_alpha",
-            "emo_vec_0", "emo_vec_1", "emo_vec_2", "emo_vec_3",
-            "emo_vec_4", "emo_vec_5", "emo_vec_6", "emo_vec_7",
-            "emo_text", "use_random",
-            "emo_unlock_vector_cap", "emo_extrapolate",
-            "do_sample", "top_p", "top_k", "temperature", "num_beams",
-            "repetition_penalty", "length_penalty", "max_mel_tokens",
-        ]
-        return dict(zip(keys, vals))
+        return dict(zip(_CORE_KEYS, vals))
 
     def _mounted_tags() -> Dict[str, List[str]]:
         """引擎上**实际**挂着的 adapter 标签，按 target 分组。
@@ -916,8 +935,8 @@ def render(ctx: AppContext):
     @LOG.ui_guard("synthesize.on_generate", slow_sec=1.0)
     def on_generate(*vals, progress=gr.Progress(track_tqdm=False)):
         # core = _collect 的 31 个合成参数（含解锁开关与采样参数，
-        # 顺序与 all_inputs/_collect keys 严格一致）；尾部 16 个单独解包
-        # （LoRA 双通道 6 + 后处理 3 + 导演 7）。
+        # 顺序与 all_inputs/_CORE_KEYS 严格一致）；尾部 22 个单独解包
+        # （LoRA 双通道 6 + 后处理 3 + 导演 13）。
         (*core, lora_run, lora_ckpt, lora_scale,
          lora_cfm_run, lora_cfm_ckpt, lora_cfm_scale,
          pol_on, pol_presence, pol_exciter,
@@ -1824,7 +1843,15 @@ def render(ctx: AppContext):
         polish_cb, polish_presence, polish_exciter, remember_cb,
         director_cb, dir_backend, dir_character, dir_route, dir_scale_sl,
         dir_bon, dir_bon_keep, dir_breath_cb, dir_pausecap_sl,
+        dir_stress_cb, dir_stressgain_sl, dir_f0cb, dir_f0exp_sl,
     ]
+    # 同 all_inputs 的自检：_live_snapshot 按位置解包 54 个名字，这里的
+    # 组件数必须与之一致（2026-10-02 事故：加了 4 个导演控件后忘了登记
+    # 进来，50 vs 54 让每次参数变化都抛异常，参数记忆静默失效）。
+    if len(remember_comps) != 54:
+        raise RuntimeError(
+            f"remember_comps 有 {len(remember_comps)} 项，但 _live_snapshot "
+            "按位置解包 54 个名字。两边必须同步增减，否则参数记忆整条失效。")
 
     def _live_snapshot(*vals) -> Dict[str, Any]:
         """remember_comps 的当前值 → 语义键字典（含音频路径与记忆开关）。"""
