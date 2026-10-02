@@ -1618,6 +1618,94 @@ def f0_stats(y: np.ndarray, sr: int) -> Dict[str, Any]:
         return {}
 
 
+def pause_quota(n_chars: int) -> int:
+    """块内允许保留的「明显停顿」名额（产品规范，2026-10-02 用户原话：
+    「每一小句内一般甚至都不需要明显断句，只有长句子可能偶然需要一处
+    断句」）。
+
+    ≤12 字（短句）：0 个 —— 词间隙以外的停顿全部压到 60ms 语音学水平；
+    13~27 字：1 个；28~40 字：2 个（块文本上限就是 40 字）。
+    """
+    if n_chars <= 12:
+        return 0
+    if n_chars <= 27:
+        return 1
+    return 2
+
+
+def normalize_intra_pauses(y: np.ndarray, sr: int, text_chars: int,
+                           cap_ms: float = 220.0,
+                           floor_ms: float = 60.0,
+                           thresh_db: float = -30.0) -> np.ndarray:
+    """块内停顿「数量+时长」双治理：配额内的压到 cap_ms，超配额的压到
+    floor_ms（词闭合间隙的语音学水平，真人 20~80ms）。
+
+    背景（2026-10-02 实测）：音色库参考 28 停顿/分钟语音 + AR 先验放大
+    → 引擎输出 44~53 个/分钟，「两三个字一停」彻底打散句子。时长封顶
+    （cap_interior_pauses）治了长治不了多。本函数按块文本长度给名额：
+    保留最长的 quota 个（各压到 cap_ms），其余全部压到 floor_ms。
+    首尾 50ms 不参与；中段截法 + 5ms 切口淡化（与 _cap_pauses 同款）。
+    int16/float 均可，返回保持原 dtype。
+    """
+    if not cap_ms or float(cap_ms) <= 0 or len(y) < sr // 4:
+        return y
+    was_int = np.issubdtype(np.asarray(y).dtype, np.integer)
+    yf = (np.asarray(y, dtype=np.float32) / 32768.0 if was_int
+          else np.asarray(y, dtype=np.float32))
+    quota = pause_quota(int(text_chars))
+
+    db, n = _frames_db(yf, sr, frame_ms=25.0, hop_ms=10.0)
+    if not n:
+        return y
+    hop = int(sr * 0.01)
+    quiet = db < thresh_db
+    edge = int(0.05 * sr)
+    lo_frame = edge // hop
+    hi_frame = max(lo_frame, (len(yf) - edge) // hop)
+
+    runs = []          # (start_sample, end_sample, dur_samples)
+    i = lo_frame
+    while i < hi_frame:
+        if quiet[i]:
+            j = i
+            while j < hi_frame and quiet[j]:
+                j += 1
+            runs.append((i * hop, min(len(yf), j * hop)))
+            i = j
+        else:
+            i += 1
+    if not runs:
+        return y
+
+    # 名额：保留最长的 quota 个 → cap_ms；其余 → floor_ms
+    keep = set(sorted(range(len(runs)), key=lambda k: -(runs[k][1] - runs[k][0]))
+               [:quota]) if quota else set()
+    fade = max(1, int(0.005 * sr))
+    out = yf
+    for k in range(len(runs) - 1, -1, -1):
+        a, b = runs[k]
+        target = int(sr * (float(cap_ms) if k in keep else float(floor_ms))
+                     / 1000.0)
+        if b - a <= target:
+            continue
+        cut = (b - a) - target
+        mid_a = a + target // 2
+        mid_b = b - (target - target // 2)
+        seg = out[mid_a:mid_b]
+        out = np.concatenate([out[:mid_a], out[mid_b:]])
+        # 切口两侧 5ms 淡化兜底
+        if len(out) > mid_a + fade:
+            out[mid_a:mid_a + fade] *= np.linspace(
+                1.0, 0.0, fade, dtype=np.float32)
+        if mid_a - fade >= 0:
+            out[mid_a - fade:mid_a] *= np.linspace(
+                0.0, 1.0, fade, dtype=np.float32)
+
+    if was_int:
+        return np.clip(out * 32767.0, -32767, 32767).astype(np.int16)
+    return out.astype(yf.dtype, copy=False)
+
+
 def edge_silence_len(y: np.ndarray, sr: int, from_end: bool = True,
                      thresh_db: float = -30.0, max_s: float = 1.0) -> float:
     """量波形尾（from_end=True）或头部的连续静音时长（秒，封顶 max_s）。

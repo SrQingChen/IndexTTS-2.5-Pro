@@ -180,6 +180,56 @@ def main() -> int:
           abs(len(_blk1) - len(_t3) - (0.30 - 0.02) * SR) < 0.05 * SR,
           f"截了 {(len(_blk1) - len(_t3)) / SR:.2f}s")
 
+    # ---- 3e. 块内停顿配额制（2026-10-02 散感彻底根治回归）----
+    # 产品规范（用户原话）：短句内 0 个明显停顿、长句最多 1 处。
+    # 实测引擎输出 44~53 停顿/分钟（参考 28 + AR 先验放大），
+    # 时长封顶治了长治不了多 —— 配额制治数量。
+    _qy = np.concatenate([
+        _tone(1.0, 0.5), np.zeros(int(0.30 * SR), np.float32),
+        _tone(0.5, 0.5), np.zeros(int(0.40 * SR), np.float32),
+        _tone(0.8, 0.5), np.zeros(int(0.25 * SR), np.float32),
+        _tone(0.6, 0.5)])
+
+    def _sil_ge80(v):
+        fr = int(SR * 0.025)
+        n = len(v) // fr
+        ee = np.sqrt(np.mean(v[: n * fr].reshape(n, fr) ** 2, axis=1)
+                     + 1e-12)
+        ddb = 20 * np.log10(ee + 1e-12)
+        qq = ddb < -30
+        cnt, ii = 0, 0
+        while ii < n:
+            if qq[ii]:
+                jj = ii
+                while jj < n and qq[jj]:
+                    jj += 1
+                if (jj - ii) * 0.025 >= 0.08:
+                    cnt += 1
+                ii = jj
+            else:
+                ii += 1
+        return cnt
+
+    check("配额规则：12字0/27字1/40字2",
+          AL.pause_quota(12) == 0 and AL.pause_quota(13) == 1
+          and AL.pause_quota(27) == 1 and AL.pause_quota(28) == 2
+          and AL.pause_quota(40) == 2)
+    _r0 = AL.normalize_intra_pauses(_qy, SR, text_chars=11, cap_ms=220)
+    check("短句（11字）块内停顿清零（压到词间隙）",
+          _sil_ge80(_r0) == 0,
+          f"剩 {_sil_ge80(_r0)} 个 ≥80ms 停顿")
+    _r1 = AL.normalize_intra_pauses(_qy, SR, text_chars=20, cap_ms=220)
+    check("中句（20字）保留恰好 1 个停顿",
+          _sil_ge80(_r1) == 1)
+    _r2 = AL.normalize_intra_pauses(_qy, SR, text_chars=35, cap_ms=220)
+    check("长句（35字）保留恰好 2 个停顿",
+          _sil_ge80(_r2) == 2)
+    _r16 = AL.normalize_intra_pauses(
+        (_qy * 32767).astype(np.int16), SR, text_chars=11, cap_ms=220)
+    check("配额制 int16 直传正常（尺度陷阱防复发）",
+          _r16.dtype == np.int16 and _sil_ge80(
+              _r16.astype(np.float32) / 32768.0) == 0)
+
     print("== 4. 呼吸库（检测/建库/插入决策） ==")
     from webui_app.services import breath_bank as BB
     # 合成"吸气":低幅高频噪声 0.3s → 语音 0.8s
