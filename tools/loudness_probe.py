@@ -153,6 +153,33 @@ def main() -> int:
           and len(_capped2) >= len(_hard) - int(0.3 * _sr_l),
           f"{len(_hard)/_sr_l:.2f}s → {len(_capped2)/_sr_l:.2f}s")
 
+    # ---- 3d. 块边界停顿精确化（2026-10-02 散感根治回归）----
+    # 块尾收束 + 块头起振 + 台本 gap 三重叠加曾把边界拖到 0.4~0.9s；
+    # 现在拼接层量出两侧实际静音，超出台本值修剪、不足垫足。
+    _sp = _tone(1.0, 0.5)
+    _blk1 = np.concatenate([_sp, np.zeros(int(0.30 * SR), np.float32)])
+    _blk2 = np.concatenate([np.zeros(int(0.25 * SR), np.float32), _sp])
+    check("edge_silence_len：尾部/头部静音量准",
+          abs(AL.edge_silence_len(_blk1, SR, from_end=True) - 0.30) < 0.04
+          and abs(AL.edge_silence_len(_blk2, SR, from_end=False) - 0.25) < 0.04)
+    # 台本 gap 0.15s < 0.30+0.25 → 修剪到 ≈0.15s 总停顿
+    _t1 = AL.trim_edge_silence(_blk1, SR, 0.20, from_end=True)
+    _t2 = AL.trim_edge_silence(_blk2, SR, 0.20, from_end=False)
+    _joint = len(_blk1) - len(_t1) + len(_blk2) - len(_t2)
+    _total_pause = 0.30 - (len(_blk1) - len(_t1)) / SR \
+        + 0.25 - (len(_blk2) - len(_t2)) / SR
+    check("修剪后块间总停顿 ≈ 台本值（0.15s）",
+          abs(_total_pause - 0.15) < 0.06,
+          f"{_total_pause:.3f}s")
+    check("修剪只动静音区（语音主体原样）",
+          len(_t1) == len(_blk1) - int(0.20 * SR)
+          and len(_t2) == len(_blk2) - int(0.20 * SR))
+    # 修剪超量：cut 大于静音量 → 只截到静音-20ms 保底
+    _t3 = AL.trim_edge_silence(_blk1, SR, 1.0, from_end=True)
+    check("修剪不越过静音量（20ms 保底）",
+          abs(len(_blk1) - len(_t3) - (0.30 - 0.02) * SR) < 0.05 * SR,
+          f"截了 {(len(_blk1) - len(_t3)) / SR:.2f}s")
+
     print("== 4. 呼吸库（检测/建库/插入决策） ==")
     from webui_app.services import breath_bank as BB
     # 合成"吸气":低幅高频噪声 0.3s → 语音 0.8s

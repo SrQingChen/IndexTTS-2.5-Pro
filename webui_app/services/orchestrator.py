@@ -667,27 +667,51 @@ def perform(
             line_infos.append(info)
             prev_chosen = cand_paths[chosen_k]
 
-        # ---- 拼接：块间停顿（按边界等级）+ 直连时 30ms 交叉淡化 ----
-        # 块间垫**数字零**：实际使用会在停顿段垫 BGM，零底最干净；人声的
-        # 自然衰减在块内由模型完成（见 _merge_blocks 的收束说明），零只
-        # 出现在「已经说完」之后，不存在戛然而止。
+        # ---- 拼接：块间停顿**精确化**（2026-10-02 散感根治）----
+        # 旧逻辑 gap 纯叠加在块尾/块头静音之上：模型的块尾收束（0.2~0.3s）
+        # + 块头起振（0.2~0.3s）+ 台本 gap 三重叠加，实测每处 0.4~0.9s ——
+        # 长句被导演拆成多块后「每一小句都拖长停顿、整体很散」。
+        # 现在：量出两侧实际静音，超出台本 gap 就从外侧修剪、不足就垫零 ——
+        # 块间总停顿精确等于 pause_after_ms（下限 30ms 防粘连），台本给的
+        # 层级（词间<逗号≤句间/戏剧拍）原样落地。
         # 吸气（2026-09）：有停顿的块边界按概率插入**角色本人**的吸气采样
-        # （breath_bank），贴下一句开口放置（真人就是「吸完立刻说」）。
-        # 默认关（breath=False）：启发式挖取的采样质量未经耳检，贸然常开
-        # 会往听感里掺噪声（用户实测「嘈杂不干净」的嫌疑之一）。
+        # （breath_bank），贴下一句开口放置。默认关（breath=False）。
         from webui_app.services import breath_bank as BB
         fade = int(SR * 0.03)
         inhales_used = 0
         final = wavs[0] if wavs else np.zeros(1, np.int16)
         for i in range(1, n):
-            gap = int(line_infos[i - 1]["pause_after_ms"])
+            gap_s = max(0.0, float(line_infos[i - 1]["pause_after_ms"])) / 1000.0
+            gap_s = max(gap_s, 0.03)             # 台本 0 也至少留 30ms
             nxt = wavs[i]
+
+            # 量两侧实际静音（块尾收束 / 块头起振）
+            _fin_f = final.astype(np.float32) / 32768.0
+            _nxt_f = nxt.astype(np.float32) / 32768.0
+            tail_s = AL.edge_silence_len(_fin_f, SR, from_end=True)
+            head_s = AL.edge_silence_len(_nxt_f, SR, from_end=False)
+
+            over = tail_s + head_s - gap_s
+            if over > 0:
+                # 超出：从两侧**外侧**修剪（各承担一半，不超过各自静音量）
+                cut_tail = min(over / 2.0, max(0.0, tail_s - 0.02))
+                cut_head = min(over - cut_tail, max(0.0, head_s - 0.02))
+                if cut_tail > 0:
+                    final = AL.trim_edge_silence(final, SR, cut_tail,
+                                                 from_end=True).astype(np.int16)
+                if cut_head > 0:
+                    nxt = AL.trim_edge_silence(nxt, SR, cut_head,
+                                               from_end=False).astype(np.int16)
+                gap = 0                          # 已贴紧，走交叉淡化
+            else:
+                gap = int(SR * (gap_s - tail_s - head_s) * 1000.0 / 1000.0)
+
             if gap > 0:
-                gap_n = int(SR * gap / 1000.0)
+                gap_n = gap
                 bed = np.zeros(gap_n, dtype=np.int16)
                 if breath and character:
                     try:
-                        inh = BB.maybe_inhale(character, gap,
+                        inh = BB.maybe_inhale(character, gap_n * 1000 // SR,
                                               float(line_infos[i].get(
                                                   "intensity") or 0.5), _rng)
                     except Exception:

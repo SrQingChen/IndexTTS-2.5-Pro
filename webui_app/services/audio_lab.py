@@ -1618,6 +1618,76 @@ def f0_stats(y: np.ndarray, sr: int) -> Dict[str, Any]:
         return {}
 
 
+def edge_silence_len(y: np.ndarray, sr: int, from_end: bool = True,
+                     thresh_db: float = -30.0, max_s: float = 1.0) -> float:
+    """量波形尾（from_end=True）或头部的连续静音时长（秒，封顶 max_s）。
+
+    块边界停顿管理用：模型的块尾收束静音 + 块头起振静音 + 台本 gap 三者
+    叠加是「长句拆块后每一小句都很散」的主因（2026-10-02），拼接层要
+    拿实际静音量来修剪/垫足，让块间总停顿精确等于台本值。
+    int16/float 均可（阈值是 ±1 尺度量——int16 直传会整体偏 +90dB、
+    判定全废，与 apply_stress_gains 同族的尺度陷阱）。
+    """
+    yf = (np.asarray(y, dtype=np.float32) / 32768.0
+          if np.issubdtype(np.asarray(y).dtype, np.integer)
+          else np.asarray(y, dtype=np.float32))
+    fr = int(sr * 0.025)
+    if len(yf) < fr:
+        return 0.0
+    frames = yf[: max(1, len(yf) // fr) * fr].reshape(-1, fr)
+    e = np.sqrt(np.mean(frames ** 2, axis=1) + 1e-12)
+    db = 20.0 * np.log10(e + 1e-12)
+    quiet = db < thresh_db
+    n = len(db)
+    max_frames = int(max_s * sr) // fr
+    count = 0
+    if from_end:
+        for i in range(n - 1, -1, -1):
+            if not quiet[i] or count >= max_frames:
+                break
+            count += 1
+    else:
+        for i in range(n):
+            if not quiet[i] or count >= max_frames:
+                break
+            count += 1
+    return count * fr / sr
+
+
+def trim_edge_silence(y: np.ndarray, sr: int, cut_s: float,
+                      from_end: bool = True, thresh_db: float = -30.0
+                      ) -> np.ndarray:
+    """把尾（from_end=True）/头部静音**从外侧**截掉 cut_s 秒。
+
+    与 cap_interior_pauses 的中段截法同款保底：只动静音区（按 -30dB 判
+    定，且不超过实测静音量 - 20ms），保留贴语音的衰减/起振端；切口做
+    5ms 淡化防 click。int16/float 均可，返回保持原 dtype。
+    """
+    if cut_s <= 0:
+        return y
+    was_int = np.issubdtype(np.asarray(y).dtype, np.integer)
+    avail = max(0.0, edge_silence_len(y, sr, from_end=from_end,
+                                      thresh_db=thresh_db) - 0.02)
+    n = int(min(cut_s, avail) * sr)
+    if n <= 0:
+        return y
+    yf = (np.asarray(y, dtype=np.float32) / 32768.0 if was_int
+          else np.asarray(y, dtype=np.float32))
+    if from_end:
+        out = yf[:-n].copy()
+        f = max(1, int(0.005 * sr))
+        if len(out) > f:
+            out[-f:] *= np.linspace(1.0, 0.0, f, dtype=np.float32)
+    else:
+        out = yf[n:].copy()
+        f = max(1, int(0.005 * sr))
+        if len(out) > f:
+            out[:f] *= np.linspace(0.0, 1.0, f, dtype=np.float32)
+    if was_int:
+        return np.clip(out * 32767.0, -32767, 32767).astype(np.int16)
+    return out.astype(np.asarray(y).dtype, copy=False)
+
+
 def restore_f0_range(y: np.ndarray, sr: int, fp: Dict[str, Any],
                      intensity: float = 0.5, max_shift_st: float = 3.0,
                      max_expand: float = 1.6,
