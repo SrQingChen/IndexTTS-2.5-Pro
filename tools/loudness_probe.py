@@ -215,9 +215,19 @@ def main() -> int:
           and AL.pause_quota(27) == 1 and AL.pause_quota(28) == 2
           and AL.pause_quota(40) == 2)
     _r0 = AL.normalize_intra_pauses(_qy, SR, text_chars=11, cap_ms=220)
-    check("短句（11字）块内停顿清零（压到词间隙）",
+    check("短句（11字）块内停顿清零（去气口）",
           _sil_ge80(_r0) == 0,
           f"剩 {_sil_ge80(_r0)} 个 ≥80ms 停顿")
+    # 去气口接缝不引入新跳变：输出 maxΔ 不得超过输入的 1.1 倍
+    # （绝对阈值不可用——22k 语音的齿音段相邻样本跳变本就可达峰值的
+    # 180%，真机实测证实；接缝在静音区，等功率淡化下只会更平滑）
+    _jump_in = float(np.max(np.abs(np.diff(_qy))))
+    _jump_out = float(np.max(np.abs(np.diff(_r0))))
+    check("去气口不引入新跳变", _jump_out < 1.1 * _jump_in + 1e-4,
+          f"maxΔ {_jump_in:.4f} → {_jump_out:.4f}")
+    _len_shrink = (len(_qy) - len(_r0)) / SR
+    check("超配额停顿被整体移除（时长收缩 ≈ 0.95s 静音）",
+          0.85 < _len_shrink < 1.05, f"收缩 {_len_shrink:.2f}s")
     _r1 = AL.normalize_intra_pauses(_qy, SR, text_chars=20, cap_ms=220)
     check("中句（20字）保留恰好 1 个停顿",
           _sil_ge80(_r1) == 1)

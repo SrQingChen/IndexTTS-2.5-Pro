@@ -471,11 +471,13 @@ def render(ctx: AppContext):
                     with gr.Row():
                         sr_btn = gr.Button("✨ 对当前结果超分", variant="primary",
                                            size="sm", scale=2)
-                        sr_steps_sl = gr.Slider(10, 100, 35, step=5,
-                                                label="扩散步数", scale=1,
-                                                info="35 足够；越大越慢")
+                        sr_steps_sl = gr.Slider(
+                            10, 100, int(ST.get("sr_steps", 35)), step=5,
+                            label="扩散步数", scale=1,
+                            info="35 足够；越大越慢")
                     sr_auto_cb = gr.Checkbox(
-                        False, label="生成后自动超分（推荐）",
+                        bool(ST.get("sr_auto", False)),
+                        label="生成后自动超分（推荐）",
                         info="勾选后每次「生成」结束自动完成整条链：卸载推理"
                              "引擎 → AudioSR 超分 48k → 卸载 AudioSR → 自动"
                              "重载推理引擎。全程无需手动操作。")
@@ -961,6 +963,15 @@ def render(ctx: AppContext):
         自动超分与手动按钮共用本流程；产出始终是独立文件，原始 22k 输出
         不被覆盖（双输出窗对比听）。
         """
+        from collections import deque as _dq
+        _sink = ctx.shared.get("synth_log")
+        if _sink is None:
+            _sink = _dq(maxlen=150)
+            ctx.shared["synth_log"] = _sink
+
+        def _slog(line: str) -> None:
+            _sink.append(line)
+
         from webui_app.services import audio_sr as SR
         from webui_app.services import audio_lab as AL2
         if not SR.available():
@@ -970,7 +981,10 @@ def render(ctx: AppContext):
         was_loaded = bool(eng.loaded)
         if was_loaded:
             gr.Info("超分：卸载推理引擎腾显存…")
+            _slog("超分：卸载推理引擎，腾显存给 AudioSR…")
             eng.unload()          # runner 任务占用时会抛，由调用方提示
+        _slog(f"AudioSR 超分开始 · {int(steps or 35)} 步 · "
+              f"{os.path.basename(str(path))}")
         try:
             r = SR.enhance_file(str(path), ddim_steps=int(steps or 35))
         except Exception:
@@ -984,9 +998,12 @@ def render(ctx: AppContext):
             SR.release_all()
         except Exception:
             pass
+        _slog(f"✅ AudioSR 完成 · {r['seconds']}s · "
+              f"{os.path.basename(r['path'])}")
         rep = ""
         if was_loaded:
             gr.Info("超分完成：重载推理引擎…")
+            _slog("超分完成：重载推理引擎…")
             try:
                 eng.load()
             except Exception as e:
@@ -1962,14 +1979,15 @@ def render(ctx: AppContext):
         director_cb, dir_backend, dir_character, dir_route, dir_scale_sl,
         dir_bon, dir_bon_keep, dir_breath_cb, dir_pausecap_sl,
         dir_stress_cb, dir_stressgain_sl, dir_f0cb, dir_f0exp_sl,
+        sr_auto_cb, sr_steps_sl,
     ]
-    # 同 all_inputs 的自检：_live_snapshot 按位置解包 54 个名字，这里的
+    # 同 all_inputs 的自检：_live_snapshot 按位置解包 56 个名字，这里的
     # 组件数必须与之一致（2026-10-02 事故：加了 4 个导演控件后忘了登记
     # 进来，50 vs 54 让每次参数变化都抛异常，参数记忆静默失效）。
-    if len(remember_comps) != 54:
+    if len(remember_comps) != 56:
         raise RuntimeError(
             f"remember_comps 有 {len(remember_comps)} 项，但 _live_snapshot "
-            "按位置解包 54 个名字。两边必须同步增减，否则参数记忆整条失效。")
+            "按位置解包 56 个名字。两边必须同步增减，否则参数记忆整条失效。")
 
     def _live_snapshot(*vals) -> Dict[str, Any]:
         """remember_comps 的当前值 → 语义键字典（含音频路径与记忆开关）。"""
@@ -1980,7 +1998,8 @@ def render(ctx: AppContext):
          lrun, lckpt, lscale, crun, cckpt, cscale,
          pon, ppre, pexc, remember_on,
          d_on, d_backend, d_char, d_route, d_scale, d_bon, d_bkeep,
-         d_breath, d_pausecap, d_stress, d_sgain, d_f0on, d_f0exp) = vals
+         d_breath, d_pausecap, d_stress, d_sgain, d_f0on, d_f0exp,
+         sr_auto, sr_steps) = vals
         return {
             "voice_name": voice_name or "",
             "prompt_audio": pa, "emo_audio": ea,
@@ -2017,6 +2036,7 @@ def render(ctx: AppContext):
             "director_f0_restore": bool(d_f0on),
             "director_f0_expand": float(d_f0exp or 1.3),
             "director_pause_cap_ms": int(d_pausecap),
+            "sr_auto": bool(sr_auto), "sr_steps": int(sr_steps or 35),
             "_remember": bool(remember_on),
         }
 
@@ -2097,6 +2117,7 @@ def render(ctx: AppContext):
         dir_bon, dir_bon_keep, dir_breath_cb, dir_pausecap_sl,
         dir_stress_cb, dir_stressgain_sl, dir_f0cb, dir_f0exp_sl,
         unlock_cap_cb, extrapolate_cb,
+        sr_auto_cb, sr_steps_sl,
     ]
 
     @LOG.ui_guard("synthesize.on_forget")
@@ -2153,6 +2174,8 @@ def render(ctx: AppContext):
             gr.update(value=float(P.get("director_f0_expand").default)),   # F0 扩张
             gr.update(value=bool(P.get("emo_unlock_vector_cap").default)),  # 解锁上限
             gr.update(value=bool(P.get("emo_extrapolate").default)),     # 外推
+            gr.update(value=False),                                      # 自动超分
+            gr.update(value=35),                                         # 超分步数
         ]
         assert len(ups) == len(reset_targets)
         mem = gr.update(

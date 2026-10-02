@@ -1635,17 +1635,21 @@ def pause_quota(n_chars: int) -> int:
 
 def normalize_intra_pauses(y: np.ndarray, sr: int, text_chars: int,
                            cap_ms: float = 220.0,
-                           floor_ms: float = 60.0,
+                           blend_ms: float = 30.0,
                            thresh_db: float = -30.0) -> np.ndarray:
-    """块内停顿「数量+时长」双治理：配额内的压到 cap_ms，超配额的压到
-    floor_ms（词闭合间隙的语音学水平，真人 20~80ms）。
+    """块内停顿「数量+时长+衔接」三治理（2026-10-02 第三轮：连贯感）。
 
-    背景（2026-10-02 实测）：音色库参考 28 停顿/分钟语音 + AR 先验放大
-    → 引擎输出 44~53 个/分钟，「两三个字一停」彻底打散句子。时长封顶
-    （cap_interior_pauses）治了长治不了多。本函数按块文本长度给名额：
-    保留最长的 quota 个（各压到 cap_ms），其余全部压到 floor_ms。
-    首尾 50ms 不参与；中段截法 + 5ms 切口淡化（与 _cap_pauses 同款）。
-    int16/float 均可，返回保持原 dtype。
+    超配额的微停顿不再「压短留洞」——那会留下 [词A衰减尾][静音][词B
+    起音] 的「两次说话」结构（用户听感：一句话内两个词完全不像一次
+    说出来的）。语音学事实：真人句内停顿优先表现为**末音节延长**而
+    非静音切段（hesitation phonetics）。改用播客工业的去气口（debreathe）
+    技术：整段移除静音 run，两侧 30ms **等功率交叉淡化**——词 A 的
+    衰减尾直接流入词 B 的起音，听感是「一个词拖长了一点点尾音」，
+    无跃变。配额内保留的停顿（戏剧拍）照旧中段截法压到 cap_ms，
+    留自然静音——那是有意的断句。
+
+    背景（实测）：音色库参考 28 停顿/分钟语音 + AR 先验放大 → 引擎输出
+    44~53 个/分钟。首尾 50ms 不参与；int16/float 均可，返回原 dtype。
     """
     if not cap_ms or float(cap_ms) <= 0 or len(y) < sr // 4:
         return y
@@ -1663,7 +1667,7 @@ def normalize_intra_pauses(y: np.ndarray, sr: int, text_chars: int,
     lo_frame = edge // hop
     hi_frame = max(lo_frame, (len(yf) - edge) // hop)
 
-    runs = []          # (start_sample, end_sample, dur_samples)
+    runs = []          # (start_sample, end_sample)
     i = lo_frame
     while i < hi_frame:
         if quiet[i]:
@@ -1677,29 +1681,39 @@ def normalize_intra_pauses(y: np.ndarray, sr: int, text_chars: int,
     if not runs:
         return y
 
-    # 名额：保留最长的 quota 个 → cap_ms；其余 → floor_ms
     keep = set(sorted(range(len(runs)), key=lambda k: -(runs[k][1] - runs[k][0]))
                [:quota]) if quota else set()
     fade = max(1, int(0.005 * sr))
+    ov = max(2, int(sr * float(blend_ms) / 1000.0))
     out = yf
     for k in range(len(runs) - 1, -1, -1):
         a, b = runs[k]
-        target = int(sr * (float(cap_ms) if k in keep else float(floor_ms))
-                     / 1000.0)
-        if b - a <= target:
-            continue
-        cut = (b - a) - target
-        mid_a = a + target // 2
-        mid_b = b - (target - target // 2)
-        seg = out[mid_a:mid_b]
-        out = np.concatenate([out[:mid_a], out[mid_b:]])
-        # 切口两侧 5ms 淡化兜底
-        if len(out) > mid_a + fade:
-            out[mid_a:mid_a + fade] *= np.linspace(
-                1.0, 0.0, fade, dtype=np.float32)
-        if mid_a - fade >= 0:
-            out[mid_a - fade:mid_a] *= np.linspace(
-                0.0, 1.0, fade, dtype=np.float32)
+        if k in keep:
+            # 配额内：中段截法压到 cap_ms（保留自然静音的有意断句）
+            target = int(sr * float(cap_ms) / 1000.0)
+            if b - a <= target:
+                continue
+            mid_a = a + target // 2
+            mid_b = b - (target - target // 2)
+            out = np.concatenate([out[:mid_a], out[mid_b:]])
+            if len(out) > mid_a + fade:
+                out[mid_a:mid_a + fade] *= np.linspace(
+                    1.0, 0.0, fade, dtype=np.float32)
+            if mid_a - fade >= 0:
+                out[mid_a - fade:mid_a] *= np.linspace(
+                    0.0, 1.0, fade, dtype=np.float32)
+        else:
+            # 超配额：去气口——整段移除静音 run，两侧等功率交叉淡化
+            left = out[:a].copy()
+            right = out[b:].copy()
+            o = min(ov, len(left), len(right))
+            if o > 1:
+                w = np.linspace(0.0, np.pi / 2, o, dtype=np.float32)
+                left[-o:] = (left[-o:] * np.cos(w)
+                             + right[:o] * np.sin(w))
+                out = np.concatenate([left, right[o:]])
+            else:
+                out = np.concatenate([left, right])
 
     if was_int:
         return np.clip(out * 32767.0, -32767, 32767).astype(np.int16)
