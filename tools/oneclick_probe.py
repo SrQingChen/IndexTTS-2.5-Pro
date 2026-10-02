@@ -1395,6 +1395,74 @@ def main() -> int:
             DS.delete(ds_pick)
 
         # =================================================================
+        head("[17] 指纹环节不得处理「不可能训练」的样本（2026-10-02）")
+        # =================================================================
+        # 两次真机事故的根源：S2.5/S2.6 把 990s 超长原件卷进响度锚定 / 频谱
+        # 画像 / F0 指纹 —— 43.7M 采样被全量解码四趟，pyworld harvest 在它
+        # 上面直接把进程 C 层 abort（另一次是修复前的并行体检 STFT 打爆堆，
+        # 0xc0000409）。指纹描述的应该是**训练素材**。与 [15] 的识别阶段同
+        # 一条原则：按时长过滤，不按 status（原件是 no_text，按状态拦不住）。
+        from webui_app.services import audio_lab as AL2
+
+        ds_fp = "probe_fp_exclude"
+        if DS.exists(ds_fp):
+            DS.delete(ds_fp)
+        DS.create(ds_fp, note="fingerprint exclude probe")
+        _fp_src = make_long_wav(os.path.join(tmp, "fp_long.wav"),
+                                pieces=16, body=2.7, gap=0.45)   # ≈ 50s > 20s
+        _fp_imp = DS.import_audio(ds_fp, [_fp_src], copy=True, lang="ZH")
+        _fp_uid = _fp_imp["ids"][0]
+        DS.split_long(ds_fp, _fp_uid, target_sec=12.0, min_sec=4.0,
+                      max_pieces=20)
+        DS.refresh_all(ds_fp, require_features=False)
+        _fp_items = DS.load_meta(ds_fp)
+        _fp_pieces = [u for u in _fp_items if u.id != _fp_uid]
+        _fp_orig = next(u for u in _fp_items if u.id == _fp_uid)
+        check("夹具就位：原件超过切片阈值、切片 ≥ 3 条",
+              float(_fp_orig.duration or 0) > 20.0 and len(_fp_pieces) >= 3,
+              f"原件 {_fp_orig.duration:.1f}s · 切片 {len(_fp_pieces)} 条")
+
+        _orig_path = _fp_orig.audio_abs(DS.dir_of(ds_fp))
+        with open(_orig_path, "rb") as _f:
+            _orig_hash = hashlib.sha256(_f.read()).hexdigest()
+        _msgs: list = []
+        _st2 = OC.stage_optimize(ds_fp, OC.OneClickOptions(),
+                                 progress=lambda f, m: _msgs.append(m))
+
+        _loud = _st2.get("loudness") or {}
+        check("响度锚定的样本数 = 切片数（原件不进指纹）",
+              int(_loud.get("n") or 0) == len(_fp_pieces),
+              f"n={_loud.get('n')} · 切片 {len(_fp_pieces)} 条")
+        with open(_orig_path, "rb") as _f:
+            check("原件字节原封不动（锚定回写不碰它）",
+                  hashlib.sha256(_f.read()).hexdigest() == _orig_hash)
+        check("三个指纹 marker 都已写盘（响度/频谱/F0）",
+              bool(DS.read_marker(ds_fp, "loudness"))
+              and bool(DS.read_marker(ds_fp, "spectral"))
+              and bool(DS.read_marker(ds_fp, "f0")),
+              str(sorted((DS.info(ds_fp).get("markers") or {}).keys())))
+        check("F0 指纹来自切片（n ≥ 3）",
+              int((DS.read_marker(ds_fp, "f0") or {}).get("n") or 0) >= 3)
+        check("指纹环节有逐条进度（不再是大黑箱静默）",
+              any("响度测量" in m for m in _msgs)
+              and any("响度锚定" in m for m in _msgs)
+              and any("F0 指纹" in m for m in _msgs),
+              f"共 {len(_msgs)} 条进度")
+
+        # f0_stats 的 30s 上限：40 份原件拼接 ≈ 44M 采样，与事故同量级 ——
+        # 修复前 pyworld harvest 在这个规模上直接 Fatal error: Aborted。
+        _y_big = np.concatenate([AL2.load_audio(_orig_path)[0]] * 40)
+        _t0 = time.perf_counter()
+        _big = AL2.f0_stats(_y_big, 22050)
+        check("f0_stats 对 44M 采样输入正常返回（30s 截断生效，不 abort）",
+              bool(_big) and time.perf_counter() - _t0 < 30.0,
+              f"{len(_y_big) / 1e6:.0f}M 采样 · "
+              f"{time.perf_counter() - _t0:.1f}s")
+
+        if DS.exists(ds_fp):
+            DS.delete(ds_fp)
+
+        # =================================================================
         head("清理")
         # =================================================================
         for d in (ds_name, ds_small, "probe_par_seq", "probe_par_par"):
@@ -1408,7 +1476,7 @@ def main() -> int:
                   "probe_par_seq", "probe_par_par", "probe_slice",
                   "probe_slice2", "probe_slice3",
                   "probe_one_decode", "probe_asr_skip",
-                  "probe_degenerate", "probe_pick"):
+                  "probe_degenerate", "probe_pick", "probe_fp_exclude"):
             try:
                 if DS.exists(d):
                     DS.delete(d)

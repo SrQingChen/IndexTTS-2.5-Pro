@@ -1579,6 +1579,12 @@ def f0_stats(y: np.ndarray, sr: int) -> Dict[str, Any]:
         y64 = np.asarray(y, dtype=np.float64)
         if len(y64) < sr // 4:
             return {}
+        # 超长输入截到前 30s：harvest 的内存随样本数线性膨胀，43.7M 采样
+        # （990s 原件）实测直接 C 层 Fatal error: Aborted（2026-10-02 一键
+        # 三连事故）。指纹统计要的是分布，30s 已是数万帧，绰绰有余。
+        _cap = int(sr) * 30
+        if len(y64) > _cap:
+            y64 = y64[:_cap]
         f0, _t = pw.harvest(y64, sr, f0_floor=70.0, f0_ceil=600.0)
         voiced = f0[f0 > 0]
         if len(voiced) < max(20, sr // 800):

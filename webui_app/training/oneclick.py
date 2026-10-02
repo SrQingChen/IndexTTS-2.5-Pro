@@ -925,9 +925,11 @@ def stage_optimize(dataset: str, opt: OneClickOptions,
             out["denoise_note"] = note
 
     FT._apply_meta(dataset, touched)
+    # 进度带分配：体检 0.90~0.94，下面 S2.5/S2.6 的指纹环节占 0.94~1.00 ——
+    # 指纹段也有逐条进度，不再是一个几分钟不动的大黑箱。
     DS.refresh_all(dataset, require_features=False,
                    workers=workers,
-                   progress=lambda f, m: cb(0.9 + 0.1 * f, m))
+                   progress=lambda f, m: cb(0.90 + 0.04 * f, m))
 
     after = {x.id: x for x in DS.load_meta(dataset)}
     for uid in touched:
@@ -951,23 +953,30 @@ def stage_optimize(dataset: str, opt: OneClickOptions,
     # 训练结束随 run.json 交付，推理端逐块采样复现。
     try:
         import numpy as _np
+        # 指纹只统计**可训练时长**的 wav（≤ slice_over_sec，与上面 enhance 的
+        # todo 同一口径）。超长原件永远不参与训练（S4 会按状态淘汰），把它卷
+        # 进指纹是 2026-10-02 两次事故的根源：990s 原件 43.7M 采样被全量解码
+        # 四趟，pyworld harvest 在它上面直接把进程 C 层 abort，其余环节分钟级
+        # 静默。指纹本来就该描述**训练素材**，而不是原件。
+        _cap_sec = float(opt.slice_over_sec)
+        _wav_items = [(u, u.audio_abs(ds_dir)) for u in DS.load_meta(dataset)
+                      if (u.audio_abs(ds_dir) or "").lower().endswith(".wav")
+                      and os.path.isfile(u.audio_abs(ds_dir))
+                      and float(u.duration or 0.0) <= _cap_sec]
+        _n_wav = len(_wav_items)
+
         _lu = []
-        for _u in DS.load_meta(dataset):
-            _ap = _u.audio_abs(ds_dir)
+        for _i, (_u, _ap) in enumerate(_wav_items):
             # 只测 wav：数据集里的 mp3/m4a 原件（不可训练的超长源）会让
             # sf.write(PCM_16) 抛 Invalid combination —— 一个坏文件曾把
             # 整个锚定阶段取消（实测 2026-09-29 19:01 的运行）
-            if (_ap and os.path.isfile(_ap)
-                    and _ap.lower().endswith(".wav")):
-                _lu.append(AL.measure_loudness(_ap))
+            _lu.append(AL.measure_loudness(_ap))
+            cb(0.94 + 0.01 * (_i + 1) / max(1, _n_wav),
+               f"响度测量 {_i + 1}/{_n_wav}")
         _anchor = AL.anchor_gain(_lu, target_dbfs=float(opt.loudness_target_db))
         _lu_post: List[float] = []
         if _anchor["n"]:
-            for _u in DS.load_meta(dataset):
-                _ap = _u.audio_abs(ds_dir)
-                if not (_ap and os.path.isfile(_ap)
-                        and _ap.lower().endswith(".wav")):
-                    continue
+            for _i, (_u, _ap) in enumerate(_wav_items):
                 try:
                     _y, _sr = AL.load_audio(_ap)
                     _y2 = AL.apply_anchor(_y, _anchor)
@@ -979,6 +988,8 @@ def stage_optimize(dataset: str, opt: OneClickOptions,
                 except Exception as _fe:
                     LOG.get_logger("oneclick.optimize").warning(
                         "响度锚定跳过 %s：%s", _u.id, _fe)
+                cb(0.95 + 0.02 * (_i + 1) / max(1, _n_wav),
+                   f"响度锚定 {_i + 1}/{_n_wav} · {_u.id}")
             _fp = AL.loudness_fingerprint(_lu_post or _lu)
             out["loudness"] = {
                 "mode": "median_anchor", "n": _anchor["n"],
@@ -987,32 +998,39 @@ def stage_optimize(dataset: str, opt: OneClickOptions,
                 "fingerprint": _fp,
             }
             DS.write_marker(dataset, "loudness", _fp)
+            tail += (f" · 响度锚定 {_anchor['gain_db']:+.1f}dB"
+                     f"（中位 {_anchor['median_db']:.1f}，相对响度保留）")
             # 频谱画像（6 频段占比+质心）：推理端用它把音色参考的包络
             # 向角色本人素材靠拢（实测：闷参考→闷输出，300-1kHz 47.5%
             # 遗传成 33.7%——参考是克隆链的频谱模板，必须先修它）
             try:
-                _sp = AL.dataset_band_profile([
-                    _u.audio_abs(ds_dir) for _u in DS.load_meta(dataset)
-                    if (_u.audio_abs(ds_dir) or "").lower().endswith(".wav")
-                    and os.path.isfile(_u.audio_abs(ds_dir))])
+                _sp = AL.dataset_band_profile([_ap for _u, _ap in _wav_items])
                 if _sp:
                     DS.write_marker(dataset, "spectral", _sp)
                     out["spectral"] = _sp
+                cb(0.975, f"频谱画像完成（{_n_wav} 条）")
             except Exception as _se:
                 LOG.get_logger("oneclick.optimize").warning(
                     "频谱画像计算失败（跳过）：%s", _se)
 
         # ---- S2.6 F0 指纹（音域恢复用，pyworld harvest,子采样 ≤40 条）----
+        # sr 必须传文件**真实**采样率：切片件是 22050 没错，但数据集里可能
+        # 有 44.1k 的导入件，硬编码 22050 会把 harvest 的时间轴整整拉错。
         try:
-            _wavs = [_u.audio_abs(ds_dir) for _u in DS.load_meta(dataset)
-                     if (_u.audio_abs(ds_dir) or "").lower().endswith(".wav")
-                     and os.path.isfile(_u.audio_abs(ds_dir))]
             import random as _rnd
             _rnd.seed(1234)
-            if len(_wavs) > 40:
-                _wavs = _rnd.sample(_wavs, 40)
-            _stats = [AL.f0_stats(AL.load_audio(_w)[0], 22050)
-                      for _w in _wavs]
+            _pool = list(_wav_items)
+            if len(_pool) > 40:
+                _pool = _rnd.sample(_pool, 40)
+            _stats = []
+            for _i, (_u, _w) in enumerate(_pool):
+                if should_stop and should_stop():
+                    out["stopped"] = True
+                    break
+                _wy, _wsr = AL.load_audio(_w)
+                _stats.append(AL.f0_stats(_wy, _wsr))
+                cb(0.98 + 0.02 * (_i + 1) / max(1, len(_pool)),
+                   f"F0 指纹 {_i + 1}/{len(_pool)} · {_u.id}")
             _stats = [x for x in _stats if x]
             if len(_stats) >= 3:
                 import numpy as _np2
@@ -1032,8 +1050,6 @@ def stage_optimize(dataset: str, opt: OneClickOptions,
         except Exception as _e2:
             LOG.get_logger("oneclick.optimize").warning(
                 "F0 指纹计算失败（跳过）：%s", _e2)
-            tail += (f" · 响度锚定 {_anchor['gain_db']:+.1f}dB"
-                     f"（中位 {_anchor['median_db']:.1f}，相对响度保留）")
     except Exception as _e:
         LOG.get_logger("oneclick.optimize").warning(
             "响度锚定失败（跳过，不影响训练）：%s: %s",
