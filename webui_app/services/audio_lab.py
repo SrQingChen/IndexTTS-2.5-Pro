@@ -198,7 +198,14 @@ def analyze(path: str) -> AudioReport:
         r.channels = int(info.channels)
         r.sample_rate = int(info.samplerate)
 
-        y, sr = librosa.load(path, sr=None, mono=True)
+        # 超长文件只分析前 30s（时长/采样率用 sf.info 的元数据真值）——
+        # 990s 原件的 spectral_centroid STFT 单个就要 0.7 GB，4 worker
+        # 并行 2.8 GB，实测把 C 运行时堆打爆（0xc0000409 硬崩、无 Python
+        # 异常，2026-10-02 事故）。原件本来不可训练，不需要全量频谱。
+        true_duration = float(info.duration)
+        load_sec = min(true_duration, 30.0)
+        y, sr = librosa.load(path, sr=None, mono=True,
+                             duration=load_sec)
         y = np.asarray(y, dtype=np.float32)
     except Exception as e:
         r.error = f"{type(e).__name__}: {e}"
@@ -209,7 +216,7 @@ def analyze(path: str) -> AudioReport:
         return r
 
     r.ok = True
-    r.duration = float(len(y) / sr)
+    r.duration = true_duration
     r.peak_dbfs = float(20 * np.log10(max(np.max(np.abs(y)), 1e-10)))
     r.rms_dbfs = float(20 * np.log10(max(np.sqrt(np.mean(y.astype(np.float64) ** 2)), 1e-10)))
     r.clip_ratio = float(np.mean(np.abs(y) >= 0.999))

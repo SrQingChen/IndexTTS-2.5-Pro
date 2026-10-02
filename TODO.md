@@ -1220,3 +1220,34 @@ audio_sr_probe **9/9**(未安装报错文案/--no-deps 提示、桩模型懒加�
 loudness_probe **23/23**（F0: std 0.71→4.09 半音、中位保持 196.6；重音精确 +2.00dB、非重音区不动）·
 orchestrator 50/50 · director 31/31 · oneclick 273 · synth_state 35 · audio_sr 9/9 ·
 build/ui_output 过。真机 A/B 留给用户。
+
+## 阶段 16 · 一键三连 Broken Connection 崩溃修复（2026-10-02）
+
+### 症状与取证
+
+用户一键三连中报 Gradio「Broken Connection」。取证链：
+1. indextts.log 心跳停在 13:43:34（"优化 · 体检 1/56 · 已静默 317 秒"），此后再无输出；
+2. error.log **无 Python 异常**（最后条目 9/30）——不是 Python 层错误；
+3. **Windows 事件日志 13:43:45:python.exe 崩溃,异常码 0xc0000409
+   (STATUS_STACK_BUFFER_OVERRUN), 模块 ucrtbase.dll**——C 运行时检测到
+   缓冲区溢出/堆损坏,进程直接被杀,Python 异常处理来不及跑。
+
+### 根因
+
+`DS.refresh_all()` 对**全部**数据集条目做 `AL.analyze()`——包括 990.8 秒
+的长音频原件（不可训练、后续会被跳过）。`analyze()` 里的
+`librosa.feature.spectral_centroid` 对全量 43.7M 样本做 STFT:
+**单个 0.7 GB,4 个 worker 并行最坏 2.8 GB**——叠加引擎/系统/其他进程,
+把堆打爆,C 运行时的安全检查触发 fast-fail。
+
+### 修复
+
+| 件 | 说明 |
+|---|---|
+| `analyze()` 超长截断 | `librosa.load(..., duration=min(true_duration, 30))`——只分析前 30 秒;时长/采样率用 `sf.info` 元数据真值（不影响 too_long 判定）。实测 990s 文件 2.34s 完成(原来会分钟级+GB 级内存) |
+| faulthandler | `webui_pro.py` 入口最先启用——C 层崩溃时至少能打印 Python 调用到 stderr,不再"静默死亡" |
+
+### 验收
+
+lab_probe 全过 · loudness 23/23 · oneclick 273 · build 过 · 990s 文件
+analyze 实测 2.34s / duration 真值 990.8s。

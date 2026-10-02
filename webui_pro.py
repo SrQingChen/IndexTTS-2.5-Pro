@@ -68,6 +68,13 @@ def main() -> int:
 
     cfg = config_from_args(sys.argv[1:])
 
+    # **faulthandler 最先打开**：C 扩展崩溃（段错误/堆损坏）不走 Python
+    # 异常——没有它，进程死了 error.log 干干净净，唯一线索是 Windows 事件
+    # 日志里的 0xc0000409（实测 2026-10-02 优化阶段硬崩事故）。有它，
+    # 崩溃时至少能打印 Python 层的调用栈到 stderr。
+    import faulthandler
+    faulthandler.enable()
+
     # 日志要在做任何实事之前就绪：启动阶段的问题同样需要留证据。
     # 文件落在 outputs/logs/（indextts.log 全量 + error.log 只看问题），
     # 级别可用 --log-level DEBUG 打开，界面「系统」页也能实时看与切。
