@@ -1244,16 +1244,26 @@ def sample_target_loudness(fp: Dict[str, Any], intensity: float,
 
 def apply_block_loudness(y: np.ndarray, target_dbfs: float,
                          peak_ceiling_db: float = -1.0) -> np.ndarray:
-    """把一个合成块调到目标响度（纯增益 + 峰值保护）。"""
-    cur = rms_dbfs(y)
+    """把一个合成块调到目标响度（纯增益 + 峰值保护）。
+
+    int16 / float 波形均可（内部按 ±1 浮点尺度运算后还原 dtype）——
+    target_dbfs 与峰值阈值都是 ±1 尺度的量，int16 直传会算错增益
+    （与 apply_stress_gains 同族的尺度陷阱，2026-10-02 一并加固）。
+    """
+    was_int = np.issubdtype(np.asarray(y).dtype, np.integer)
+    yf = (np.asarray(y, dtype=np.float32) / 32768.0 if was_int
+          else np.asarray(y, dtype=np.float32))
+    cur = rms_dbfs(yf)
     if cur <= -100.0:
         return y
     gain = 10 ** ((target_dbfs - cur) / 20.0)
-    out = y * gain
+    out = yf * gain
     peak = float(np.max(np.abs(out))) if len(out) else 0.0
     limit = 10 ** (peak_ceiling_db / 20.0)
     if peak > limit:
         out = out * (limit / peak)
+    if was_int:
+        return np.clip(out * 32767.0, -32767, 32767).astype(np.int16)
     return out.astype(np.float32)
 
 
@@ -1543,12 +1553,18 @@ def apply_stress_gains(y: np.ndarray, sr: int,
 
     stress_spans: [(start_s, end_s)]（已按时间排序、去重叠）。
     gain_db ≤ 0 时原样返回。峰值保护 -1dBFS。
+    int16 / float 波形均可（内部按 ±1 浮点尺度运算后还原 dtype）——
+    峰值阈值 0.891 只对 ±1 尺度有意义；编排器传的是 int16，此前直接
+    拿 ±32767 尺度的峰值与 0.891 比较，重音段被整体压到数字静音
+    （2026-10-02「成品只剩一两个残缺声音」事故的根因）。
     """
     import numpy as _np
     g = 10 ** (float(gain_db) / 20.0)
     if g <= 1.001 or not stress_spans:
         return y
-    out = y.astype(np.float32).copy()
+    was_int = np.issubdtype(np.asarray(y).dtype, np.integer)
+    out = (np.asarray(y, dtype=np.float32) / 32768.0 if was_int
+           else np.asarray(y, dtype=np.float32)).copy()
     ramp = max(1, int(sr * float(ramp_ms) / 1000.0))
     for a_s, b_s in stress_spans:
         a = max(0, int(a_s * sr) - ramp // 2)
@@ -1565,7 +1581,9 @@ def apply_stress_gains(y: np.ndarray, sr: int,
         if peak > 10 ** (-1.0 / 20.0):
             seg2 *= (10 ** (-1.0 / 20.0) / peak)
         out[a:b] = seg2
-    return out.astype(y.dtype)
+    if was_int:
+        return np.clip(out * 32767.0, -32767, 32767).astype(np.int16)
+    return out.astype(np.asarray(y).dtype)
 
 
 def f0_stats(y: np.ndarray, sr: int) -> Dict[str, Any]:

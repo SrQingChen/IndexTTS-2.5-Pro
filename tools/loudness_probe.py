@@ -97,6 +97,34 @@ def main() -> int:
     mid1 = ye[int(len(yi)*0.4) + int(SR*0.08): int(len(yi)*0.6) + int(SR*0.08)]
     check("中段原样", np.array_equal(mid0, mid1))
 
+    # ---- 3b. int16 尺度陷阱回归（2026-10-02 成品静音事故）----
+    # 编排器把 int16 的块直接传给 apply_stress_gains / apply_block_loudness；
+    # 两函数内部的峰值阈值（±1 尺度）曾直接与 ±32767 尺度的峰值比较，
+    # 重音段被整体压到数字静音——成品听感「一句只剩一两个残缺声音」。
+    _y16 = (_tone(3.0, 0.5) * 32767).astype(np.int16)
+    _spans = [(1.0, 2.0)]
+    _g16 = AL.apply_stress_gains(_y16, SR, _spans, gain_db=2.0)
+    _norm = lambda v: (v.astype(np.float32) / 32768.0
+                       if np.issubdtype(v.dtype, np.integer)
+                       else v.astype(np.float32))
+    _r = lambda v, a, b: 20 * np.log10(np.sqrt(np.mean(
+        _norm(v)[int(a*SR):int(b*SR)] ** 2)) + 1e-12)
+    check("stress int16：重音区增益正常（非静音）",
+          _r(_g16, 1.1, 1.9) - _r(_y16, 1.1, 1.9) > 1.0
+          and float(np.max(np.abs(_g16))) > 1000,
+          f"重音区 {_r(_y16,1.1,1.9):.1f}→{_r(_g16,1.1,1.9):.1f}dB · "
+          f"peak={float(np.max(np.abs(_g16))):.0f}")
+    check("stress int16：非重音区原样",
+          abs(_r(_g16, 0.1, 0.9) - _r(_y16, 0.1, 0.9)) < 0.01)
+    _f32 = AL.apply_stress_gains(_tone(3.0, 0.5), SR, _spans, gain_db=2.0)
+    check("stress float32：与 int16 行为一致",
+          abs(_r(_f32, 1.1, 1.9) - _r(_g16, 1.1, 1.9)) < 0.1)
+    _b16 = AL.apply_block_loudness(_y16, -20.0)
+    check("block_loudness int16：RMS 精确到目标",
+          _b16.dtype == np.int16 and abs(AL.rms_dbfs(
+              _b16.astype(np.float32) / 32768.0) + 20.0) < 0.1,
+          f"{AL.rms_dbfs(_b16.astype(np.float32) / 32768.0):.1f}")
+
     print("== 4. 呼吸库（检测/建库/插入决策） ==")
     from webui_app.services import breath_bank as BB
     # 合成"吸气":低幅高频噪声 0.3s → 语音 0.8s
