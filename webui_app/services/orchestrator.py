@@ -406,12 +406,26 @@ def perform(
             xf = int(0.060 * SR)
 
             prev_tail = prev_y[-int(11.0 * SR):]
+            # 参考韵律摊平对滚动参考同样生效（2026-10-03 连续性修复）：
+            # prev_tail 是上一块**未经输出治理的原始波形**，带着模型自发
+            # 的词组化停顿（实测 44~53 个/分钟）——不摊平的话，第 2 块起
+            # 的参考把散感韵律重新教回模型，阶段28只治了块 1（实测用户
+            # 成品停顿密度 147/分钟 vs 单次直出 98）。这里用与基础参考同一
+            # 把刀（>flatten_cap_ms 停顿封顶，中段截，语音/音色不动）。
+            if flatten_ref:
+                prev_tail = AL.cap_interior_pauses(
+                    prev_tail, SR, int(flatten_cap_ms), thresh_db=-30.0)
             ref_part = ref_y[max(0, len(ref_y) - (fixed - len(prev_tail))):]
             # 参考不够填 → 拉长上一块的占用；两者合计仍不足 14s 就**短着用**
             # ——绝不补零（静音参考稀释条件是实测过的病）。代价是这种罕见
             # 场景多一次 cuDNN 形状调优；正常素材（参考≥6s）恒为 14.0s。
             if len(ref_part) + len(prev_tail) < fixed:
-                prev_tail = prev_y[-(fixed - len(ref_part)):]                     if fixed - len(ref_part) <= len(prev_y) else prev_y
+                _need = fixed - len(ref_part)
+                prev_tail = (prev_y[-_need:] if _need <= len(prev_y)
+                             else prev_y)
+                if flatten_ref:
+                    prev_tail = AL.cap_interior_pauses(
+                        prev_tail, SR, int(flatten_cap_ms), thresh_db=-30.0)
 
             # 段间电平匹配（按各自语音 RMS，±6dB 限幅）—— 电平差会让
             # 交叉淡化处出现台阶，条件特征读到「音量突变」
@@ -636,8 +650,12 @@ def perform(
                 wav = np.clip(y * 32767.0, -32767, 32767).astype(np.int16)
 
             # ---- 词级重音（LLM/规则标注 + 字符时间映射 + 局部增益）----
+            # 短块（<10 字）跳过（2026-10-03 阶梯感修复）：整块只有一个
+            # 韵律词组时，重音增益不是「聚焦」而是电平台阶——真机 4 字块
+            # 「因为这样……」上给末 2 字 +2dB，用户听到明显的两次合成感。
             stressed: List[str] = []
-            if stress_enable and stress_gain_db > 0 and blk.get("stress_words"):
+            if (stress_enable and stress_gain_db > 0
+                    and blk.get("stress_words") and len(blk_text) >= 10):
                 try:
                     _y = wav.astype(np.float32) / 32768.0
                     _fr = int(SR * 0.025)
@@ -800,6 +818,20 @@ def perform(
 
     # 台本落盘为旁车文件（观测/复现用；清理页会随 outputs/ 一起盘点）
     sidecar = os.path.splitext(out_base)[0] + ".script.json"
+    # code_rev：合成时实际运行的代码版本。WebUI 改完代码不重启的话，
+    # 进程里还是旧逻辑，而旁车里的一切看起来都正常——2026-10-03 用户
+    # 两次合成全部带着「阶段24 之前」的旧进程跑出（170ms 停顿在 quota=0
+    # 块里存活），只能靠行为反推进程年龄。落盘 git 短 SHA 让这类事一眼
+    # 可判。取不到（非 git 环境）就留空，不影响主流程。
+    try:
+        import subprocess as _sp
+        code_rev = _sp.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=os.path.dirname(os.path.abspath(__file__)),
+            capture_output=True, text=True, timeout=5,
+        ).stdout.strip() or ""
+    except Exception:
+        code_rev = ""
     try:
         with open(sidecar, "w", encoding="utf-8") as f:
             json.dump({
@@ -807,7 +839,7 @@ def perform(
                 "error": script.error, "character": character,
                 "routed": routed, "fallback": fallback,
                 "base_seed": base_seed, "lines_in": len(script.lines),
-                "blocks": n, "lines": line_infos,
+                "blocks": n, "code_rev": code_rev, "lines": line_infos,
             }, f, ensure_ascii=False, indent=2)
     except Exception:
         log.warning("台本旁车文件写失败：%s", sidecar, exc_info=True)

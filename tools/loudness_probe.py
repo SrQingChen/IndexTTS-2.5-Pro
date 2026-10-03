@@ -380,6 +380,33 @@ def main() -> int:
           _zG.dtype == np.int16 and _rrG and _rrG[0][1] >= 90,
           f"{_rrG}")
 
+    # ---- 3g. 门槛帧量化盲区（2026-10-03 第五轮补丁）----
+    # 事故：物理 150~176ms 的停顿帧化后只检出 150ms（3300 样本 < 门槛
+    # 3307），正好逃逸——真机块1「因为|这样」170ms 停顿就这样漏网。
+    # 补丁：治理门槛按「检出 ≥ min_run - 1帧」判；塞音闭合/词间隙仍保护。
+    _yg = np.concatenate([
+        _tone(0.9, 0.5), np.zeros(int(0.170 * SR), np.float32),
+        _tone(0.9, 0.5)])
+    _zg = AL.normalize_intra_pauses(_yg, SR, text_chars=11, cap_ms=220)
+    check("事故案例：170ms 物理停顿不再逃逸（quota 0 → 压到微气口）",
+          len(_zg) < len(_yg) and all(d < 80 for _, d in _runs_ms_at(_zg)),
+          f"{_runs_ms_at(_zg)} · 长度 -{(len(_yg)-len(_zg))/SR*1000:.0f}ms")
+    _ygap = np.concatenate([
+        _tone(0.9, 0.5), np.zeros(int(0.130 * SR), np.float32),
+        _tone(0.9, 0.5)])
+    _zgap = AL.normalize_intra_pauses(_ygap, SR, text_chars=11, cap_ms=220)
+    check("对照组：130ms 词间隙原样保留（保护语义不变）",
+          np.array_equal(_zgap, _ygap),
+          f"{_runs_ms_at(_zgap)}")
+    # 塞音闭合保护在标点感知路径下也保持（带 text）
+    _zc = AL.normalize_intra_pauses(
+        _qy_closure, SR, text_chars=11, cap_ms=220,
+        text="我们走吧外面雨停了啊。",
+        punct_floor_ms=_lo_ms, punct_cap_ms=_hi_ms)
+    check("塞音闭合保护：标点感知路径 60/90ms 闭合仍原样",
+          _sil_ge(_zc, 45) == 2 and len(_zc) == len(_qy_closure),
+          f"长度 {len(_qy_closure)/SR:.2f}→{len(_zc)/SR:.2f}s")
+
     print("== 4. 呼吸库（检测/建库/插入决策） ==")
     from webui_app.services import breath_bank as BB
     # 合成"吸气":低幅高频噪声 0.3s → 语音 0.8s

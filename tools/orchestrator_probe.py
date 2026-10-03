@@ -325,6 +325,62 @@ def main() -> int:
     data12 = _json.load(open(res12["director"]["sidecar"], encoding="utf-8"))
     check("台本记录 rolling_ref", data12["lines"][0].get("rolling_ref") is False
           and data12["lines"][1].get("rolling_ref") is True)
+
+    # ---- 滚动参考继承摊平（2026-10-03 连续性修复回归）----
+    # prev_tail 是上一块原始波形（未经输出治理），带模型自发的词组化
+    # 停顿；不摊平的话第 2 块起的参考把散感韵律教回模型。桩引擎这次
+    # 产「语音-500ms静音-语音」块，断言滚动参考里 >300ms 内部静音消失。
+    class _StubEngineGappy(_StubEngine):
+        def infer(self, progress=None, **kw):
+            import shutil as _sh
+            pp = str(kw.get("spk_audio_prompt") or "")
+            if "prompt_blk" in pp and os.path.isfile(pp):
+                _sh.copy2(pp, os.path.join(self.keep_dir,
+                                           os.path.basename(pp)))
+            self.calls.append(kw)
+            path = kw["output_path"]
+            sf.write(path, np.concatenate([
+                (np.random.default_rng(1).normal(
+                    0, 0.05, int(SR * LINE_SEC)) * 32767).astype(np.int16),
+                np.zeros(int(0.50 * SR), np.int16),
+                (np.random.default_rng(2).normal(
+                    0, 0.05, int(SR * LINE_SEC)) * 32767).astype(np.int16),
+            ]), SR, subtype="PCM_16")
+            return path
+
+    eng14 = _StubEngineGappy(_Cfg_populate(tmp))
+    # 桩的基础参考要给足电平（_make_wav 的 ±1000 噪声只有 -35dB，在
+    # -30dB 判定线下整条算静音，会把断言污染成「参考本身就是大停顿」）
+    spk14 = os.path.join(tmp, "spk14.wav")
+    sf.write(spk14, (np.random.default_rng(9).normal(
+        0, 0.08, int(SR * 2.0)) * 32767).astype(np.int16), SR,
+        subtype="PCM_16")
+    req14 = INF.GenRequest(spk_audio_prompt=spk14,
+                           text="你好。再见！", emo_alpha=0.65, seed=123)
+    res14 = ORC.perform(eng14, req14, sc12, route=False)
+    _p2 = eng14.calls[1]["spk_audio_prompt"]
+    _p2k = os.path.join(eng14.keep_dir, os.path.basename(_p2))
+    _ry2, _ = sf.read(_p2k, dtype="float32")
+    _fr2 = int(SR * 0.025)
+    _n2 = len(_ry2) // _fr2
+    _rms2 = np.sqrt(np.mean(
+        _ry2[:_n2 * _fr2].reshape(_n2, _fr2) ** 2, axis=1) + 1e-12)
+    _q2 = _rms2 < 10 ** (-30 / 20)
+    _maxrun, _run, _seen_any = 0, 0, False
+    for _v in _q2[int(0.1 / 0.025):int((len(_ry2) / SR - 0.1) / 0.025)]:
+        if _v:
+            _run += 1
+            _maxrun = max(_maxrun, _run)
+            _seen_any = True
+        else:
+            _run = 0
+    check("滚动参考继承摊平：上一块的 500ms 停顿在参考里 ≤250ms",
+          _seen_any and _maxrun * 0.025 <= 0.25,
+          f"最大内部静音 {_maxrun * 0.025:.2f}s")
+    _side14 = _json.load(open(res14["director"]["sidecar"], encoding="utf-8"))
+    check("旁车记录 code_rev（git 短 SHA，空也合法）",
+          isinstance(_side14.get("code_rev"), str),
+          repr(_side14.get("code_rev")))
     # continuity=False → 不构建滚动参考，两块共用同一基础参考
     eng13 = _StubEngine(_Cfg_populate(tmp))
     ORC.perform(eng13, req, sc12, route=False, continuity=False)

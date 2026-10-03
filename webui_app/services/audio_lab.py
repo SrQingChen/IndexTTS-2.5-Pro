@@ -1736,12 +1736,17 @@ def normalize_intra_pauses(y: np.ndarray, sr: int, text_chars: int,
     hi_frame = max(lo_frame, (len(yf) - edge) // hop)
     min_run = int(sr * float(min_run_ms) / 1000.0)
 
-    # 静音段全集：标点模式按**帧数**收（≥5 帧 ≈ 名义 50ms——帧化会吞掉
-    # 静音两端各半帧，样本级阈值会把 75ms 实际停顿正好卡在门外，首版
-    # 探针翻车点）；旧路径保持样本级 min_run 比较不变。
+    # 静音段收集门槛（2026-10-03 第五轮补丁）：检出时长比物理静音低估
+    # 约 25~30ms（帧窗跨界的帧不算静音）——物理 150~176ms 的停顿只检出
+    # 140~150ms，卡在样本级 150ms 门槛外逃逸（真机块1「因为|这样」170ms
+    # 停顿的漏网路径）。收集与治理统一用 min_run - 3帧 容差把边界移回
+    # 物理域 ≈150ms；塞音闭合（≤100ms 物理 → 检出 ≤80ms）与词间隙
+    # （≤130ms 物理 → 检出 ≤110ms）仍远低于门槛，保护语义不变。
+    # 标点模式另收 ≥5 帧（≈名义 50ms）的短段供逗号保底位匹配。
     punct_min_frames = max(1, int(np.ceil(_PUNCT_RUN_MS / 10.0)))
-    collect_min = min_run if not punct_mode else min(
-        min_run, punct_min_frames * hop)
+    collect_min = max(0, min_run - 3 * hop)
+    if punct_mode:
+        collect_min = min(collect_min, punct_min_frames * hop)
     runs: List[tuple] = []
     i = lo_frame
     while i < hi_frame:
@@ -1784,9 +1789,12 @@ def normalize_intra_pauses(y: np.ndarray, sr: int, text_chars: int,
                 used.add(best)
                 mandated[best] = (p_floor, p_cap)
 
-    # ---- 配额治理（只在非标点段上数名额，规则本身不变）----
+    # ---- 配额治理（非标点段；治理资格 = 检出 ≥ min_run - 3帧）----
+    # 收集门槛更低（供逗号保底位匹配短停顿），但配额治理只碰「够格的
+    # 停顿」——塞音闭合/词间隙（检出 <120ms）收集进来也不治理。
+    gov_min = max(0, min_run - 3 * hop)
     gov = [k for k in range(len(runs))
-           if k not in mandated and runs[k][1] - runs[k][0] >= min_run]
+           if k not in mandated and runs[k][1] - runs[k][0] >= gov_min]
     keep = set(sorted(gov, key=lambda k: -(runs[k][1] - runs[k][0]))
                [:quota]) if quota else set()
 
