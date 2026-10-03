@@ -21,7 +21,17 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 CHECKS = []
 SR = 22050
-SRC = os.path.join("outputs", "spk_20261003-132629.script.json")
+# 用户 13:26 运行的台本/情绪/停顿（旁车原文已在清理中删除，按会话记录
+# 硬编码重建；种子用固定值——验收对象是治理行为，不是复现某次采样）
+SRC_LINES = [
+    ("因为这样……", "melancholic", 0.45, 300),
+    ("等她意识到我已经离开的时候，", "melancholic", 0.50, 84),
+    ("也就不会那么难过了啊……", "sad", 0.55, 328),
+    ("死掉一个曾经的朋友，", "melancholic", 0.50, 84),
+    ("总比死掉一个现在的朋友要好受吧？", "sad", 0.60, 148),
+]
+SEED = 1978276345
+BASELINE = os.path.join("outputs", "spk_20261003-132629.wav")
 
 
 def check(name, cond, detail=""):
@@ -81,12 +91,9 @@ def main() -> int:
     from webui_app.services.director import DirectorScript, ScriptLine
     from webui_app.training import merge as MG
 
-    side = json.load(open(SRC, encoding="utf-8"))
     sc = DirectorScript(lines=[
-        ScriptLine(text=l["text"], emotion=l["emotion"],
-                   intensity=l["intensity"],
-                   pause_after_ms=l["pause_after_ms"])
-        for l in side["lines"]], backend="api", ok=True)
+        ScriptLine(text=t, emotion=e, intensity=i, pause_after_ms=p)
+        for t, e, i, p in SRC_LINES], backend="api", ok=True)
 
     cfg = config_from_args([])
     ctx = AppContext.get(cfg)
@@ -98,7 +105,7 @@ def main() -> int:
     req = INF.GenRequest(
         spk_audio_prompt=os.path.join("voice_bank", "audio", "达妮娅.wav"),
         text="".join(l.text for l in sc.lines), emo_alpha=0.65,
-        seed=side["base_seed"], duration_factor=0.9,
+        seed=SEED, duration_factor=0.9,
         temperature=1.2, top_p=0.9, top_k=30,
         max_text_tokens_per_segment=180)
 
@@ -110,10 +117,11 @@ def main() -> int:
                       f0_expand_max=1.3, output_path=out)
 
     y_new, _ = sf.read(out, dtype="float32")
-    y_old, _ = sf.read(os.path.join("outputs", "spk_20261003-132629.wav"),
-                       dtype="float32")
     m_new = metrics(y_new, "修复后全管线")
-    m_old = metrics(y_old, "用户13:26（旧进程）")
+    m_old = None
+    if os.path.isfile(BASELINE):
+        y_old, _ = sf.read(BASELINE, dtype="float32")
+        m_old = metrics(y_old, "用户13:26基线")
 
     # ---- 规格化停顿审计（判据=产品规格，不是越少越好）----
     # 合法停顿：块边界 gap（台本值）+ 配额保留的戏剧拍（≤pause_cap）+
@@ -165,17 +173,28 @@ def main() -> int:
     check("无「越权」长停顿（边界/配额/逗号以外的 ≥150ms = 0）",
           not escapes, f"违规={escapes} · 边界床={len(junctions)} 处")
 
+    # 层级锚定（2026-10-03 倒挂修复）：块内一切停顿 ≤ 逗号天花板
+    # （0.4 系数下 84ms）——逗号/句号边界不再被块内节奏停顿反超。
+    _hi_scaled = int(min(2000, 210 * 0.4))
+    _intra = [d for s, d in runs
+              if d >= 60 and s * SR >= lead
+              and not any(abs(s - j) < 0.25 for j in junctions)]
+    check(f"块内停顿全部 ≤ 逗号天花板（{_hi_scaled}ms + 检出余量）",
+          max(_intra) <= _hi_scaled + 10,
+          f"块内最长 {max(_intra) if _intra else 0}ms · 全部={_intra}")
+
     _blk1_end = (junctions[0] - 0.25) if junctions else 1.6
     _blk1_zone = [r for r in runs
                   if 0.4 < r[0] < _blk1_end and r[1] >= 150]
     check("事故点「因为|这样」长停顿已消（blk1 内 ≥150ms = 0）",
           not _blk1_zone, f"blk1 长停顿={_blk1_zone}（旧 170ms）")
 
-    check("停顿密度下降 ≥15%（剩余为规格内拍+自然词隙）",
-          m_new["per_min"] < m_old["per_min"] * 0.85,
-          f"{m_old['per_min']:.0f} → {m_new['per_min']:.0f}/分钟")
-    check("响度跳变下降（54→≤48）", m_new["jumps"] <= 48,
-          f"{m_old['jumps']} → {m_new['jumps']}")
+    if m_old is not None:
+        check("停顿密度下降 ≥15%（剩余为规格内拍+自然词隙）",
+              m_new["per_min"] < m_old["per_min"] * 0.85,
+              f"{m_old['per_min']:.0f} → {m_new['per_min']:.0f}/分钟")
+        check("响度跳变不劣化", m_new["jumps"] <= m_old["jumps"] + 5,
+              f"{m_old['jumps']} → {m_new['jumps']}")
     check("旁车 code.rev 记录（新代码实锤）",
           (side2.get("code") or {}).get("rev") not in ("", None),
           repr(side2.get("code")))

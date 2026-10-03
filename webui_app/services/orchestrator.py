@@ -675,14 +675,23 @@ def perform(
             # 没有停顿」。标点感知模式：块文本里每个逗号类标点按位置匹配
             # 已实现的静音，保证落在导演逗号带（×停顿系数，与块边界同一
             # 真源）；无标点路径行为不变。
+            #
+            # 层级锚定（2026-10-03）：配额拍的上限不再只看封顶滑条，而是
+            # 锚到**缩放后的逗号带上限**（cap_eff = min(滑条, 逗号带 hi)）
+            # ——块内皆句内，句内停顿不过逗号级。此前 pause_scale=0.4 时
+            # 边界逗号被压到 84ms 而块内配额拍仍可达 300ms，「逗号/句号
+            # 比句内节奏停顿还短」的倒挂由此而来；句号/省略号等更强的
+            # 停顿永远由块边界（台本带）承载，层级在任何停顿系数下成立。
+            # 默认（scale=1.0, 封顶220）下 220→210ms，听感无差。
             if pause_cap_ms and int(pause_cap_ms) > 0:
                 _pf, _pc = _comma_band(float(pause_scale or 1.0))
+                _cap_eff = min(int(pause_cap_ms), int(_pc))
                 gov_audit: List[Dict[str, Any]] = []
                 _raw_samples = int(wav.shape[0])
                 wav = AL.normalize_intra_pauses(
                     wav.astype(np.float32) / 32768.0, SR,
                     text_chars=len(blk_text),
-                    cap_ms=int(pause_cap_ms),
+                    cap_ms=_cap_eff,
                     text=blk_text,
                     punct_floor_ms=_pf, punct_cap_ms=_pc,
                     audit_out=gov_audit)
@@ -690,6 +699,8 @@ def perform(
                               32767).astype(np.int16)
                 _gov_entry = {"raw_samples": _raw_samples,
                               "out_samples": int(wav.shape[0]),
+                              "cap_ms_effective": _cap_eff,
+                              "punct_band": [_pf, _pc],
                               "audit": gov_audit}
             else:
                 _gov_entry = {"enabled": False,

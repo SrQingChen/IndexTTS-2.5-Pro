@@ -452,6 +452,43 @@ def main() -> int:
           np.array_equal(_za, AL.normalize_intra_pauses(
               _qy, SR, text_chars=20, cap_ms=220)))
 
+    # ---- 3i. 停顿层级锚定（2026-10-03 倒挂修复）----
+    # 事故：pause_scale=0.4 时块边界逗号 84ms，而块内配额拍（封顶滑条
+    # 300ms 不随 scale 缩放）仍可达 300ms、词组间隙（保护门槛固定）至
+    # 150ms——「逗号/句号比句内节奏停顿还短」。修复：标点模式下逗号带
+    # 上限成为块内一切静音的天花板（gap_ceiling_trim）；编排层配额拍
+    # 上限 = min(滑条, 逗号带 hi)。
+    _txtNC = "我们走吧外面雨停了啊。"        # 无逗号：纯测天花板
+    _yG = np.concatenate([
+        _tone(0.9, 0.5), np.zeros(int(0.135 * SR), np.float32),  # 词间隙(物理135)
+        _tone(0.6, 0.5), np.zeros(int(0.09 * SR), np.float32),   # 塞音闭合(90)
+        _tone(0.9, 0.5)])
+    _zG0 = AL.normalize_intra_pauses(
+        _yG, SR, text_chars=len(_txtNC), cap_ms=210,
+        text=_txtNC, punct_floor_ms=80, punct_cap_ms=84)        # 0.4 缩放带
+    _rG0 = _runs_ms_at(_zG0)
+    check("词组间隙越过逗号天花板被压回（检出全部 ≤84ms 且有截断）",
+          _rG0 and max(d for _, d in _rG0) <= 84
+          and len(_zG0) < len(_yG),
+          f"{_rG0}")
+    check("塞音闭合（90ms 物理，检出≤80）不受天花板影响",
+          _runs_ms_at(_zG0, 25) == [] or max(
+              d for _, d in _runs_ms_at(_zG0, 25)) <= 80,
+          f"{_runs_ms_at(_zG0, 25)}")
+    _zG1 = AL.normalize_intra_pauses(
+        _yG, SR, text_chars=len(_txtNC), cap_ms=210,
+        text=_txtNC, punct_floor_ms=120, punct_cap_ms=210)      # 1.0 带宽
+    check("对照：scale=1.0 天花板 210ms > 词间隙，零处理（默认行为不变）",
+          np.array_equal(_zG1, _yG),
+          f"{_runs_ms_at(_zG1)}")
+    _audG: list = []
+    AL.normalize_intra_pauses(
+        _yG, SR, text_chars=len(_txtNC), cap_ms=210,
+        text=_txtNC, punct_floor_ms=80, punct_cap_ms=84, audit_out=_audG)
+    check("审计：天花板修剪记为 gap_ceiling_trim",
+          any(a.get("action") == "gap_ceiling_trim" for a in _audG),
+          str([a for a in _audG if a["kind"] == "run"]))
+
     print("== 4. 呼吸库（检测/建库/插入决策） ==")
     from webui_app.services import breath_bank as BB
     # 合成"吸气":低幅高频噪声 0.3s → 语音 0.8s

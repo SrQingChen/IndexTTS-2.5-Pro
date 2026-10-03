@@ -1728,6 +1728,7 @@ def normalize_intra_pauses(y: np.ndarray, sr: int, text_chars: int,
               below_gate（检出 < 治理门槛，保护塞音闭合/词间隙）
               mandated_in_band / mandated_insert / mandated_trim（标点位）
               quota_keep_in_band / quota_keep_trim / floor_trim（配额制）
+              gap_ceiling_trim（词组间隙越过逗号天花板，压回天花板）
         punct matched_run=<下标> / no_realized_silence（无可匹配静音，跳过）
     """
     if not cap_ms or float(cap_ms) <= 0 or len(y) < sr // 4:
@@ -1789,6 +1790,10 @@ def normalize_intra_pauses(y: np.ndarray, sr: int, text_chars: int,
     # ---- 标点保底位：逗号类标点 ↔ 已实现静音段（按位置贪心匹配）----
     mandated: Dict[int, tuple] = {}          # run 下标 -> (floor_n, cap_n)
     punct_audit: List[Dict[str, Any]] = []
+    # 逗号带上限（样本域）：标点模式下它同时是**块内一切静音的天花板**
+    #（2026-10-03 层级锚定）：块内皆句内，句内停顿不过逗号级——配额拍与
+    # 词组间隙都压在它之下，「词间≤逗号≤句号」在任何 pause_scale 下成立。
+    p_cap_n = int(sr * float(punct_cap_ms or 0) / 1000.0) if punct_mode else 0
     if punct_mode:
         hop_s = hop / sr
         # 首尾静音段（连到分析边界）是拼接层的辖区，不参与匹配
@@ -1846,6 +1851,12 @@ def normalize_intra_pauses(y: np.ndarray, sr: int, text_chars: int,
         elif k in gov:
             if b - a > int(sr * float(floor_ms) / 1000.0):
                 edits.append((a, b, int(sr * float(floor_ms) / 1000.0)))
+        elif punct_mode and p_cap_n and b - a > p_cap_n:
+            # 低于治理门槛的词组间隙越过逗号天花板 → 压回天花板（中段截，
+            # 与历版同一把刀；塞音闭合检出 ≤80ms，永远低于 84ms 级天花板，
+            # 不受影响）。scale=1.0 时天花板 210ms > 词间隙检出上限 120ms，
+            # 此分支天然不触发——默认行为零变化。
+            edits.append((a, b, p_cap_n))
 
     # ---- 审计输出：每段静音的处置与原因（旁车落盘用）----
     if audit_out is not None:
@@ -1864,6 +1875,8 @@ def normalize_intra_pauses(y: np.ndarray, sr: int, text_chars: int,
                           else "quota_keep_in_band")
             elif k in gov:
                 action = "floor_trim" if (a, b) in edit_at else "untouched"
+            elif punct_mode and (a, b) in edit_at:
+                action = "gap_ceiling_trim"   # 词组间隙压到逗号天花板
             else:
                 action = "below_gate"        # 收集到但不够格治理（受保护）
             audit_out.append({
