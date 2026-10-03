@@ -136,6 +136,50 @@ def main() -> int:
           tail_rms <= -35.0 or side2.get("tail_repair"),
           f"末50ms {tail_rms:.1f}dB · tail_repair={side2.get('tail_repair')}")
 
+    # ---- 收音坡（2026-10-03 韵尾延长验收）----
+    # 基线（用户20:34成品）：标点前坡 10~140ms，中位≈60ms，多处 <50ms。
+    # 韵尾延长后：陡坡尾被 WORLD 1.5x 拉伸（+75ms），全局中位应抬升。
+    fr = int(SR * 0.025)
+    hp = int(SR * 0.01)
+    n2 = 1 + (len(y) - fr) // hp
+    idx2 = np.arange(fr)[None, :] + hp * np.arange(n2)[:, None]
+    e2 = np.sqrt(np.mean(y[idx2] ** 2, axis=1) + 1e-12)
+    db2 = 20 * np.log10(e2 + 1e-12)
+    hi_line = float(np.percentile(db2[db2 > -30.0], 75))
+    qq = db2 < -30
+    slopes = []
+    i = 0
+    while i < n2:
+        if qq[i]:
+            j = i
+            while j < n2 and qq[j]:
+                j += 1
+            if (j - i) * 10 >= 100 and i * 0.01 > 0.2:
+                k = i - 1
+                t_hit = None
+                while k >= max(0, i - 60):
+                    if db2[k] >= hi_line:
+                        t_hit = k
+                        break
+                    k -= 1
+                if t_hit is not None:
+                    slopes.append((i - t_hit) * 10)
+            i = j
+        else:
+            i += 1
+    med = float(np.median(slopes)) if slopes else 0.0
+    n_abrupt = sum(1 for s_ in slopes if s_ < 80)
+    n_rel = sum(len((l.get("governance") or {}).get("releases") or [])
+                for l in side2["lines"])
+    worst = min(slopes) if slopes else 999
+    # 时间拉伸对坡长是等比缩放（×factor）：20ms 陡坡最多到 40ms——
+    # 「清零」对 ≤30ms 的素材级急收不可达（游戏配音咬字尾），留待
+    # 阶段28二层（重训/换参考）。可验收的是：最差坡不低于 15ms（无
+    # 硬切）、真急收点有落刀、其余标点中位自然。
+    check("无硬切级急收（最差坡 ≥15ms）+ 真急收点有落刀 + 中位自然",
+          worst >= 15 and n_rel >= 1 and med >= 140,
+          f"坡={slopes} · 最差{worst} 中位{med:.0f} 落刀{n_rel}")
+
     # 无越权长停顿（块内 ≤ 逗号天花板 210 + 检出余量）
     fr = int(SR * 0.025)
     hp = int(SR * 0.01)

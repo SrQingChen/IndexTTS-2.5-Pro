@@ -1956,6 +1956,178 @@ def repair_truncated_tail(y: np.ndarray, sr: int,
     return out
 
 
+def lengthen_abrupt_releases(y: np.ndarray, sr: int,
+                             min_run_ms: float = 100.0,
+                             slope_max_ms: float = 80.0,
+                             take_ms: float = 150.0,
+                             factor: float = 2.0,
+                             seam_ms: float = 15.0,
+                             max_releases: int = 4
+                             ) -> Tuple[np.ndarray, List[Dict[str, Any]]]:
+    """对「急收尾」做韵尾延长（final lengthening 的输出侧合成）。
+
+    背景（2026-10-03 爱弥斯实锤）：该 LoRA 把标点前的收音渲染成 10~50ms
+    的陡坡（8 个 BoN 候选全部如此——游戏配音素材先验，选择侧无解），
+    听感「戛然而止/收音超级快」。语音学上真人句内/句末停顿的实现是
+    **末音节延长**而非静音切段（阶段25已引）。这里对停顿前的尾段做
+    WORLD 时长拉伸（音高/谱不变），把陡坡拖成可感知的收音。
+
+    触发条件（全部满足才动，保守）：
+      · 该停顿检出 ≥min_run_ms（词间隙级别的小缝不碰）；
+      · 峰相对坡长 <slope_max_ms（「语音主体线」帧峰-8dB 滑到停顿的
+        时长；自然收音 100~300ms 的坡不触发。不能用绝对 dB 线——素材
+        电平低时永不触发，真机实锤）；
+      · 尾段有足够浊音帧（harvest 守卫：纯气息/无谐波不做 WORLD）；
+      · 每块最多 max_releases 处（防整段拖沓）。
+    施工：WORLD 分析 [停顿前 take_ms]，谱帧线性插值到 factor 倍长后重
+    合成，首接缝 seam_ms 等功率交叉淡化、末端 20ms 淡出（落在停顿里）；
+    从后往前处理，偏移不互相影响。int16/float 均可，
+    返回 (波形, [{at_s, added_ms}, ...])。
+    """
+    was_int = np.issubdtype(np.asarray(y).dtype, np.integer)
+    yf = (np.asarray(y, dtype=np.float32) / 32768.0 if was_int
+          else np.asarray(y, dtype=np.float32))
+    if len(yf) < sr // 2:
+        return y, []
+
+    db, n = _frames_db(yf, sr, frame_ms=25.0, hop_ms=10.0)
+    if not n:
+        return y, []
+    hop = int(sr * 0.01)
+    quiet = db < -30.0
+    edge = int(0.05 * sr)
+    lo_frame = edge // hop
+    hi_frame = max(lo_frame, (len(yf) - edge) // hop)
+    min_run = int(sr * float(min_run_ms) / 1000.0)
+
+    # 候选停顿（含块尾：末段有声→静音的转折也算）
+    cands: List[int] = []          # 停顿起始帧
+    i = lo_frame
+    while i < hi_frame:
+        if quiet[i]:
+            j = i
+            while j < hi_frame and quiet[j]:
+                j += 1
+            if j - i >= max(1, min_run // hop):
+                cands.append(i)
+            i = j
+        else:
+            i += 1
+
+    # 陡坡判据（2026-10-03 三次校准后定稿）：**主体相对坡长**——从
+    # 「语音主体线」（非静音帧的 p75，电平不变）滑到停顿的时长
+    # <slope_max_ms 才算急收。不能用帧峰-8dB 之类的线：块响度归一前后
+    # 峰-体距离会漂（raw 块正文离峰仅 2dB 时线掉进停顿肩部，坡长全是
+    # 假 10ms；真机实锤两轮）。用真机校准：自然收音 150~800ms 不触发，
+    # 真急收点（30ms，如「对不起，」）触发。
+    line = float(np.percentile(db[~quiet], 75)) if (~quiet).any() \
+        else float(np.max(db)) - 8.0
+    targets = []
+    for a in cands:
+        if a * hop < int(sr * 0.15):
+            continue
+        k = a - 1
+        while k >= max(0, a - 80) and db[k] < line:
+            k -= 1
+        slope_ms = (a - 1 - k) * 10 if k >= 0 else 10_000
+        if slope_ms < float(slope_max_ms):
+            targets.append(a)
+    targets = targets[-max_releases:]
+    if not targets:
+        return y, []
+
+    try:
+        import pyworld as pw
+    except Exception:
+        return y, []
+
+    out = yf.copy()
+    releases: List[Dict[str, Any]] = []
+    take = int(sr * float(take_ms) / 1000.0)
+    seam = max(1, int(sr * float(seam_ms) / 1000.0))
+    for a in reversed(targets):
+        s0 = a * hop - take
+        if s0 < seam or a * hop + hop >= len(out):
+            continue
+        seg = out[s0:a * hop].astype(np.float64)
+        if len(seg) < sr // 10:
+            continue
+        try:
+            f0, t = pw.harvest(seg, sr, f0_floor=70.0, f0_ceil=600.0,
+                               frame_period=5.0)
+            # 浊音守卫（宽）：harvest 对无谐波信号（纯正弦/纯噪声）判全
+            # 无声带（f0=0），cheaptrick 用默认 f0 分析、重合成出频率错乱
+            # 的垃圾（实锤：220Hz 正弦被合成成 ~330Hz）。真实尾段多为
+            # 混合型（16/30 帧浊音），只要「有结构」（≥4 帧）就做，合成
+            # 后另有谱自检兜底，不达标整刀放弃。
+            if int((f0 > 0).sum()) < 4:
+                continue
+            sp = pw.cheaptrick(seg, f0, t, sr)
+            ap = pw.d4c(seg, f0, t, sr)
+            n_fr = max(2, len(f0))
+            idx = np.linspace(0.0, n_fr - 1.0,
+                              max(2, int(n_fr * float(factor))))
+
+            def _interp_frames(arr):
+                # 谱/非周期性按帧线性插值（nearest-hold 会让帧间包络
+                # 跳台阶，合成出来是可闻的帧率抖动）
+                i0 = np.floor(idx).astype(int)
+                i1 = np.clip(i0 + 1, 0, arr.shape[0] - 1)
+                w = (idx - i0)[:, None].astype(np.float64)
+                return arr[i0] * (1.0 - w) + arr[i1] * w
+
+            seg2 = pw.synthesize(
+                np.interp(idx, np.arange(n_fr), f0),
+                _interp_frames(sp), _interp_frames(ap), sr,
+                frame_period=5.0)
+        except Exception:
+            continue
+        seg2 = np.asarray(seg2, dtype=np.float32)
+        want = int(take * float(factor))
+        seg2 = seg2[:want + sr // 20]      # WORLD 尾部多合成一点再裁
+        if len(seg2) < want:
+            seg2 = np.concatenate(
+                [seg2, np.zeros(want - len(seg2), np.float32)])
+        seg2 = seg2[:want]
+        # 谱自检（兜底守卫）：WORLD 重合成的电平与频谱形状必须贴近原段
+        # （RMS ±4dB、<1kHz 占比 ±20pp）——拉伸让能量略向低频移是自然
+        # 收音方向，允许；但整体变闷/变亮/变响说明重合成失真，整刀放弃
+        # （真机气声尾实测：-30.3→-29.4dB、低频段 63.6→78.4pp，通过）。
+        def _rms_db(x):
+            return 20.0 * np.log10(np.sqrt(np.mean(x ** 2)) + 1e-12)
+
+        def _low_share(x):
+            S = np.abs(np.fft.rfft(x)) ** 2
+            ff = np.fft.rfftfreq(len(x), 1.0 / sr)
+            tot = float(S.sum()) + 1e-12
+            return 100.0 * float(S[ff < 1000.0].sum()) / tot
+
+        if (abs(_rms_db(seg2) - _rms_db(seg)) > 4.0
+                or abs(_low_share(seg2) - _low_share(seg)) > 20.0):
+            continue
+        m = min(seam, len(seg2))
+        seg2[:m] = (seg2[:m] * np.linspace(0.0, 1.0, m, dtype=np.float32)
+                    + out[s0:s0 + m]
+                    * np.linspace(1.0, 0.0, m, dtype=np.float32))
+        # 末端淡出：seg2 结束处落在停顿静音里，WORLD 重合成与原相位
+        # 无关、末尾未必归零——不淡化会在这里留一个可闻台阶
+        f_out = min(int(0.02 * sr), len(seg2) // 3)
+        if f_out > 1:
+            seg2[-f_out:] *= np.linspace(1.0, 0.0, f_out,
+                                         dtype=np.float32)
+        out = np.concatenate([out[:s0], seg2, out[s0 + take:]])
+        releases.append({
+            "at_s": round(a * hop / sr, 3),
+            "added_ms": round((len(seg2) - take) / sr * 1000),
+        })
+    if not releases:
+        return y, []
+    if was_int:
+        return (np.clip(out * 32767.0, -32767, 32767).astype(np.int16),
+                releases)
+    return out.astype(np.float32), releases
+
+
 def edge_silence_len(y: np.ndarray, sr: int, from_end: bool = True,                     thresh_db: float = -30.0, max_s: float = 1.0) -> float:
     """量波形尾（from_end=True）或头部的连续静音时长（秒，封顶 max_s）。
 

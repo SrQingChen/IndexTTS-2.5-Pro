@@ -555,6 +555,55 @@ def main() -> int:
           _f16.dtype == np.int16
           and float(np.max(np.abs(_f16[-int(0.005 * SR):]))) < 0.05 * 32767)
 
+    # ---- 3l. 韵尾延长（2026-10-03 爱弥斯急收根除件回归）----
+    # 8 候选实测全部 10~50ms 陡坡（素材先验，选择侧无解）——对陡坡停顿
+    # 前的尾段做 WORLD 1.5x 拉伸；自然坡与词间隙不触发；接缝无 click。
+    # 夹具必须用**谐波丰富**的类语音信号：harvest 对纯正弦判全无声带
+    # （f0=0），cheaptrick 重合成出频率错乱的垃圾（实锤 220Hz→330Hz）。
+    def _voice_like(sec, f0_hz=220.0, amp=0.5, seed=3):
+        # 类语音：谐波 + 5Hz 颤音 + 微噪声——harvest 对稳态纯谐波也判
+        # 保守（4/30 帧浊音），颤音+噪声才是它设计针对的信号形态
+        tt = np.arange(int(sec * SR)) / SR
+        ph = 2 * np.pi * f0_hz * (tt + 0.01 * np.sin(2 * np.pi * 5 * tt))
+        w = (amp * np.sin(ph) + 0.3 * amp * np.sin(2 * ph)
+             + 0.15 * amp * np.sin(3 * ph)
+             + 0.02 * np.random.default_rng(seed).normal(size=len(tt)))
+        return w.astype(np.float32)
+
+    _abrupt = np.concatenate([_voice_like(0.9),
+                              np.zeros(int(0.20 * SR), np.float32),
+                              _voice_like(0.9),
+                              np.zeros(int(0.20 * SR), np.float32),
+                              _voice_like(0.9)])      # 两处陡坡+长停顿
+    _nat2 = np.concatenate([
+        _voice_like(0.9),
+        # 自然坡：指数衰减（τ=80ms，body→静音约 280ms）。线性坡的数学
+        # 形态不自然——末端才离开主体电平，按主体线判据会被误判急收。
+        (np.exp(-np.arange(int(0.35 * SR)) / (0.08 * SR))
+         * _voice_like(0.35 + 1e-6)).astype(np.float32),
+        np.zeros(int(0.20 * SR), np.float32)])
+    _yL, _rel = AL.lengthen_abrupt_releases(_abrupt, SR)
+    check("陡坡尾被延长（2 处，各 +~75ms，长度净增 >100ms）",
+          len(_rel) == 2 and len(_yL) > len(_abrupt) + int(0.1 * SR),
+          f"{_rel} · Δ={(len(_yL)-len(_abrupt))/SR*1000:.0f}ms")
+    _peaks = np.abs(np.diff(_yL))
+    check("延长接缝无 click（最大跳变 ≤ 输入最大跳变的 3 倍）",
+          float(_peaks.max()) <= 3.0 * float(np.abs(np.diff(_abrupt)).max()),
+          f"{float(_peaks.max()):.3f} vs {float(np.abs(np.diff(_abrupt)).max()):.3f}")
+    _yL2, _rel2 = AL.lengthen_abrupt_releases(_nat2, SR)
+    check("自然坡（350ms 衰减）零触发",
+          not _rel2 and np.array_equal(_yL2, _nat2))
+    # 浊音守卫：纯正弦（harvest 判全无声带）不做 WORLD 拉伸
+    _pure = np.concatenate([_tone(0.9, 0.5),
+                            np.zeros(int(0.20 * SR), np.float32)])
+    _yL3, _rel3 = AL.lengthen_abrupt_releases(_pure, SR)
+    check("纯气息/无谐波尾（守卫）：不做 WORLD 拉伸，原样返回",
+          not _rel3 and np.array_equal(_yL3, _pure))
+    _yL16, _rel16 = AL.lengthen_abrupt_releases(
+        (_abrupt * 32767).astype(np.int16), SR)
+    check("int16 直传：dtype 保持且同样延长",
+          _yL16.dtype == np.int16 and len(_rel16) == 2)
+
     print("== 4. 呼吸库（检测/建库/插入决策） ==")
     from webui_app.services import breath_bank as BB
     # 合成"吸气":低幅高频噪声 0.3s → 语音 0.8s

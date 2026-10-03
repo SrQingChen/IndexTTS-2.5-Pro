@@ -785,6 +785,24 @@ def perform(
                 except Exception as e:
                     log.warning("重音定位失败（跳过）：%s", e)
 
+            # ---- 韵尾延长（2026-10-03 收音急促根治件，第三处定稿位）----
+            # 爱弥斯类 LoRA 把标点前收音渲染成 ≤30ms 陡坡（8 候选全如此，
+            # 选择侧无解）——对真急收点前的尾段做 WORLD 1.5x 拉伸（音高/
+            # 谱不变），把「戛然而止」拖成可感知的末音节延长。
+            # **必须在响度归一与重音之后**：静音判定线（-30dB）是绝对电平，
+            # 引擎原始块比成品响 ~7dB，早做会让停顿检出整体缩水、零触发
+            # （真机实锤两轮）；放在这里 = 判据电平与听众听到的一致。
+            # 保守触发：主体线（非静音帧 p75，电平不变）坡 <80ms、停顿
+            # ≥100ms、浊音守卫 + 谱自检，每块 ≤4 处；拼接层随后的边界
+            # 记账（tail_s 重测）自动吸收新尾长。
+            if isinstance(_gov_entry, dict):
+                wav, _releases = AL.lengthen_abrupt_releases(wav, SR)
+                _gov_entry["releases"] = _releases
+                _gov_entry["out_samples"] = int(wav.shape[0])
+                if _releases:
+                    log.info("块 %d 韵尾延长 %d 处：%s", bi + 1,
+                             len(_releases), _releases)
+
             wavs.append(wav)
             # 块后停顿 = 块末行的 pause_after_ms（导演层已按标点/情绪给量）；
             # 块内行的停顿标记作废 —— 那部分节奏交还模型
