@@ -1623,15 +1623,20 @@ def f0_stats(y: np.ndarray, sr: int) -> Dict[str, Any]:
 _COMMA_MARKS = "，,、；;：:"
 
 # 标点保底位认定的最小静音段（名义值）。帧化会吞掉静音两端各约半个
-# 帧窗：75ms 的实际停顿只检出 ~60ms（6 帧×10ms hop）——名义阈值必须
-# 低于目标下限留足余量，50ms 名义 ≈ 能抓住 ≥70ms 的实际停顿。低于它的
-# 静音是塞音闭合/词间隙（语音结构），不认定为「逗号已实现」——找不到
-# 已实现的静音就跳过该标点，绝不切语音。
-_PUNCT_RUN_MS = 50.0
+# 帧窗：物理 40ms 的停顿只检出 10~20ms——名义阈值必须低于目标下限留
+# 足余量。2026-10-03 两次收紧 50→20ms：真机实锤模型可以把逗号实现成
+# 仅 40~60ms 的「闪缝」（爱弥斯 LoRA，第一逗号检出 20~40ms）——收集
+# 不到就匹配不上，保底位被 0.2s 外的词组间隙冒领（冒领间隙被保留在带
+# 内、真逗号处依旧急促）。20ms 名义（2 帧）≈ 能抓住 ≥35ms 的实际停顿；
+# 低于它的静音在帧域已无法与语音内起伏区分，不认定为「逗号已实现」
+# ——找不到就跳过该标点，绝不切语音。
+_PUNCT_RUN_MS = 20.0
 
 # 标点位置 ↔ 静音段的匹配容差（秒）。按语音时长比例估计标点时刻，误差
-# 主要来自音节时长不均，实测远小于此值；超出容差视为「模型没在这里停」。
-_PUNCT_MATCH_WIN_S = 0.6
+# 主要来自音节时长不均；实测（27 字块）估计误差 <0.05s。0.6→0.35 收紧
+# （2026-10-03）：过宽的窗口会让真逗号的**下一个词组间隙**（0.2~0.3s
+# 外）冒领保底位——真逗号闪缝太短没被收集时尤其如此。
+_PUNCT_MATCH_WIN_S = 0.35
 
 
 def _punct_mark_times(text: str, quiet: np.ndarray,
@@ -1919,8 +1924,39 @@ def normalize_intra_pauses(y: np.ndarray, sr: int, text_chars: int,
     return out.astype(yf.dtype, copy=False)
 
 
-def edge_silence_len(y: np.ndarray, sr: int, from_end: bool = True,
-                     thresh_db: float = -30.0, max_s: float = 1.0) -> float:
+def repair_truncated_tail(y: np.ndarray, sr: int,
+                          thresh_db: float = -35.0,
+                          min_tail_s: float = 0.03,
+                          fade_ms: float = 100.0) -> np.ndarray:
+    """成品末尾被硬截时的兜底修复：给尾部一段余弦淡出。
+
+    背景（2026-10-03 爱弥斯实锤）：AR 偶发 EOS 提前，末字衰减在 -29dB
+    处直接接数字零——听感「收音戛然而止」。BoN 的截断惩罚能挡住大部分
+    候选，但当**全部**候选都被截（LoRA 素材本身是急收尾的游戏配音）时
+    择优无米下锅。这里不伪造内容，只把硬悬崖变成 100ms 的快速收束：
+    尾部实测静音（-35dB 判定）≥30ms 视为自然收尾，原样返回（一次都不
+    动）；短于 30ms（还有语音能量就断了）才淡化。int16/float 均可，
+    返回保持原 dtype。
+    """
+    yf = (np.asarray(y, dtype=np.float32) / 32768.0
+          if np.issubdtype(np.asarray(y).dtype, np.integer)
+          else np.asarray(y, dtype=np.float32))
+    tail = edge_silence_len(yf, sr, from_end=True, thresh_db=thresh_db,
+                            max_s=0.5)
+    if tail >= min_tail_s:
+        return y
+    n = min(int(sr * fade_ms / 1000.0), len(yf) // 2)
+    if n <= 1:
+        return y
+    out = yf.copy()
+    out[-n:] *= (0.5 * (1.0 + np.cos(
+        np.linspace(0.0, np.pi, n, dtype=np.float32)))).astype(np.float32)
+    if np.issubdtype(np.asarray(y).dtype, np.integer):
+        return np.clip(out * 32767.0, -32767, 32767).astype(np.int16)
+    return out
+
+
+def edge_silence_len(y: np.ndarray, sr: int, from_end: bool = True,                     thresh_db: float = -30.0, max_s: float = 1.0) -> float:
     """量波形尾（from_end=True）或头部的连续静音时长（秒，封顶 max_s）。
 
     块边界停顿管理用：模型的块尾收束静音 + 块头起振静音 + 台本 gap 三者

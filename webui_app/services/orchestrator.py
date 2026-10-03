@@ -76,26 +76,30 @@ def code_info() -> Dict[str, Any]:
 
 
 def _tail_truncation_penalty(path: str) -> float:
-    """候选末字被截的惩罚（BoN 专用，2026-10-02）。
+    """候选末字被截的惩罚（BoN 专用）。
 
-    AR 模型偶发 EOS 提前，末字在语音中戛然而止（实测某候选尾部
-    -14.8dB 直接接数字零）。SenseVoice 转写会**容错补全**缺尾音的
-    句子，reward 的 WER 项扣不到分 —— 坏候选照样可能被选中。用
-    波形尾部检查兜底：正常候选结尾必有收束衰减，最后 100ms 仍在
-    语音电平（>-25dB）即判截断。只影响候选间相对排序，保守罚分。
-    模块级便于探针直测。
+    AR 模型偶发 EOS 提前，末字衰减被硬切（2026-10-03 爱弥斯实锤：块尾
+    在 -29dB 处直接数字零，听感「收音戛然而止」）。SenseVoice 转写会
+    **容错补全**缺尾音的句子，reward 的 WER 项扣不到分 —— 坏候选照样
+    可能被选中。用波形尾部检查兜底。
+
+    判据按真机校准（2026-10-03）：自然收尾的末 50ms RMS ≤ -41dB（衰减
+    完成）；被截断的末 50ms ≈ -30dB（还有语音能量就断了）。取分界
+    **-35dB**——比旧判据（末 100ms > -25dB）严格得多：旧线放走了这次
+    实锤的截断候选（末 100ms -27dB 却未触发）。只影响候选间相对排序，
+    保守罚分。模块级便于探针直测。
     """
     try:
         import soundfile as sf
         y, sr = sf.read(path, dtype="float32")
         if y.ndim > 1:
             y = y.mean(axis=1)
-        n = int(min(0.10, len(y) / sr) * sr)
-        if n < int(0.05 * sr):
+        n = int(min(0.05, len(y) / sr) * sr)
+        if n < int(0.02 * sr):
             return 0.0
         tail = y[-n:]
         rms = 20.0 * np.log10(np.sqrt(np.mean(tail ** 2)) + 1e-12)
-        return 0.30 if rms > -25.0 else 0.0
+        return 0.30 if rms > -35.0 else 0.0
     except Exception:
         return 0.0
 
@@ -887,6 +891,15 @@ def perform(
 
         # ---- 起止整形：首尾 80ms 余白 + 12ms 淡化（治"被咬掉"感） ----
         # 余白给下游混音留呼吸口；淡入让第一个字的起振不被切。
+        # 末尾硬截断兜底（2026-10-03）：AR EOS 提前时成品在语音能量中直接
+        # 数字零（爱弥斯实锤 -29dB 硬切）。BoN 惩罚收紧后仍可能全员被截
+        # （素材本身急收尾），这里把悬崖变成 100ms 快速收束——自然收尾
+        # （尾部静音 ≥30ms）原样不动。
+        _tail_fixed = AL.repair_truncated_tail(final, SR)
+        tail_repaired = not np.array_equal(_tail_fixed, final)
+        if tail_repaired:
+            log.info("成品末尾疑似截断，已做 100ms 收束淡化")
+        final = _tail_fixed
         final = AL.shape_edges(final, SR, pad_ms=80.0, fade_ms=12.0)
 
         try:
@@ -932,6 +945,7 @@ def perform(
                 "perform_args": perform_args,
                 "refs": ref_log,
                 "joints": joints,
+                "tail_repair": tail_repaired,
                 "lines": line_infos,
             }, f, ensure_ascii=False, indent=2)
     except Exception:

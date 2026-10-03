@@ -489,6 +489,72 @@ def main() -> int:
           any(a.get("action") == "gap_ceiling_trim" for a in _audG),
           str([a for a in _audG if a["kind"] == "run"]))
 
+    # ---- 3j. 逗号闪缝与保底位冒领（2026-10-03 爱弥斯实锤回归）----
+    # 病例：模型把逗号实现成仅 35ms 的闪缝（低于 50ms 收集门槛）→ 匹配
+    # 不上 → 保底位被 0.2~0.3s 外的词组间隙冒领（真逗号处依旧急促，听感
+    # 「急促打断收音」）。修复：收集门槛降到 30ms 检出 + 窗口 0.6→0.35s
+    # + 就近匹配——闪缝被收集并补插到带下限，远处间隙不再冒领。
+    _txtF = "我们走吧，外面雨停了啊。"
+    # 语音段时长∝字数（4字1.0s|7字1.75s），闪缝在逗号位，0.4s 后放一个
+    # 150ms 诱饵间隙（距估计 0.52s：旧窗口 0.6 会冒领，新窗口 0.35 不收）
+    # 闪缝两侧带自然衰减/起振坡（真实语音的收音不是方波切口——纯数字
+    # 零夹具只检出 1 帧，天然语音衰减可检出 2~4 帧，与爱弥斯实测一致）
+    _pre = _tone(1.0, 0.5).copy()
+    _ramp_d = int(0.03 * SR)
+    _pre[-_ramp_d:] *= np.linspace(1.0, 0.03, _ramp_d, dtype=np.float32)
+    _post = _tone(0.40, 0.5).copy()
+    _ramp_o = int(0.02 * SR)
+    _post[:_ramp_o] *= np.linspace(0.03, 1.0, _ramp_o, dtype=np.float32)
+    _yF2 = np.concatenate([
+        _pre,
+        np.zeros(int(0.040 * SR), np.float32),          # 逗号闪缝 40ms 物理
+        _post, np.zeros(int(0.15 * SR), np.float32),    # 诱饵间隙
+        _tone(1.35, 0.5)])
+    _aF: list = []
+    _zF = AL.normalize_intra_pauses(
+        _yF2, SR, text_chars=len(_txtF), cap_ms=210, text=_txtF,
+        punct_floor_ms=120, punct_cap_ms=210, audit_out=_aF)
+    _pF = [a for a in _aF if a["kind"] == "punct"]
+    _runF = [a for a in _aF if a["kind"] == "run"]
+    check("闪缝被收集并匹配（matched_run_ms ≈30ms，不再是 no_realized）",
+          len(_pF) == 1 and _pF[0]["matched_run"] is not None
+          and _pF[0]["matched_run_ms"] is not None
+          and _pF[0]["matched_run_ms"] <= 50,
+          f"{_pF}")
+    _mand = [a for a in _runF if a["action"] == "mandated_insert"]
+    check("闪缝处置记为 mandated_insert（审计可见）",
+          len(_mand) == 1 and _mand[0]["start_s"] < 1.2,
+          f"{_mand}")
+    _rF = _runs_ms_at(_zF)
+    check("闪缝补插到带下限（成品检出 ≥110ms 且语音零接触）",
+          any(s < 1.15 and d >= 110 for s, d in _rF)
+          and np.array_equal(_zF[:int(0.98 * SR)], _yF2[:int(0.98 * SR)]),
+          f"{_rF}")
+    check("诱饵间隙不再冒领（未被 mandate，且 ≤天花板）",
+          any(1.3 < s < 1.7 for s, d in _rF)
+          and not any(a["action"].startswith("mandated")
+                      and a.get("start_s", 0) > 1.3
+                      for a in _aF if a["kind"] == "run")
+          and all(d <= 210 for s, d in _rF if 1.3 < s < 1.7),
+          f"{[r for r in _rF if 1.2 < r[0] < 1.8]}")
+
+    # ---- 3k. 末尾硬截断兜底修复（2026-10-03 爱弥斯块尾 -29dB 硬切实锤）----
+    _cliff = _tone(1.0, 0.5)                     # 全能量直接结束=悬崖
+    _fixed = AL.repair_truncated_tail(_cliff, SR)
+    _tail5 = np.max(np.abs(_fixed[-int(0.005 * SR):]))
+    check("悬崖尾部被淡化（末 5ms 幅度 < 峰值 5%）",
+          len(_fixed) == len(_cliff) and _tail5 < 0.05 * float(np.max(np.abs(_cliff))),
+          f"末5ms峰值 {_tail5:.4f}")
+    _nat = np.concatenate([_tone(0.5, 0.5),
+                           np.zeros(int(0.2 * SR), np.float32)])
+    check("自然收尾（尾静音 200ms）零改动",
+          np.array_equal(AL.repair_truncated_tail(_nat, SR), _nat))
+    _c16 = (_cliff * 32767).astype(np.int16)
+    _f16 = AL.repair_truncated_tail(_c16, SR)
+    check("int16 直传：dtype 保持且同样淡化",
+          _f16.dtype == np.int16
+          and float(np.max(np.abs(_f16[-int(0.005 * SR):]))) < 0.05 * 32767)
+
     print("== 4. 呼吸库（检测/建库/插入决策） ==")
     from webui_app.services import breath_bank as BB
     # 合成"吸气":低幅高频噪声 0.3s → 语音 0.8s

@@ -185,9 +185,10 @@ def main() -> int:
     data4 = _json.load(open(res4["director"]["sidecar"], encoding="utf-8"))
     bon_rows = [l.get("bon") for l in data4["lines"]]
     check("台本记录逐句 BoN 得分与中选",
-          all(b and b["n"] == 3 and b["rewards"] == [0, 1, 2]
+          all(b and b["n"] == 3
+              and b["rewards"] == [round(v - 0.30, 4) for v in (0, 1, 2)]
               and b["chosen"] == 2 for b in bon_rows),
-          str(bon_rows))
+          str(bon_rows) + "（桩候选为噪声无衰减尾，新惩罚线统一 -0.30）")
     check("中选种子 = 候选2 的种子", all(
         l["seed"] == (data4["base_seed"] + 977 * l["idx"] + 131 * 2) % (2**31)
         for l in data4["lines"]), str([l["seed"] for l in data4["lines"]]))
@@ -399,6 +400,27 @@ def main() -> int:
           all("governance" in l and "audit" in l.get("governance", {})
               for l in _side14.get("lines", [])),
           str(_side14["lines"][0].get("governance", {}))[:90])
+    check("旁车记录 tail_repair（末尾截断兜底可见）",
+          isinstance(_side14.get("tail_repair"), bool),
+          repr(_side14.get("tail_repair")))
+
+    # ---- 截断惩罚线（2026-10-03 爱弥斯实锤：末50ms 校准自然≤-41/截断-30）----
+    import numpy as _np2
+    _p_trunc = os.path.join(tmp, "trunc.wav")
+    _t2 = _np2.arange(int(SR * 1.0)) / SR
+    _body = (0.5 * _np2.sin(2 * _np2.pi * 220 * _t2)).astype(_np2.float32)
+    _hot_tail = _body[-int(0.05 * SR):] * 10 ** (-30 / 20) / max(
+        1e-9, float(_np2.max(np.abs(_body[-int(0.05 * SR):]))))
+    _y_trunc = _np2.concatenate([_body[:-int(0.05 * SR)], _hot_tail])
+    sf.write(_p_trunc, _y_trunc, SR, subtype="PCM_16")
+    _p_nat = os.path.join(tmp, "nat.wav")
+    sf.write(_p_nat, np.concatenate([_body, np.zeros(
+        int(0.1 * SR), np.float32)]), SR, subtype="PCM_16")
+    check("截断惩罚：末50ms≈-30dB 罚 0.30（旧线-25/-100ms 会放走）",
+          ORC._tail_truncation_penalty(_p_trunc) == 0.30,
+          str(ORC._tail_truncation_penalty(_p_trunc)))
+    check("截断惩罚：自然衰减尾（100ms 静音）不罚",
+          ORC._tail_truncation_penalty(_p_nat) == 0.0)
     # continuity=False → 不构建滚动参考，两块共用同一基础参考
     eng13 = _StubEngine(_Cfg_populate(tmp))
     ORC.perform(eng13, req, sc12, route=False, continuity=False)
