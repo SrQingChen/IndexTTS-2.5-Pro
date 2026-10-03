@@ -25,6 +25,7 @@ from typing import Any, Dict, List, Optional
 import numpy as np
 
 from webui_app import logging_setup as LOG
+from webui_app import PROCESS_STARTED_AT
 from webui_app.services import emotion_bank as EB
 from webui_app.services import audio_lab as AL
 from webui_app.services import inference as INF
@@ -32,6 +33,46 @@ from webui_app.services.director import DirectorScript, comma_pause_band as _com
 from webui_app.services.engine import EngineError, TTSEngine
 
 SR = 22050  # 官方输出采样率（int16 单声道）
+
+
+def code_info() -> Dict[str, Any]:
+    """合成时代码与进程的版本信息（旁车落盘，归因用）。
+
+    2026-10-03 教训：连续两轮把「帧量化盲区」误判成「旧进程在跑」——
+    事后归因靠行为反推太脆弱。现在旁车直接记录四件事：
+        rev / commit_ts  ：磁盘上代码的版本与提交时刻
+        dirty            ：工作树是否有未提交修改（同版本不同行为的隐患）
+        process_started_at / process_older_than_code：
+            进程启动时刻，以及「进程比代码旧」的自动判定——True 即合成
+            跑在代码更新之前启动的进程上（改代码没重启 WebUI 的实锤）。
+    git 不可用时各字段尽力而为，不影响主流程。
+    """
+    import subprocess as _sp
+    root = os.path.dirname(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__))))
+
+    def _git(*args: str) -> str:
+        try:
+            return _sp.run(["git", *args], cwd=root, capture_output=True,
+                           text=True, timeout=5).stdout.strip()
+        except Exception:
+            return ""
+
+    rev = _git("rev-parse", "--short", "HEAD")
+    try:
+        commit_ts = float(_git("log", "-1", "--format=%ct") or 0) or None
+    except ValueError:
+        commit_ts = None
+    dirty = bool(_git("status", "--porcelain"))
+    older = (commit_ts is not None
+             and PROCESS_STARTED_AT < commit_ts)
+    return {
+        "rev": rev,
+        "commit_ts": commit_ts,
+        "dirty": dirty,
+        "process_started_at": PROCESS_STARTED_AT,
+        "process_older_than_code": older,
+    }
 
 
 def _tail_truncation_penalty(path: str) -> float:
@@ -146,6 +187,13 @@ def perform(
     """
     if not script or not script.lines:
         raise EngineError("导演台本为空，无法编排。")
+    # 入参快照（追踪件，2026-10-03）：函数入口的 locals() 恰好就是全部
+    # 位置/关键字参数，取标量子集落盘旁车——事后归因时「当时到底传了什
+    # 么」不再依赖 UI 状态文件的时序猜测。新增参数自动纳入。
+    perform_args = {k: v for k, v in locals().copy().items()
+                    if isinstance(v, (bool, int, float, str))}
+    # 参考链路审计：基础参考与每块滚动参考的构建/摊平统计
+    ref_log: List[Dict[str, Any]] = []
     empty = [i + 1 for i, ln in enumerate(script.lines) if not (ln.text or "").strip()]
     if empty:
         raise EngineError(
@@ -343,6 +391,13 @@ def perform(
                 sr = SR
             y2 = AL.cap_interior_pauses(y, SR, int(flatten_cap_ms),
                                         thresh_db=-30.0)
+            ref_log.append({
+                "stage": "flatten", "file": os.path.basename(path),
+                "cap_ms": int(flatten_cap_ms),
+                "before_s": round(len(y) / SR, 3),
+                "after_s": round(len(y2) / SR, 3),
+                "changed": not (len(y2) == len(y) and np.array_equal(y2, y)),
+            })
             if len(y2) == len(y) and np.array_equal(y2, y):
                 return path
             p = os.path.join(run_dir, "prompt_base_flat.wav")
@@ -412,9 +467,16 @@ def perform(
             # 的参考把散感韵律重新教回模型，阶段28只治了块 1（实测用户
             # 成品停顿密度 147/分钟 vs 单次直出 98）。这里用与基础参考同一
             # 把刀（>flatten_cap_ms 停顿封顶，中段截，语音/音色不动）。
+            _pt_before = len(prev_tail)
             if flatten_ref:
                 prev_tail = AL.cap_interior_pauses(
                     prev_tail, SR, int(flatten_cap_ms), thresh_db=-30.0)
+            ref_log.append({
+                "stage": "rolling", "block": bi, "prev": os.path.basename(prev_wav),
+                "prev_tail_before_s": round(_pt_before / SR, 3),
+                "prev_tail_after_s": round(len(prev_tail) / SR, 3),
+                "flatten_on": bool(flatten_ref),
+            })
             ref_part = ref_y[max(0, len(ref_y) - (fixed - len(prev_tail))):]
             # 参考不够填 → 拉长上一块的占用；两者合计仍不足 14s 就**短着用**
             # ——绝不补零（静音参考稀释条件是实测过的病）。代价是这种罕见
@@ -615,14 +677,23 @@ def perform(
             # 真源）；无标点路径行为不变。
             if pause_cap_ms and int(pause_cap_ms) > 0:
                 _pf, _pc = _comma_band(float(pause_scale or 1.0))
+                gov_audit: List[Dict[str, Any]] = []
+                _raw_samples = int(wav.shape[0])
                 wav = AL.normalize_intra_pauses(
                     wav.astype(np.float32) / 32768.0, SR,
                     text_chars=len(blk_text),
                     cap_ms=int(pause_cap_ms),
                     text=blk_text,
-                    punct_floor_ms=_pf, punct_cap_ms=_pc)
+                    punct_floor_ms=_pf, punct_cap_ms=_pc,
+                    audit_out=gov_audit)
                 wav = np.clip(wav * 32767.0, -32767,
                               32767).astype(np.int16)
+                _gov_entry = {"raw_samples": _raw_samples,
+                              "out_samples": int(wav.shape[0]),
+                              "audit": gov_audit}
+            else:
+                _gov_entry = {"enabled": False,
+                              "reason": "pause_cap_ms<=0"}
 
             # ---- F0 音域恢复（WORLD 重合成，向角色指纹靠拢并扩张）----
             f0_applied = False
@@ -716,6 +787,7 @@ def perform(
                 "f0_note": f0_note,
                 "ref_flattened": bool(flatten_ref),
                 "samples": int(wav.shape[0]),
+                "governance": _gov_entry,
                 "lines": [l.text for l in blk["lines"]],
             }
             if bon_n > 1:
@@ -735,6 +807,9 @@ def perform(
         from webui_app.services import breath_bank as BB
         fade = int(SR * 0.03)
         inhales_used = 0
+        # 拼接层审计（追踪件）：每个块边界实际量到的两侧静音与修剪/垫足
+        # 决策——「边界停顿为什么是这个长度」从旁车直接读，不用反推。
+        joints: List[Dict[str, Any]] = []
         final = wavs[0] if wavs else np.zeros(1, np.int16)
         for i in range(1, n):
             gap_s = max(0.0, float(line_infos[i - 1]["pause_after_ms"])) / 1000.0
@@ -761,6 +836,17 @@ def perform(
                 gap = 0                          # 已贴紧，走交叉淡化
             else:
                 gap = int(SR * (gap_s - tail_s - head_s) * 1000.0 / 1000.0)
+
+            joints.append({
+                "after_block": i,
+                "script_gap_ms": int(round(gap_s * 1000)),
+                "tail_s": round(tail_s, 3), "head_s": round(head_s, 3),
+                "over_s": round(over, 3),
+                "trim_tail_ms": int(round(min(over / 2.0, max(0.0, tail_s - 0.02)) * 1000)) if over > 0 else 0,
+                "trim_head_ms": int(round(min(over - min(over / 2.0, max(0.0, tail_s - 0.02)), max(0.0, head_s - 0.02)) * 1000)) if over > 0 else 0,
+                "bed_ms": int(round(gap / SR * 1000)) if gap > 0 else 0,
+                "mode": "bed" if gap > 0 else "crossfade",
+            })
 
             if gap > 0:
                 gap_n = gap
@@ -817,21 +903,12 @@ def perform(
     dur = INF.audio_duration(out_base)
 
     # 台本落盘为旁车文件（观测/复现用；清理页会随 outputs/ 一起盘点）
+    # 2026-10-03 追踪件全套：code（代码版本+进程年龄自动判定）、
+    # perform_args（本次编排全部入参）、refs（参考链路与摊平统计）、
+    # joints（拼接层逐边界审计）、逐块 governance（每段静音的处置原因码
+    # 与逗号匹配详情）。事后归因从旁车直接读——本轮「旧进程」误判两次的
+    # 教训：行为反推不可靠，让产物自己作证。
     sidecar = os.path.splitext(out_base)[0] + ".script.json"
-    # code_rev：合成时实际运行的代码版本。WebUI 改完代码不重启的话，
-    # 进程里还是旧逻辑，而旁车里的一切看起来都正常——2026-10-03 用户
-    # 两次合成全部带着「阶段24 之前」的旧进程跑出（170ms 停顿在 quota=0
-    # 块里存活），只能靠行为反推进程年龄。落盘 git 短 SHA 让这类事一眼
-    # 可判。取不到（非 git 环境）就留空，不影响主流程。
-    try:
-        import subprocess as _sp
-        code_rev = _sp.run(
-            ["git", "rev-parse", "--short", "HEAD"],
-            cwd=os.path.dirname(os.path.abspath(__file__)),
-            capture_output=True, text=True, timeout=5,
-        ).stdout.strip() or ""
-    except Exception:
-        code_rev = ""
     try:
         with open(sidecar, "w", encoding="utf-8") as f:
             json.dump({
@@ -839,7 +916,12 @@ def perform(
                 "error": script.error, "character": character,
                 "routed": routed, "fallback": fallback,
                 "base_seed": base_seed, "lines_in": len(script.lines),
-                "blocks": n, "code_rev": code_rev, "lines": line_infos,
+                "blocks": n,
+                "code": code_info(),
+                "perform_args": perform_args,
+                "refs": ref_log,
+                "joints": joints,
+                "lines": line_infos,
             }, f, ensure_ascii=False, indent=2)
     except Exception:
         log.warning("台本旁车文件写失败：%s", sidecar, exc_info=True)

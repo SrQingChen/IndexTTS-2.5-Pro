@@ -1107,6 +1107,37 @@ def render(ctx: AppContext):
                     res = INF.generate(eng, req, progress=_lp)
             finally:
                 _lp.stop()
+
+            # 追踪件（2026-10-03）：导演模式下把 UI 级参数快照 merge 进旁车
+            # ——编排层只知道自己收到的 perform 入参，polish/双 LoRA/情感
+            # 模式/采样参数在这里才齐。事后归因要「当时界面到底是什么状
+            # 态」，不能依赖 synthesis_state.json 的保存时序。失败不影响主流程。
+            if dir_on and res.get("director", {}).get("sidecar"):
+                try:
+                    import json as _json_sidecar
+                    _sp = res["director"]["sidecar"]
+                    with open(_sp, encoding="utf-8") as _f:
+                        _sd = _json_sidecar.load(_f)
+                    _sd["engine_kwargs"] = {
+                        k: v for k, v in (res.get("kwargs") or {}).items()}
+                    _sd["ui"] = {
+                        "emo_mode": int(raw.get("emo_control_method") or 0),
+                        "duration_factor": float(raw.get("duration_factor") or 1.0),
+                        "temperature": float(raw.get("temperature") or 0.8),
+                        "top_p": float(raw.get("top_p") or 0.8),
+                        "seed": int(res.get("seed") or 0),
+                        "lora_gpt": str(lora_run or ""),
+                        "lora_gpt_scale": float(lora_scale or 1.0),
+                        "lora_cfm": str(lora_cfm_run or ""),
+                        "lora_cfm_scale": float(lora_cfm_scale or 1.0),
+                        "polish_on": bool(pol_on),
+                        "polish_presence": float(pol_presence or 0),
+                        "polish_exciter": float(pol_exciter or 0),
+                    }
+                    with open(_sp, "w", encoding="utf-8") as _f:
+                        _json_sidecar.dump(_sd, _f, ensure_ascii=False, indent=2)
+                except Exception:
+                    pass
         except EngineError as e:
             gr.Error(str(e))
             _log_sink.append(f"✗ 合成失败：{e}")

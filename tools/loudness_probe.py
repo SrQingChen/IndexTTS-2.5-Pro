@@ -407,6 +407,51 @@ def main() -> int:
           _sil_ge(_zc, 45) == 2 and len(_zc) == len(_qy_closure),
           f"长度 {len(_qy_closure)/SR:.2f}→{len(_zc)/SR:.2f}s")
 
+    # ---- 3h. 治理审计接口（2026-10-03 追踪件回归）----
+    # audit_out 落盘旁车：每个静音段的处置原因码 + 逗号匹配详情。
+    # 归因场景：事后要知道「这个停顿为什么还在/为什么被压」。
+    _aud1: list = []
+    AL.normalize_intra_pauses(
+        _qy_closure, SR, text_chars=11, cap_ms=220,
+        text="我们走吧外面雨停了啊。",
+        punct_floor_ms=_lo_ms, punct_cap_ms=_hi_ms, audit_out=_aud1)
+    _acts1 = {a["action"] for a in _aud1 if a["kind"] == "run"}
+    check("审计：闭合段记为 below_gate（保护原因可见）",
+          "below_gate" in _acts1 and all(
+              a["action"] in ("below_gate", "edge_owned_by_splice",
+                              "untouched", "floor_trim", "quota_keep_in_band",
+                              "quota_keep_trim", "mandated_in_band",
+                              "mandated_insert", "mandated_trim")
+              for a in _aud1 if a["kind"] == "run"),
+          f"{sorted(_acts1)}")
+    _aud2: list = []
+    AL.normalize_intra_pauses(_yA, SR, text_chars=len(_txtA), cap_ms=220,
+                              text=_txtA, punct_floor_ms=_lo_ms,
+                              punct_cap_ms=_hi_ms, audit_out=_aud2)
+    _p2 = [a for a in _aud2 if a["kind"] == "punct"]
+    _r2 = [a for a in _aud2 if a["kind"] == "run"
+           and a["action"].startswith("mandated")]
+    check("审计：逗号匹配详情+补插动作都有记录",
+          len(_p2) == 1 and _p2[0]["matched_run"] is not None
+          and _p2[0]["matched_run_ms"] is not None
+          and len(_r2) == 1 and _r2[0]["action"] == "mandated_insert",
+          f"punct={_p2} run={_r2}")
+    _aud3: list = []
+    AL.normalize_intra_pauses(_yE, SR, text_chars=len(_txtA), cap_ms=220,
+                              text=_txtA, punct_floor_ms=_lo_ms,
+                              punct_cap_ms=_hi_ms, audit_out=_aud3)
+    _p3 = [a for a in _aud3 if a["kind"] == "punct"]
+    check("审计：无静音可匹配的逗号记 no_realized_silence（早退也留痕）",
+          len(_p3) == 1 and _p3[0]["action"] == "no_realized_silence"
+          and any(a.get("action") == "no_collected_runs" for a in _aud3),
+          f"{_aud3}")
+    _aud4: list = []
+    _za = AL.normalize_intra_pauses(_qy, SR, text_chars=20, cap_ms=220,
+                                    audit_out=_aud4)
+    check("审计：不传 audit_out 行为不变（与旧路径逐位一致）",
+          np.array_equal(_za, AL.normalize_intra_pauses(
+              _qy, SR, text_chars=20, cap_ms=220)))
+
     print("== 4. 呼吸库（检测/建库/插入决策） ==")
     from webui_app.services import breath_bank as BB
     # 合成"吸气":低幅高频噪声 0.3s → 语音 0.8s

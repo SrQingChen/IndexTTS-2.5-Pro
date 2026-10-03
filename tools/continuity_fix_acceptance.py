@@ -176,9 +176,9 @@ def main() -> int:
           f"{m_old['per_min']:.0f} → {m_new['per_min']:.0f}/分钟")
     check("响度跳变下降（54→≤48）", m_new["jumps"] <= 48,
           f"{m_old['jumps']} → {m_new['jumps']}")
-    check("旁车记录 code_rev（新代码实锤）",
-          side2.get("code_rev") not in ("", None),
-          repr(side2.get("code_rev")))
+    check("旁车 code.rev 记录（新代码实锤）",
+          (side2.get("code") or {}).get("rev") not in ("", None),
+          repr(side2.get("code")))
     check("短块(<10字)未施重音（阶梯修复）",
           all(not l.get("stress") for l in side2["lines"]
               if len(l["text"]) < 10),

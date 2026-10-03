@@ -1689,7 +1689,9 @@ def normalize_intra_pauses(y: np.ndarray, sr: int, text_chars: int,
                            thresh_db: float = -30.0,
                            text: str = "",
                            punct_floor_ms: float = 0.0,
-                           punct_cap_ms: float = 0.0) -> np.ndarray:
+                           punct_cap_ms: float = 0.0,
+                           audit_out: Optional[List[Dict[str, Any]]] = None
+                           ) -> np.ndarray:
     """块内停顿「门槛-配额-时长」三治理（2026-10-02 第四轮：修去气口误伤）。
 
     **去气口版本的教训（真机实锤）**：上一版把所有 ≥25ms 的静音段整段
@@ -1717,6 +1719,16 @@ def normalize_intra_pauses(y: np.ndarray, sr: int, text_chars: int,
 
     背景：参考 28 停顿/分钟 + AR 放大 → 引擎输出 44~53 个/分钟。
     int16/float 均可，返回保持原 dtype。
+
+    **审计接口（2026-10-03 追踪件）**：audit_out 传一个 list 进来，函数
+    把每个静音段的处置（动作+原因码）和每个逗号类标点的匹配结果 append
+    进去，供旁车落盘。事后归因（「这个停顿为什么还在/为什么没了」）从
+    审计记录直接读，不再靠推测。原因码：
+        run   edge_owned_by_splice（首尾静音，拼接层辖区）
+              below_gate（检出 < 治理门槛，保护塞音闭合/词间隙）
+              mandated_in_band / mandated_insert / mandated_trim（标点位）
+              quota_keep_in_band / quota_keep_trim / floor_trim（配额制）
+        punct matched_run=<下标> / no_realized_silence（无可匹配静音，跳过）
     """
     if not cap_ms or float(cap_ms) <= 0 or len(y) < sr // 4:
         return y
@@ -1761,10 +1773,22 @@ def normalize_intra_pauses(y: np.ndarray, sr: int, text_chars: int,
         else:
             i += 1
     if not runs:
+        # 早退也要留审计痕迹（追踪件）：「什么都没做」的原因本身就是归因
+        # 要的答案——逗号逐个记 no_realized_silence，再记一条总结性 note。
+        if audit_out is not None:
+            if punct_mode:
+                for t in _punct_mark_times(text, quiet, hop / sr):
+                    audit_out.append({
+                        "kind": "punct", "est_s": round(t, 3),
+                        "matched_run": None, "matched_run_ms": None,
+                        "action": "no_realized_silence",
+                    })
+            audit_out.append({"kind": "note", "action": "no_collected_runs"})
         return y
 
     # ---- 标点保底位：逗号类标点 ↔ 已实现静音段（按位置贪心匹配）----
     mandated: Dict[int, tuple] = {}          # run 下标 -> (floor_n, cap_n)
+    punct_audit: List[Dict[str, Any]] = []
     if punct_mode:
         hop_s = hop / sr
         # 首尾静音段（连到分析边界）是拼接层的辖区，不参与匹配
@@ -1788,6 +1812,14 @@ def normalize_intra_pauses(y: np.ndarray, sr: int, text_chars: int,
             if best >= 0:
                 used.add(best)
                 mandated[best] = (p_floor, p_cap)
+            punct_audit.append({
+                "kind": "punct", "est_s": round(t, 3),
+                "matched_run": best if best >= 0 else None,
+                "matched_run_ms": (round((runs[best][1] - runs[best][0])
+                                         / sr * 1000) if best >= 0 else None),
+                "action": ("matched_run" if best >= 0
+                           else "no_realized_silence"),
+            })
 
     # ---- 配额治理（非标点段；治理资格 = 检出 ≥ min_run - 3帧）----
     # 收集门槛更低（供逗号保底位匹配短停顿），但配额治理只碰「够格的
@@ -1814,6 +1846,31 @@ def normalize_intra_pauses(y: np.ndarray, sr: int, text_chars: int,
         elif k in gov:
             if b - a > int(sr * float(floor_ms) / 1000.0):
                 edits.append((a, b, int(sr * float(floor_ms) / 1000.0)))
+
+    # ---- 审计输出：每段静音的处置与原因（旁车落盘用）----
+    if audit_out is not None:
+        edit_at = {(a, b): t for a, b, t in edits}
+        for k, (a, b) in enumerate(runs):
+            det_ms = round((b - a) / sr * 1000)
+            if a <= lo_frame * hop or b >= hi_frame * hop:
+                action = "edge_owned_by_splice"
+            elif k in mandated:
+                action = ("mandated_insert" if (a, b) in edit_at
+                          and edit_at[(a, b)] > b - a else
+                          "mandated_trim" if (a, b) in edit_at else
+                          "mandated_in_band")
+            elif k in keep:
+                action = ("quota_keep_trim" if (a, b) in edit_at
+                          else "quota_keep_in_band")
+            elif k in gov:
+                action = "floor_trim" if (a, b) in edit_at else "untouched"
+            else:
+                action = "below_gate"        # 收集到但不够格治理（受保护）
+            audit_out.append({
+                "kind": "run", "start_s": round(a / sr, 3),
+                "detected_ms": det_ms, "action": action,
+            })
+        audit_out.extend(punct_audit)
 
     fade = max(1, int(0.005 * sr))
     out = yf

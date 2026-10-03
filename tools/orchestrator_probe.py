@@ -378,9 +378,27 @@ def main() -> int:
           _seen_any and _maxrun * 0.025 <= 0.25,
           f"最大内部静音 {_maxrun * 0.025:.2f}s")
     _side14 = _json.load(open(res14["director"]["sidecar"], encoding="utf-8"))
-    check("旁车记录 code_rev（git 短 SHA，空也合法）",
-          isinstance(_side14.get("code_rev"), str),
-          repr(_side14.get("code_rev")))
+    check("旁车 code 信息含 rev 与进程年龄判定",
+          isinstance(_side14.get("code"), dict)
+          and isinstance(_side14["code"].get("rev"), str)
+          and isinstance(_side14["code"].get("process_older_than_code"), bool),
+          repr(_side14.get("code")))
+    check("旁车 perform_args 快照齐全（追踪件）",
+          isinstance(_side14.get("perform_args"), dict)
+          and _side14["perform_args"].get("pause_cap_ms") == 300
+          and _side14["perform_args"].get("flatten_ref") is True,
+          str(_side14.get("perform_args"))[:80])
+    check("旁车 refs 记录滚动参考摊平（追踪件）",
+          any(r.get("stage") == "rolling" for r in _side14.get("refs", [])),
+          f"{[(r.get('stage'), r.get('prev_tail_after_s')) for r in _side14.get('refs', [])]}")
+    check("旁车 joints 逐边界审计（追踪件）",
+          len(_side14.get("joints", [])) == 1
+          and "script_gap_ms" in _side14["joints"][0],
+          str(_side14.get("joints")))
+    check("旁车逐块 governance 审计（追踪件）",
+          all("governance" in l and "audit" in l.get("governance", {})
+              for l in _side14.get("lines", [])),
+          str(_side14["lines"][0].get("governance", {}))[:90])
     # continuity=False → 不构建滚动参考，两块共用同一基础参考
     eng13 = _StubEngine(_Cfg_populate(tmp))
     ORC.perform(eng13, req, sc12, route=False, continuity=False)
