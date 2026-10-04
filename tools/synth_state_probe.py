@@ -84,6 +84,68 @@ def main() -> int:
         check("语言清洗为大写", s.get("lang") == "ZH")
         check("情感模式索引钳到 3", s.get("emo_mode_index") == 3)
         check("白名单外字段被丢弃", "hacker_key" not in s)
+
+        # ---- 超分键记忆（2026-10-04 用户需求回归）----
+        # 事故：sr_auto/sr_steps 此前不在 sanitize 白名单——UI 恢复端
+        # ST.get 有键、落盘端 sanitize 却静默丢弃，重启即丢。
+        s_sr = SS.sanitize({"sr_auto": True, "sr_steps": 40,
+                            "sr_steps_hi": 9999})
+        check("超分键入白名单：sr_auto/sr_steps 存活",
+              s_sr.get("sr_auto") is True and s_sr.get("sr_steps") == 40)
+        check("sr_steps 越界钳到 100", SS.sanitize(
+            {"sr_steps": 9999}).get("sr_steps") == 100)
+
+        # ---- 生成历史（2026-10-04 用户需求回归）----
+        _hist_bak = SS.HISTORY_PATH + ".probe_bak"
+        if os.path.isfile(SS.HISTORY_PATH):
+            shutil.copy2(SS.HISTORY_PATH, _hist_bak)
+        try:
+            os.path.isfile(SS.HISTORY_PATH) and os.remove(SS.HISTORY_PATH)
+            _vals = {"voice_name": "探针角色", "lang": "ZH", "seed": 7,
+                     "temperature": 1.2, "director_enable": True,
+                     "sr_auto": True, "sr_steps": 45}
+            ok = SS.append_history("历史回归文本甲", _vals,
+                                   prompt_audio=str(vb_audio),  # 稳存路径直引
+                                   output="outputs/probe_h.wav", mode="导演·api")
+            tmp_path = os.path.join(tempfile.gettempdir(),
+                                    "zz_hist_probe_up.wav")
+            import numpy as _np
+            import soundfile as _sf
+            _sf.write(tmp_path, _np.zeros(2205, _np.float32), 22050)
+            SS.append_history("历史回归文本乙（临时上传参考）", _vals,
+                              prompt_audio=tmp_path, mode="单次合成")
+            hist = SS.load_history()
+            check("历史追加与读取（新→旧）",
+                  ok and len(hist) == 2 and "乙" in hist[0]["text"],
+                  f"n={len(hist)}")
+            check("稳存路径直接引用（不拷贝）",
+                  hist[1]["prompt_audio"] == str(vb_audio))
+            check("临时上传被拷进 history_audio",
+                  hist[0]["prompt_audio"] is not None
+                  and hist[0]["prompt_audio"].startswith(
+                      SS.HISTORY_AUDIO_DIR)
+                  and os.path.isfile(hist[0]["prompt_audio"]))
+            ch = SS.history_choices()
+            check("下拉标签含模式/角色/摘要",
+                  len(ch) == 2 and "单次合成" in ch[0][0]
+                  and "探针角色" in ch[0][0], ch[0][0][:50])
+            e = SS.get_history_entry(ch[1][1])
+            check("按 id 取条目（值经 sanitize 存活）",
+                  e is not None and e["values"]["sr_steps"] == 45
+                  and e["values"]["seed"] == 7)
+            check("不存在 id → None",
+                  SS.get_history_entry("no-such") is None)
+            for i in range(SS.HISTORY_MAX + 5):
+                SS.append_history(f"填充{i}", _vals)
+            check(f"封顶 {SS.HISTORY_MAX} 条",
+                  len(SS.load_history()) == SS.HISTORY_MAX)
+        finally:
+            if os.path.isfile(_hist_bak):
+                shutil.copy2(_hist_bak, SS.HISTORY_PATH)
+                os.remove(_hist_bak)
+            else:
+                os.path.isfile(SS.HISTORY_PATH) and os.remove(SS.HISTORY_PATH)
+            shutil.rmtree(SS.HISTORY_AUDIO_DIR, ignore_errors=True)
         check("畸形数值字段被丢弃", "interval_silence" not in s)
 
         # 1b) 2026-09 新键：导演模式 / 解锁开关 / CFM 通道 / 外推钳制修正

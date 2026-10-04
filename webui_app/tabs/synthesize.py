@@ -735,6 +735,18 @@ def render(ctx: AppContext):
                     interactive=False, autoscroll=True,
                     placeholder="点「生成」后这里会实时打印合成各阶段的进度…",
                     elem_id="ix-synth-log")
+                # 生成历史（2026-10-04 · 用户需求）：最近生成一键恢复全部
+                # 配置——文本、采样参数、双 LoRA、导演设置、参考音频、种子。
+                with gr.Accordion("🕘 生成历史（一键恢复完整配置）",
+                                  open=False):
+                    hist_dd = gr.Dropdown(
+                        choices=SS.history_choices(),
+                        label="选择一次生成（新→旧，最多 30 条）",
+                        interactive=True, scale=5)
+                    with gr.Row():
+                        hist_apply_btn = gr.Button(
+                            "📥 应用此配置（覆盖当前界面）", scale=1)
+                        hist_status = gr.HTML("")
 
         # =================================================================
         # 右栏
@@ -1230,6 +1242,56 @@ def render(ctx: AppContext):
                 "缓解办法见「参数手册 → 显存策略 → 低显存自动分块」。")
 
         _log_sink.append(f"✅ 合成完成 · 共 {res.get('audio_duration', 0):.1f}s 音频")
+
+        # ---- 生成历史（2026-10-04 · 用户需求）：成功后记录完整配置 ----
+        # syn_live_values 提供界面快照形状（含音色名/记忆开关），生成路径
+        # 上的权威值（raw 核心 + 尾部 22 参）以其为准覆盖——两侧同构，
+        # sanitize 白名单兜底。失败不影响合成主流程。
+        try:
+            _hv = dict(ctx.shared.get("syn_live_values") or {})
+            for k in _CORE_KEYS:
+                if k in ("spk_audio_prompt", "text", "emo_audio_prompt"):
+                    continue          # 音频走独立字段；文本走顶层
+                _hv[k if k != "emo_control_method" else "emo_mode_label"] = \
+                    raw.get(k)
+            _hv.update({
+                "emo_mode_index": W.emo_mode_index(
+                    str(raw.get("emo_control_method") or "")),
+                "lora_run": str(lora_run or ""),
+                "lora_ckpt": str(lora_ckpt or "best"),
+                "lora_scale": float(lora_scale or 1.0),
+                "lora_cfm_run": str(lora_cfm_run or ""),
+                "lora_cfm_ckpt": str(lora_cfm_ckpt or "best"),
+                "lora_cfm_scale": float(lora_cfm_scale or 1.0),
+                "polish_on": bool(pol_on),
+                "polish_presence": float(pol_presence or 0.0),
+                "polish_exciter": float(pol_exciter or 0.0),
+                "director_enable": bool(dir_on),
+                "director_backend": ("api" if str(dir_backend) == "api"
+                                     else "rules"),
+                "director_character": str(dir_character or ""),
+                "director_route_emo": bool(dir_route),
+                "director_pause_scale": float(dir_scale or 1.0),
+                "director_bon": int(dir_bon_n or 0),
+                "director_bon_keep": bool(dir_bon_keep),
+                "director_breath": bool(dir_breath_on),
+                "director_stress": bool(dir_stress_on),
+                "director_stress_gain": float(dir_stressgain or 2.0),
+                "director_f0_restore": bool(dir_f0on),
+                "director_f0_expand": float(dir_f0exp or 1.3),
+                "director_pause_cap_ms": int(dir_pausecap or 0),
+                "sr_auto": bool(ctx.shared.get("sr_auto")),
+                "sr_steps": int(ctx.shared.get("sr_steps") or 35),
+            })
+            SS.append_history(
+                req.text or "", _hv,
+                prompt_audio=str(req.spk_audio_prompt or ""),
+                emo_audio=str(raw.get("emo_audio_prompt") or ""),
+                output=res["path"],
+                mode=(f"导演·{'api' if str(dir_backend) == 'api' else 'rules'}"
+                      if dir_on else "单次合成"))
+        except Exception:
+            pass
 
         # ---- 自动超分（勾选「生成后自动超分」时）----
         # 一条龙：卸引擎 → AudioSR 48k → 卸 AudioSR → 重载引擎。产出进
@@ -2133,6 +2195,119 @@ def render(ctx: AppContext):
     gr.on(triggers=[c.change for c in remember_comps],
           fn=on_param_change, inputs=remember_comps, outputs=[mem_status],
           show_progress="hidden")
+
+    # ---------- 生成历史：一键恢复完整配置（2026-10-04 · 用户需求） ------
+    # 返回顺序 = [text_in] + remember_comps + [hist_status]，与下方
+    # click 的 outputs 一一对应；下拉选项用 2.5s 定时器刷新（仅条数
+    # 变化时更新，避免覆盖用户正在做的选择）。
+    _HIST_N_OUT = 1 + len(remember_comps) + 1
+
+    @LOG.ui_guard("synthesize.on_apply_history")
+    def on_apply_history(hid):
+        if not hid:
+            return (gr.update(),) * (_HIST_N_OUT - 1) + (
+                gr.update(value='<span class="ix-chip">'
+                        '<span class="ix-dot warn"></span>'
+                        '先在上方选一条生成记录</span>'),)
+        e = SS.get_history_entry(str(hid))
+        if not e:
+            return (gr.update(),) * (_HIST_N_OUT - 1) + (
+                gr.update(value='<span class="ix-chip">'
+                        '<span class="ix-dot warn"></span>'
+                        '记录不存在（历史文件可能被清理）</span>'),)
+        v = e.get("values") or {}
+        g = v.get
+
+        def _aud(p):
+            p = str(p or "")
+            return gr.update(value=p) if p and os.path.isfile(p) \
+                else gr.update()
+
+        def _dd(val, choices):
+            val = str(val or "")
+            return gr.update(value=val) if val in choices else gr.update()
+
+        ck_g = _lora_ckpt_choices(g("lora_run") or "")
+        ck_c = _lora_ckpt_choices(g("lora_cfm_run") or "")
+        # remember_comps 顺序（见上方列表），逐个映射：
+        ups = [
+            gr.update(value=e.get("text") or ""),          # text_in
+            _dd(g("voice_name"), _bank_names),              # voice_dd
+            _aud(e.get("prompt_audio")),                    # prompt_audio
+            _dd(g("lang"), list(cfg.languages)),            # lang_dd
+            gr.update(value=g("duration_factor", 1.0)),     # dur_sl
+            gr.update(value=g("seed") if g("seed") is not None else -1),
+            gr.update(value=bool(g("text_normalization"))),
+            gr.update(value=g("max_text_tokens_per_segment", 120)),
+            gr.update(value=g("interval_silence", 200)),
+            gr.update(value=g("emo_mode_label") or None),   # emo_mode
+            _aud(e.get("emo_audio")),
+            gr.update(value=g("emo_alpha", 0.65)),
+        ] + [gr.update(value=g(f"emo_vec_{i}", 0.0)) for i in range(8)] + [
+            gr.update(value=g("emo_text") or ""),
+            gr.update(value=bool(g("use_random"))),
+            gr.update(value=bool(g("emo_unlock_vector_cap"))),
+            gr.update(value=bool(g("emo_extrapolate"))),
+            gr.update(value=bool(g("do_sample"))),
+            gr.update(value=g("temperature", 0.8)),
+            gr.update(value=g("top_p", 0.8)),
+            gr.update(value=g("top_k", 30)),
+            gr.update(value=g("num_beams", 3)),
+            gr.update(value=g("repetition_penalty", 10.0)),
+            gr.update(value=g("length_penalty", 0.0)),
+            gr.update(value=g("max_mel_tokens", 1500)),
+            _dd(g("lora_run"), _gpt_values),
+            _dd(g("lora_ckpt"), ["best"] + ck_g),
+            gr.update(value=g("lora_scale", 1.0)),
+            _dd(g("lora_cfm_run"), _cfm_values),
+            _dd(g("lora_cfm_ckpt"), ["best"] + ck_c),
+            gr.update(value=g("lora_cfm_scale", 1.0)),
+            gr.update(value=bool(g("polish_on"))),
+            gr.update(value=g("polish_presence", 0.0)),
+            gr.update(value=g("polish_exciter", 0.0)),
+            gr.update(),                                   # remember_cb 不动
+            gr.update(value=bool(g("director_enable"))),
+            gr.update(value=g("director_backend") or "rules"),
+            gr.update(value=g("director_character") or ""),
+            gr.update(value=bool(g("director_route_emo"))),
+            gr.update(value=g("director_pause_scale", 1.0)),
+            gr.update(value=int(g("director_bon") or 0)),
+            gr.update(value=bool(g("director_bon_keep"))),
+            gr.update(value=bool(g("director_breath"))),
+            gr.update(value=int(g("director_pause_cap_ms") or 0)),
+            gr.update(value=bool(g("director_stress"))),
+            gr.update(value=g("director_stress_gain", 2.0)),
+            gr.update(value=bool(g("director_f0_restore"))),
+            gr.update(value=g("director_f0_expand", 1.3)),
+            gr.update(value=bool(g("sr_auto"))),
+            gr.update(value=int(g("sr_steps") or 35)),
+            gr.update(value=(
+                '<span class="ix-chip"><span class="ix-dot ok"></span>'
+                f'已应用 [{e.get("time", "")}] 的完整配置'
+                f'（输出：{os.path.basename(e.get("output") or "—")}）'
+                '</span>')),
+        ]
+        if len(ups) != _HIST_N_OUT:
+            # 映射表与 outputs 错位是静默错配事故的形态（阶段18教训），
+            # 渲染期就炸出来。
+            raise RuntimeError(
+                f"on_apply_history 返回 {len(ups)} 项，outputs 需要 "
+                f"{_HIST_N_OUT} 项——remember_comps 变更后同步映射表。")
+        return tuple(ups)
+
+    hist_apply_btn.click(
+        on_apply_history, inputs=[hist_dd],
+        outputs=[text_in] + remember_comps + [hist_status])
+
+    def _refresh_hist():
+        ch = SS.history_choices()
+        if len(ch) != ctx.shared.get("_hist_n", -1):
+            ctx.shared["_hist_n"] = len(ch)
+            return gr.update(choices=ch, value=None)
+        return gr.update()
+
+    _hist_timer = gr.Timer(value=2.5, active=True)
+    _hist_timer.tick(_refresh_hist, outputs=[hist_dd])
 
     # ---------- 清除记忆并恢复默认 ----------
     reset_targets = [

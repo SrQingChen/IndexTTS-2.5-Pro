@@ -70,11 +70,11 @@ FLOAT_KEYS = {"duration_factor", "emo_alpha", "top_p", "temperature",
               "repetition_penalty", "length_penalty", "interval_silence"} | {
                   f"emo_vec_{i}" for i in range(8)}
 INT_KEYS = {"top_k", "num_beams", "max_mel_tokens",
-            "max_text_tokens_per_segment", "director_bon"}
+            "max_text_tokens_per_segment", "director_bon", "sr_steps"}
 BOOL_KEYS = {"text_normalization", "use_random", "do_sample",
              "director_enable", "director_route_emo", "director_bon_keep",
              "director_breath", "director_stress", "director_f0_restore",
-             "emo_unlock_vector_cap", "emo_extrapolate"}
+             "emo_unlock_vector_cap", "emo_extrapolate", "sr_auto"}
 # 本项目自有的、官方预设格式之外的配置（记忆机制保存，配置档不保存）
 EXTRA_KEYS: List[str] = ["lora_scale", "polish_on", "polish_presence",
                          "polish_exciter",
@@ -84,7 +84,8 @@ EXTRA_KEYS: List[str] = ["lora_scale", "polish_on", "polish_presence",
                          "director_bon", "director_bon_keep",
                          "director_breath", "director_stress_gain",
                          "director_f0_expand", "director_pause_cap_ms",
-                         "emo_unlock_vector_cap", "emo_extrapolate"]
+                         "emo_unlock_vector_cap", "emo_extrapolate",
+                         "sr_auto", "sr_steps"]
 FLOAT_KEYS |= {"lora_scale", "polish_presence", "polish_exciter",
                "lora_cfm_scale", "director_pause_scale",
                "director_stress_gain", "director_f0_expand",
@@ -104,6 +105,7 @@ _CLAMP: Dict[str, Tuple[float, float]] = {
     "polish_exciter": (0.0, 0.3), "interval_silence": (0.0, 1000.0),
     "lora_cfm_scale": (0.0, 1.5),
     "director_pause_scale": (0.4, 1.6), "director_bon": (0, 8),
+    "sr_steps": (10, 100),
 }
 
 
@@ -392,3 +394,94 @@ def delete_lora_profile(character: str) -> bool:
         return True
     except OSError:
         return False
+
+
+# ===========================================================================
+# 生成历史（2026-10-04 · 用户需求：日志窗下方列出最近生成，一键恢复全部配置）
+# ===========================================================================
+
+HISTORY_PATH = os.path.join(STATE_DIR, "synth_history.json")
+HISTORY_MAX = 30
+HISTORY_AUDIO_DIR = os.path.join(STATE_DIR, "history_audio")
+
+
+def append_history(text: str, values: Dict[str, Any],
+                   prompt_audio: Optional[str] = None,
+                   emo_audio: Optional[str] = None,
+                   output: str = "", mode: str = "") -> bool:
+    """生成成功后追加一条历史（最新在前，封顶 HISTORY_MAX）。
+
+    values 与 save_state 同构（_live_snapshot 的输出）；sanitize 白名单
+    过滤后入库——历史被手改也不会把畸形值带进界面。音频按「稳存路径直
+    接引用、临时上传拷贝进库」处理：音色库/情感库/outputs 下的文件生命
+    周期与项目一致；Gradio 上传的临时文件会被清理，必须拷贝。
+    """
+    ts = time.time()
+    hid = f"{ts:.3f}"
+
+    def _settle_audio(p: Optional[str]) -> Optional[str]:
+        if not p or not os.path.isfile(p):
+            return None
+        p = os.path.abspath(p)
+        root = os.path.abspath(PROJECT_ROOT)
+        if p.startswith(root):
+            return p                      # 项目内文件：生命周期有保障
+        try:
+            os.makedirs(HISTORY_AUDIO_DIR, exist_ok=True)
+            dst = os.path.join(HISTORY_AUDIO_DIR, f"{hid}_prompt.wav")
+            shutil.copy2(p, dst)
+            return dst
+        except OSError:
+            return None
+
+    entry = {
+        "id": hid,
+        "time": time.strftime("%m-%d %H:%M:%S"),
+        "mode": mode,
+        "text": str(text or ""),
+        "values": sanitize(values),
+        "prompt_audio": _settle_audio(prompt_audio),
+        "emo_audio": _settle_audio(emo_audio),
+        "output": output,
+        "created_at": ts,
+    }
+    hist = load_history()
+    hist.insert(0, entry)
+    del hist[HISTORY_MAX:]
+    try:
+        _atomic_write(HISTORY_PATH, {"entries": hist})
+        return True
+    except OSError:
+        return False
+
+
+def load_history() -> List[Dict[str, Any]]:
+    """读历史列表（新→旧）。坏文件静默降级为空。"""
+    if not os.path.isfile(HISTORY_PATH):
+        return []
+    try:
+        with open(HISTORY_PATH, "r", encoding="utf-8") as f:
+            d = json.load(f)
+        items = d.get("entries") if isinstance(d, dict) else d
+        return [e for e in (items or []) if isinstance(e, dict) and e.get("id")]
+    except (OSError, ValueError):
+        return []
+
+
+def history_choices() -> List[Tuple[str, str]]:
+    """下拉框选项：[(标签, id)]。标签带模式/角色/文本摘要便于辨认。"""
+    out = []
+    for e in load_history():
+        v = e.get("values") or {}
+        label = (f"[{e.get('time', '')}] {e.get('mode', '')} "
+                 f"{v.get('voice_name') or v.get('director_character') or ''} · "
+                 f"{(e.get('text') or '')[:24]}")
+        out.append((label[:80], str(e.get("id"))))
+    return out
+
+
+def get_history_entry(hid: str) -> Optional[Dict[str, Any]]:
+    for e in load_history():
+        if str(e.get("id")) == str(hid):
+            return e
+    return None
