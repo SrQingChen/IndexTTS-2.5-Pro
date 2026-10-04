@@ -450,6 +450,32 @@ def main() -> int:
           _j15[2]["punct_floor_ms"] == 320
           and _j15[2]["script_gap_ms"] >= 320,
           f"{_j15[2]}")
+
+    # ---- 衔接连续性择优（2026-10-04 块间语感突变治理回归）----
+    # 实测：块尾→下块首 F0 中位差 ±2~8 半音（与块内词组过渡同级），
+    # 30ms 无缝时代被掩盖，句间拉长后暴露。BoN 择优时罚首音区跳变。
+    def _tone_f0(sec, f0_hz, seed):
+        t = np.arange(int(sec * SR)) / SR
+        ph = 2 * np.pi * f0_hz * (t + 0.01 * np.sin(2 * np.pi * 5 * t))
+        w = (0.5 * np.sin(ph) + 0.3 * 0.5 * np.sin(2 * ph)
+             + 0.02 * np.random.default_rng(seed).normal(size=len(t)))
+        return w.astype(np.float32)
+
+    _p_hi = os.path.join(tmp, "cont_hi.wav")
+    _p_lo = os.path.join(tmp, "cont_lo.wav")
+    sf.write(_p_hi, _tone_f0(1.0, 250, 1), SR, subtype="PCM_16")
+    sf.write(_p_lo, _tone_f0(1.0, 175, 2), SR, subtype="PCM_16")
+    _pen = ORC._register_jump_penalty(_p_lo, _p_hi)
+    check("连续性：音区差≈6st（250→175Hz）→ 罚 0.1~0.3",
+          0.1 < _pen <= 0.3, str(_pen))
+    check("连续性：同音区 → 不罚",
+          ORC._register_jump_penalty(_p_hi, _p_hi) == 0.0)
+    check("连续性：惩罚封顶 0.30",
+          ORC._register_jump_penalty(_p_lo, _p_hi, free_st=0.0,
+                                     max_pen=0.30) == 0.30)
+    check("连续性：缺文件/异常 → 0（不影响排序）",
+          ORC._register_jump_penalty(os.path.join(tmp, "无.wav"),
+                                     _p_hi) == 0.0)
     # continuity=False → 不构建滚动参考，两块共用同一基础参考
     eng13 = _StubEngine(_Cfg_populate(tmp))
     ORC.perform(eng13, req, sc12, route=False, continuity=False)

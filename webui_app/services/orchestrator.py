@@ -106,6 +106,57 @@ def _tail_truncation_penalty(path: str) -> float:
         return 0.0
 
 
+def _register_jump_st(path: str, prev_path: str) -> float:
+    """候选首音区与上一块尾音区的差（半音，绝对值）。异常/测不出→inf。
+
+    实测（30 块长文本）：块尾→下一块首的 F0 中位差 ±2~8 半音，与块内
+    词组过渡同量级——块是独立渲染的，起始音区随机；以前块间 30ms 无缝
+    交叉淡化把跳变掩盖了，句间停顿拉长后每一处边界都成了干净 A/B 对比
+    （用户听感「分块前后语感突变」）。
+    """
+    try:
+        import soundfile as sf
+        import pyworld as pw
+
+        def _med(p: str, head: bool) -> float:
+            y, sr = sf.read(p, dtype="float32")
+            if y.ndim > 1:
+                y = y.mean(axis=1)
+            n = int(min(0.30, len(y) / sr * 0.5) * sr)
+            if n < int(0.1 * sr):
+                return float("nan")
+            seg = (y[:n] if head else y[-n:]).astype(np.float64)
+            f0, _t = pw.harvest(seg, sr, f0_floor=70.0, f0_ceil=600.0)
+            v = f0[f0 > 0]
+            if len(v) < 15:
+                return float("nan")
+            return float(np.median(v))
+
+        a = _med(prev_path, head=False)
+        b = _med(path, head=True)
+        if np.isnan(a) or np.isnan(b):
+            return float("inf")
+        return abs(12.0 * np.log2(b / a))
+    except Exception:
+        return float("inf")
+
+
+def _register_jump_penalty(path: str, prev_path: str,
+                           free_st: float = 3.0,
+                           max_pen: float = 0.30) -> float:
+    """_register_jump_st 的惩罚形态（BoN 软罚，线性 >free_st 起罚，封顶）。
+
+    软罚在「某候选奖励领先过多」时买不动（实测 0.93 vs 0.86 差距下
+    0.30 罚不动第一名）——真正的决胜在 chosen 选择处的并列组择优
+    （奖励差 ≤0.10 为并列，组内挑音区衔接最好的），本惩罚负责把
+    「奖励本来就接近」的候选排对顺序。模块级便于探针直测。
+    """
+    st = _register_jump_st(path, prev_path)
+    if not np.isfinite(st):
+        return 0.0
+    return float(min(max_pen, max(0.0, st - free_st) * 0.06))
+
+
 def _read_mono_int16(path: str) -> np.ndarray:
     try:
         import soundfile as sf
@@ -532,12 +583,17 @@ def perform(
             log.warning("滚动参考构建失败（块 %d 回退原参考）：%s", bi, e)
             return base_ref
 
-    def _score_one(path: str, text: str, emo_ref: str) -> float:
+    def _score_one(path: str, text: str, emo_ref: str,
+                   prev_path: str = "") -> float:
         r = _scorer.score(path, text, base["spk_audio_prompt"],
                           emo_ref_path=(emo_ref or None))
         if not r.get("ok") or r.get("reward") is None:
             return -1.0
-        return float(r["reward"]) - _tail_truncation_penalty(path)
+        pen = _tail_truncation_penalty(path)
+        if prev_path:
+            # 衔接连续性择优：同情绪块间才罚（情绪转换是有意的风格变化）
+            pen += _register_jump_penalty(path, prev_path)
+        return float(r["reward"]) - pen
 
     # 逐块目标响度：先采完整序列再做**限步平滑**（首块=中位，相邻 ≤2.5dB）
     # —— 独立采样在宽分布角色上会 ±9dB 跳变，听感「忽高忽低」/混响抽吸
@@ -622,6 +678,14 @@ def perform(
             chosen_k = 0
             bon_info: Dict[str, Any] = {}
             if bon_n > 1:
+                # 衔接连续性：同情绪的相邻块间，候选首音区偏离上一选中
+                # 块尾音区会被罚——「分块前后语感突变」的择优治理
+                # （2026-10-04，实测边界音区差 ±2~8 半音与块内词组过渡
+                # 同级，句间停顿拉长后暴露）。
+                _prev_for_cont = (prev_chosen if (
+                    bi > 0 and prev_chosen
+                    and blocks[bi]["emotion"] == blocks[bi - 1]["emotion"])
+                    else "")
                 for k, cp in enumerate(cand_paths):
                     if progress:
                         try:
@@ -631,12 +695,30 @@ def perform(
                         except Exception:
                             pass
                     rewards.append(round(_score_one(cp, blk_text,
-                                                    emo_ref_path), 4))
+                                                    emo_ref_path,
+                                                    prev_path=_prev_for_cont),
+                                         4))
                 ok_idx = [k for k, r in enumerate(rewards) if r >= 0]
-                chosen_k = (max(ok_idx, key=lambda k: rewards[k])
-                            if ok_idx else 0)
+                chosen_k = 0
+                _tied_n = 1
+                if ok_idx:
+                    best_r = max(rewards[k] for k in ok_idx)
+                    # 并列组择优（2026-10-04 衔接连续性决胜局）：奖励差
+                    # ≤0.10 的候选视为并列（准确率优先不妥协），组内挑
+                    # 与上一块尾音区衔接最好的——软罚买不动领先者时由
+                    # 这里兜底（实测 0.93 vs 0.86 的差距下 0.30 罚不动）。
+                    tied = [k for k in ok_idx if rewards[k] >= best_r - 0.10]
+                    _tied_n = len(tied)
+                    if len(tied) > 1 and _prev_for_cont:
+                        chosen_k = min(
+                            tied, key=lambda k: _register_jump_st(
+                                cand_paths[k], _prev_for_cont))
+                    else:
+                        chosen_k = max(ok_idx, key=lambda k: rewards[k])
                 bon_info = {"n": n_try, "chosen": chosen_k,
-                            "rewards": rewards}
+                            "rewards": rewards,
+                            "tied_n": _tied_n,
+                            "continuity": bool(_prev_for_cont)}
                 # bon_keep：把最优/最差落成持久文件 —— 对齐页的
                 # 「从 BoN 台本导入」用它们构造 DPO 偏好对（C2 桥接）。
                 if bon_keep and len(ok_idx) >= 2:
