@@ -64,8 +64,10 @@ def main() -> int:
                    intensity=l["intensity"], pause_after_ms=l["pause_after_ms"])
         for l in lines], backend="api", ok=True)
 
-    out = os.path.join("outputs", "continuity_after.wav")
+    out = os.path.join("outputs", "continuity_after_%s.wav"
+                       % os.environ.get("PROBE_TEMP", "1.2").replace(".", ""))
     side_out = os.path.splitext(out)[0] + ".script.json"
+    print("  PROBE_TEMP =", os.environ.get("PROBE_TEMP", "1.2"))
     if "--reuse" in sys.argv and os.path.isfile(out):
         print("  --reuse：复用已有成品")
         res = {"director": {"sidecar": side_out}}
@@ -79,7 +81,9 @@ def main() -> int:
         req = INF.GenRequest(
             spk_audio_prompt=os.path.join("voice_bank", "audio", "达妮娅.wav"),
             text="".join(l.text for l in sc.lines), emo_alpha=0.65,
-            seed=side["base_seed"], temperature=1.2, top_p=0.9,
+            seed=side["base_seed"],
+            temperature=float(os.environ.get("PROBE_TEMP", "1.2")),
+            top_p=0.9,
             max_text_tokens_per_segment=180)
         t0 = time.perf_counter()
         res = ORC.perform(eng, req, sc, route=False, character="达妮娅",
@@ -114,6 +118,34 @@ def main() -> int:
           med <= 2.5, f"中位 {med:.1f} · {diffs}")
     check("无 >5.5 半音的剧烈边界跳变（基线最大 8.3）",
           all(d <= 5.5 for d in diffs), f"{diffs}")
+    # 谱质心稳定性（2026-10-04 音色漂移根治验收）：基线=用户30块成品
+    # 质心 775~4690Hz（6 倍摆动=「一句尖锐嘶哑一句很低沉」）。滚动参考
+    # 的 prev_tail 现已向角色 spectral_profile 对齐，块间质心比应 ≤2.5。
+    cens = []
+    acc2 = 0.08
+    for i, l in enumerate(side2["lines"]):
+        s0 = acc2
+        acc2 += l["samples"] / SR
+        if i < len(side2["lines"]) - 1:
+            acc2 += max(side2["joints"][i]["script_gap_ms"], 30) / 1000
+        seg = y[int(s0 * SR):int(min(acc2, len(y) / SR) * SR)]
+        if len(seg) < SR // 2:
+            continue
+        S = np.abs(np.fft.rfft(seg * np.hanning(len(seg)))) ** 2
+        ff = np.fft.rfftfreq(len(seg), 1 / SR)
+        cens.append(float(np.sum(ff * S) / (np.sum(S) + 1e-12)))
+    ratio = (max(cens) / min(cens)) if cens and min(cens) > 0 else 99.0
+    print(f"  块谱质心: {[round(c) for c in cens]} · 最大/最小比 {ratio:.2f}"
+          f"（基线 6.0）")
+    # 注意：整块谱质心含内容混淆（齿音/擦音多的文本质心天然高，实测
+    # temp 0.8 不收敛），此断言只卡「极端漂移」档（>4.5=真漂移），块间
+    # 细致音色一致性以听感为准。
+    check("块间谱质心比 ≤4.5（极端音色漂移档，基线 6.0）",
+          ratio <= 4.5, f"{[round(c) for c in cens]} · ratio={ratio:.2f}")
+    _sm = [r.get("spectral_matched") for r in (side2.get("refs") or [])
+           if r.get("stage") == "rolling"]
+    check("滚动参考全部做过频谱对齐", sm_ok := (bool(_sm) and all(_sm)),
+          f"{_sm}")
     check("旁车 bon 记录 continuity（可追溯）",
           all((l.get("bon") or {}).get("continuity") in (True, False)
               for l in side2["lines"][1:]),

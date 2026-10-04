@@ -141,6 +141,37 @@ def _register_jump_st(path: str, prev_path: str) -> float:
         return float("inf")
 
 
+def _centroid_jump(path: str, prev_path: str) -> float:
+    """候选首 300ms 与上一块尾 300ms 的谱质心差（Hz/400 归一）。
+
+    音色连续性的决胜项之一（2026-10-04）：谱质心块间 6 倍摆动是「一句
+    尖锐嘶哑、一句很低沉」的实体；与 _register_jump_st 联合构成并列组
+    决胜键（音区 + 音色）。异常 → 0（不影响排序）。
+    """
+    try:
+        import soundfile as sf
+
+        def _cen(p: str, head: bool) -> float:
+            y, sr = sf.read(p, dtype="float32")
+            if y.ndim > 1:
+                y = y.mean(axis=1)
+            n = int(min(0.30, len(y) / sr * 0.5) * sr)
+            if n < int(0.1 * sr):
+                return float("nan")
+            seg = (y[:n] if head else y[-n:]) * np.hanning(n)
+            S = np.abs(np.fft.rfft(seg)) ** 2
+            ff = np.fft.rfftfreq(n, 1.0 / sr)
+            return float(np.sum(ff * S) / (np.sum(S) + 1e-12))
+
+        a = _cen(prev_path, head=False)
+        b = _cen(path, head=True)
+        if np.isnan(a) or np.isnan(b):
+            return 0.0
+        return abs(b - a) / 400.0
+    except Exception:
+        return 0.0
+
+
 def _register_jump_penalty(path: str, prev_path: str,
                            free_st: float = 3.0,
                            max_pen: float = 0.30) -> float:
@@ -517,7 +548,11 @@ def perform(
             fixed = int(14.0 * SR)
             xf = int(0.060 * SR)
 
-            prev_tail = prev_y[-int(11.0 * SR):]
+            # 2026-10-04 尾巴占比反转：11s→5s。11s 尾巴占 14s 参考的
+            # 79%，音色/音区漂移链式放大（谱质心 6 倍摆动实锤）；5s 尾巴
+            # （35%）足以承载「最新语境接续」，9s 光谱对齐过的稳定基础
+            # 参考把每块条件锚回角色均值。
+            prev_tail = prev_y[-int(5.0 * SR):]
             # 参考韵律摊平对滚动参考同样生效（2026-10-03 连续性修复）：
             # prev_tail 是上一块**未经输出治理的原始波形**，带着模型自发
             # 的词组化停顿（实测 44~53 个/分钟）——不摊平的话，第 2 块起
@@ -528,11 +563,27 @@ def perform(
             if flatten_ref:
                 prev_tail = AL.cap_interior_pauses(
                     prev_tail, SR, int(flatten_cap_ms), thresh_db=-30.0)
+            # 频谱画像对齐（2026-10-04 音色漂移根治件）：滚动参考里 11s
+            # 的 prev_tail 主导 w2v/CAMPPlus 条件，而它从未做频谱匹配——
+            # 明亮块生出明亮参考（更亮）、暗块反之，音色链式漂移（实测
+            # 30 块谱质心 775~4690Hz 摆 6 倍 = 用户听感「一句尖锐嘶哑、
+            # 一句很低沉」；最初导演模式每块共用同一参考所以无此问题）。
+            # 与块 1 基础参考同一把刀：向角色 spectral_profile 对齐
+            # （±5dB 平滑增益、相位不变），把每块的音色条件拉回角色均值。
+            _spec_matched = False
+            if _spectral_fp:
+                try:
+                    prev_tail = AL.match_band_profile(
+                        prev_tail, SR, _spectral_fp, max_db=5.0)
+                    _spec_matched = True
+                except Exception:
+                    pass
             ref_log.append({
                 "stage": "rolling", "block": bi, "prev": os.path.basename(prev_wav),
                 "prev_tail_before_s": round(_pt_before / SR, 3),
                 "prev_tail_after_s": round(len(prev_tail) / SR, 3),
                 "flatten_on": bool(flatten_ref),
+                "spectral_matched": _spec_matched,
             })
             ref_part = ref_y[max(0, len(ref_y) - (fixed - len(prev_tail))):]
             # 参考不够填 → 拉长上一块的占用；两者合计仍不足 14s 就**短着用**
@@ -710,9 +761,11 @@ def perform(
                     tied = [k for k in ok_idx if rewards[k] >= best_r - 0.10]
                     _tied_n = len(tied)
                     if len(tied) > 1 and _prev_for_cont:
+                        # 联合连续度决胜：音区（半音）+ 音色（质心/400）
                         chosen_k = min(
                             tied, key=lambda k: _register_jump_st(
-                                cand_paths[k], _prev_for_cont))
+                                cand_paths[k], _prev_for_cont)
+                            + _centroid_jump(cand_paths[k], _prev_for_cont))
                     else:
                         chosen_k = max(ok_idx, key=lambda k: rewards[k])
                 bon_info = {"n": n_try, "chosen": chosen_k,

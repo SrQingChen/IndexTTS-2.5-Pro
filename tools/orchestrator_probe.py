@@ -379,6 +379,12 @@ def main() -> int:
           _seen_any and _maxrun * 0.025 <= 0.25,
           f"最大内部静音 {_maxrun * 0.025:.2f}s")
     _side14 = _json.load(open(res14["director"]["sidecar"], encoding="utf-8"))
+    check("滚动参考记录 spectral_matched（追踪件，桩无画像=False也合法）",
+          all(isinstance(r.get("spectral_matched"), bool)
+              for r in _side14.get("refs", [])
+              if r.get("stage") == "rolling"),
+          str([(r.get("stage"), r.get("spectral_matched"))
+               for r in _side14.get("refs", [])]))
     check("旁车 code 信息含 rev 与进程年龄判定",
           isinstance(_side14.get("code"), dict)
           and isinstance(_side14["code"].get("rev"), str)
