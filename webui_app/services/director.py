@@ -237,7 +237,40 @@ def comma_pause_band(scale: float = 1.0) -> tuple:
     return int(max(80, lo * s)), int(min(2000, hi * s))
 
 
+def min_punct_pause(line_text: str, scale: float = 1.0) -> int:
+    """按行尾标点给块间停顿下限（ms）；无标点返回 0。
+
+    背景（2026-10-03 长文本实锤）：API 导演按「连续叙述给 0」的提示词
+    把 30 块里 22 个块间停顿给了 0——0 的语义是「希望与后文合并成一
+    块」，但 40 字预算常常合并不了，0 落到拼接层就成了 30ms 交叉淡化，
+    **句间(30ms) 被句内逗号保底(150~290ms) 彻底反超**。文本自身的标
+    点是比 LLM 的 0 更强的语义信号（提示词自己也禁止 LLM 改标点等级）。
+
+    下限取 max(标点带 lo, 逗号带 hi)——块边界是「行/句」级接缝，必须
+    不低于句内逗号类的天花板，否则逗号结尾的块间(120)仍会被块内逗号
+    (120~210) 反超（真机第二轮实锤：句间中位 120 vs 句内中位 170）。
+    无标点（40 字上限强行切的句中缝）→ 0，保持 30ms 无缝交叉淡化。
+    """
+    t = (line_text or "").rstrip()
+    if not t or t[-1] not in _PUNCT_END_CHARS:
+        return 0
+    s = max(0.1, min(3.0, float(scale or 1.0)))
+    lo, _hi = _band_for(t)
+    lo_s = max(80, int(lo * s))                 # 标点带下限（随系数缩放）
+    comma_hi_s = int(min(2000, _PAUSE_BAND["，"][1] * s))
+    # +50ms 行接缝余量：块内气息性逗号截到 210ms 检出后物理残留可达
+    # ~290ms（肩部留在原处，阶段33已知属性）；块边界多为数字零垫床，
+    # 物理即检出——不加余量时边界(210)会被最长的句内逗号(~290)反超
+    # （真机第三轮实锤：句间中位 180 vs 句内中位 180 打平）。
+    return max(lo_s, comma_hi_s + 50)
+
+
 _SENT_SPLIT_RE = re.compile(r'([^。！？!?…；;\n]*[。！？!?…]+|[^。！？!?…；;\n]*[；;\n]+|[^。！？!?…；;\n]+)')
+
+# 行尾标点全集（min_punct_pause 的判定域；_band_for 对无标点回退句号带，
+# 这里必须显式判无标点 → 0，不能用 _band_for 的回退值）
+_PUNCT_END_CHARS = "".join(
+    m for marks in _BAND_ORDER for m in marks) + ".,:!?"
 
 
 def _split_sentences(text: str) -> List[str]:

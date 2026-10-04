@@ -421,6 +421,35 @@ def main() -> int:
           str(ORC._tail_truncation_penalty(_p_trunc)))
     check("截断惩罚：自然衰减尾（100ms 静音）不罚",
           ORC._tail_truncation_penalty(_p_nat) == 0.0)
+
+    # ---- 块间标点下限（2026-10-03 句间反转修复回归）----
+    # 事故：API 导演按「连续叙述给 0」把多数块间停顿给了 0 → 拼接层
+    # 30ms 交叉淡化，被块内逗号保底(150~290ms)反超。修复：gap≈0 时按
+    # 前块行尾标点等级带下限兜底；无标点（40 字强行句中切）保持无缝。
+    eng15 = _StubEngine(_Cfg_populate(tmp))
+    # 交替情绪强制断块（同情绪+≤40字会被合并成一个块）
+    sc15 = DirectorScript(lines=[
+        SL(text="前一句以逗号结尾，", emotion="calm", intensity=0.4,
+           pause_after_ms=0),
+        SL(text="这一句没有标点结尾", emotion="happy", intensity=0.4,
+           pause_after_ms=0),
+        SL(text="句号结尾。", emotion="sad", intensity=0.4,
+           pause_after_ms=0),
+        SL(text="末句。", emotion="angry", intensity=0.4, pause_after_ms=300)])
+    res15 = ORC.perform(eng15, req14, sc15, route=False)
+    _j15 = _json.load(open(res15["director"]["sidecar"],
+                           encoding="utf-8"))["joints"]
+    check("零gap+逗号结尾 → 逗号天花板+接缝余量 260ms 兜底",
+          _j15[0]["punct_floor_ms"] == 260
+          and _j15[0]["script_gap_ms"] >= 260,
+          f"{_j15[0]}")
+    check("零gap+无标点（句中切）→ 保持 30ms 无缝",
+          _j15[1]["punct_floor_ms"] == 0 and _j15[1]["script_gap_ms"] == 30,
+          f"{_j15[1]}")
+    check("零gap+句号结尾 → 句号带下限 320ms 兜底",
+          _j15[2]["punct_floor_ms"] == 320
+          and _j15[2]["script_gap_ms"] >= 320,
+          f"{_j15[2]}")
     # continuity=False → 不构建滚动参考，两块共用同一基础参考
     eng13 = _StubEngine(_Cfg_populate(tmp))
     ORC.perform(eng13, req, sc12, route=False, continuity=False)

@@ -29,7 +29,9 @@ from webui_app import PROCESS_STARTED_AT
 from webui_app.services import emotion_bank as EB
 from webui_app.services import audio_lab as AL
 from webui_app.services import inference as INF
-from webui_app.services.director import DirectorScript, comma_pause_band as _comma_band
+from webui_app.services.director import (
+    DirectorScript, comma_pause_band as _comma_band,
+    min_punct_pause as _min_punct_pause)
 from webui_app.services.engine import EngineError, TTSEngine
 
 SR = 22050  # 官方输出采样率（int16 单声道）
@@ -846,6 +848,16 @@ def perform(
         final = wavs[0] if wavs else np.zeros(1, np.int16)
         for i in range(1, n):
             gap_s = max(0.0, float(line_infos[i - 1]["pause_after_ms"])) / 1000.0
+            # 标点下限（2026-10-03 句间反转修复）：LLM 的 0 语义是「想合
+            # 并成一块」，40 字预算合并不了时 0 会落到 30ms 交叉淡化，
+            # 被块内逗号保底(150~290ms)反超——「句间比句内还短」。行尾
+            # 标点才是停顿等级的真源：逗号结尾→至少逗号带下限；无标点
+            # （强行句中切）→保持 30ms 无缝。
+            _punct_floor_ms = 0
+            if gap_s < 0.05:
+                _punct_floor_ms = _min_punct_pause(
+                    line_infos[i - 1]["text"], float(pause_scale or 1.0))
+                gap_s = max(gap_s, _punct_floor_ms / 1000.0)
             gap_s = max(gap_s, 0.03)             # 台本 0 也至少留 30ms
             nxt = wavs[i]
 
@@ -873,6 +885,7 @@ def perform(
             joints.append({
                 "after_block": i,
                 "script_gap_ms": int(round(gap_s * 1000)),
+                "punct_floor_ms": _punct_floor_ms,
                 "tail_s": round(tail_s, 3), "head_s": round(head_s, 3),
                 "over_s": round(over, 3),
                 "trim_tail_ms": int(round(min(over / 2.0, max(0.0, tail_s - 0.02)) * 1000)) if over > 0 else 0,
