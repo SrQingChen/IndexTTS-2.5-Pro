@@ -92,6 +92,11 @@ def main() -> int:
                             "sr_steps_hi": 9999})
         check("超分键入白名单：sr_auto/sr_steps 存活",
               s_sr.get("sr_auto") is True and s_sr.get("sr_steps") == 40)
+        s_sw = SS.sanitize({"director_stress": True,
+                            "director_f0_restore": False})
+        check("F0/重音勾选键入白名单（历史/记忆双路径丢键修复）",
+              s_sw.get("director_stress") is True
+              and s_sw.get("director_f0_restore") is False)
         check("sr_steps 越界钳到 100", SS.sanitize(
             {"sr_steps": 9999}).get("sr_steps") == 100)
 

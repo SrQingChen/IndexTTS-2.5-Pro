@@ -459,6 +459,24 @@ def render(ctx: AppContext):
                              "0.05~0.15 是安全区；再高会明显失真")
                 polish_md = gr.Markdown(
                     T.hint("生成后这里会显示谱质心前后对比 —— 「亮了没有」有客观数字。"))
+                # ---- F0 音域恢复（2026-10-04 从导演模式独立出来）----
+                # 只依赖输出音频 + 角色 F0 指纹（挂载的 LoRA run），与
+                # 逐句编排无关——单次合成/导演模式都生效。组件对象与键名
+                # 不变（参数记忆/生成历史的登记列表无需改动）。
+                with gr.Row():
+                    dir_f0cb = W.make_component(
+                        "director_f0_restore",
+                        value=bool(ST.get("director_f0_restore", True)),
+                        scale=1)
+                    dir_f0exp_sl = W.make_component(
+                        "director_f0_expand",
+                        value=float(ST.get("director_f0_expand", 1.3)),
+                        scale=1)
+                gr.HTML(T.hint(
+                    "🎚️ <b>F0 音域恢复</b>把输出的音高起伏向角色本人的 F0 "
+                    "指纹扩张（WORLD 重合成，谱包络不动=音色不变），"
+                    "<b>单次合成与导演模式都生效</b>；超过 30s 的单次输出"
+                    "自动跳过（内存安全上限），长文本请用导演模式。"))
                 with gr.Accordion("✨ 超分 48k（AudioSR · 治「老式喇叭」）",
                                   open=False):
                     gr.HTML(T.hint(
@@ -630,10 +648,13 @@ def render(ctx: AppContext):
             # ---------- 导演模式（逐句编排） ----------
             with gr.Column(elem_classes=["ix-section"]):
                 gr.HTML(T.section(
-                    "导演模式（逐句编排）", "🎬",
+                    "导演模式（逐句编排 · 实验性）", "🎬",
                     "把文本交给「导演层」逐句拆分、标情绪、排停顿，再逐句合成拼接。"
                     "句间停顿不再固定 200ms，而是按标点与情绪浮动（150~1200ms）；"
-                    "配合「🎭 情感参考库」可逐句切换情绪参考 —— 这是语气起伏的主杠杆。"))
+                    "配合「🎭 情感参考库」可逐句切换情绪参考 —— 这是语气起伏的主杠杆。<br>"
+                    "⚠️ <b>实验性</b>：逐块编排/滚动参考/BoN 择优会引入额外的接力变量，"
+                    "效果不满意时请先对比<b>关闭导演</b>的单次合成（稳定路径）——"
+                    "「一键应用历史配置」也可以快速还原某次满意的完整设置。"))
                 director_cb = W.make_component(
                     "director_enable",
                     value=bool(ST.get("director_enable", False)))
@@ -678,12 +699,10 @@ def render(ctx: AppContext):
                         dir_stressgain_sl = W.make_component(
                             "director_stress_gain",
                             value=float(ST.get("director_stress_gain", 2.0)))
-                        dir_f0cb = W.make_component(
-                            "director_f0_restore",
-                            value=bool(ST.get("director_f0_restore", True)))
-                        dir_f0exp_sl = W.make_component(
-                            "director_f0_expand",
-                            value=float(ST.get("director_f0_expand", 1.3)))
+                        # F0 音域恢复 2026-10-04 移出导演模式（独立功能，
+                        # 单次合成同样生效）——控件在上方「输出后处理」区；
+                        # 词级重音保留在此：重音词来自台本标注，物理上
+                        # 依赖导演层。
                     with gr.Accordion("🔌 LLM API 配置（OpenAI 兼容）",
                                       open=False) as api_acc:
                         _api_cfg = DR.load_api_config()
@@ -1043,6 +1062,7 @@ def render(ctx: AppContext):
          dir_bon_n, dir_bon_keep, dir_breath_on, dir_pausecap,
          dir_stress_on, dir_stressgain, dir_f0on, dir_f0exp) = vals
         raw = _collect(*core)
+        emo_label_raw = raw["emo_control_method"]     # 下拉标签原值
         raw["emo_control_method"] = W.emo_mode_index(raw["emo_control_method"])
         # 记下本次参数快照，供「预设管理」页的「保存当前参数」使用
         ctx.shared["last_gen_values"] = dict(raw)
@@ -1117,6 +1137,44 @@ def render(ctx: AppContext):
                         pause_scale=float(dir_scale or 1.0))
                 else:
                     res = INF.generate(eng, req, progress=_lp)
+                    # F0 音域恢复（2026-10-04 独立化）：单次合成同样生效。
+                    # 指纹来自挂载的 GPT run（run.json 随训练交付）；输出
+                    # 原地改写，后续 polish/历史/展示自动拿到恢复后的音频。
+                    # 30s 上限 = WORLD harvest 的内存安全界（f0_stats 同款）。
+                    if dir_f0on and lora_run:
+                        try:
+                            from webui_app.training import runs as _RN
+                            _fp = (_RN.read_run(lora_run) or {}
+                                   ).get("f0_fingerprint") or {}
+                            _p = res["path"]
+                            _y, _srr = AL.load_audio(_p)
+                            if not _fp:
+                                _log_sink.append(
+                                    "· F0 恢复跳过：该 run 无 F0 指纹")
+                            elif len(_y) / _srr > 30.0:
+                                _log_sink.append(
+                                    f"· F0 恢复跳过：输出 "
+                                    f"{len(_y) / _srr:.0f}s > 30s（内存安全"
+                                    "上限；长文本请用导演模式）")
+                            else:
+                                _rr = AL.restore_f0_range(
+                                    _y, _srr, _fp, intensity=0.5,
+                                    max_expand=float(dir_f0exp or 1.3))
+                                if _rr.get("ok"):
+                                    import soundfile as _sfw
+                                    _sfw.write(_p, _rr["y"], _srr,
+                                               subtype="PCM_16")
+                                    _log_sink.append(
+                                        f"✅ F0 音域恢复已应用（k="
+                                        f"{_rr.get('k')}）")
+                                else:
+                                    _log_sink.append(
+                                        f"· F0 恢复未应用："
+                                        f"{_rr.get('error', '')[:60]}")
+                        except Exception as _e:
+                            _log_sink.append(
+                                f"· F0 恢复失败（不影响输出）："
+                                f"{type(_e).__name__}: {_e}")
             finally:
                 _lp.stop()
 
@@ -1250,13 +1308,15 @@ def render(ctx: AppContext):
         try:
             _hv = dict(ctx.shared.get("syn_live_values") or {})
             for k in _CORE_KEYS:
-                if k in ("spk_audio_prompt", "text", "emo_audio_prompt"):
-                    continue          # 音频走独立字段；文本走顶层
-                _hv[k if k != "emo_control_method" else "emo_mode_label"] = \
-                    raw.get(k)
+                if k in ("spk_audio_prompt", "text", "emo_audio_prompt",
+                         "emo_control_method"):
+                    continue          # 音频走独立字段；文本走顶层；emo下面修
+                _hv[k] = raw.get(k)
             _hv.update({
-                "emo_mode_index": W.emo_mode_index(
-                    str(raw.get("emo_control_method") or "")),
+                # emo_control_method 此时已是整数——标签用捕获的原值，
+                # 存成整数会让恢复端下拉校验失败（静默不恢复）
+                "emo_mode_label": emo_label_raw,
+                "emo_mode_index": W.emo_mode_index(emo_label_raw),
                 "lora_run": str(lora_run or ""),
                 "lora_ckpt": str(lora_ckpt or "best"),
                 "lora_scale": float(lora_scale or 1.0),
