@@ -486,16 +486,20 @@ def render(ctx: AppContext):
                         "<b>自动卸载推理引擎 → 超分 → 自动重载</b>全程一条龙，"
                         "产出进下方「超分 48k 结果」窗，原始 22k 保留可对比。"
                         "首次运行经镜像下载权重约 1GB。"))
+                    # 2026-10-04：默认 True（用户诉求「默认勾选且生效」；
+                    # 首次无记忆时自动超分）。执行侧由 gen_btn.click 直读
+                    # 组件值，不再经 ctx.shared 中转（显示与执行同源）。
+                    _sr_auto_init = bool(ST.get("sr_auto", True))
+                    _sr_steps_init = int(ST.get("sr_steps", 35) or 35)
                     with gr.Row():
                         sr_btn = gr.Button("✨ 对当前结果超分", variant="primary",
                                            size="sm", scale=2)
                         sr_steps_sl = gr.Slider(
-                            10, 100, int(ST.get("sr_steps", 35)), step=5,
+                            10, 100, _sr_steps_init, step=5,
                             label="扩散步数", scale=1,
                             info="35 足够；越大越慢")
                     sr_auto_cb = gr.Checkbox(
-                        bool(ST.get("sr_auto", False)),
-                        label="生成后自动超分（推荐）",
+                        _sr_auto_init, label="生成后自动超分（推荐）",
                         info="勾选后每次「生成」结束自动完成整条链：卸载推理"
                              "引擎 → AudioSR 超分 48k → 卸载 AudioSR → 自动"
                              "重载推理引擎。全程无需手动操作。")
@@ -1060,7 +1064,8 @@ def render(ctx: AppContext):
          pol_on, pol_presence, pol_exciter,
          dir_on, dir_backend, dir_character, dir_route, dir_scale,
          dir_bon_n, dir_bon_keep, dir_breath_on, dir_pausecap,
-         dir_stress_on, dir_stressgain, dir_f0on, dir_f0exp) = vals
+         dir_stress_on, dir_stressgain, dir_f0on, dir_f0exp,
+         sr_auto_now, sr_steps_now) = vals
         raw = _collect(*core)
         emo_label_raw = raw["emo_control_method"]     # 下拉标签原值
         raw["emo_control_method"] = W.emo_mode_index(raw["emo_control_method"])
@@ -1340,8 +1345,8 @@ def render(ctx: AppContext):
                 "director_f0_restore": bool(dir_f0on),
                 "director_f0_expand": float(dir_f0exp or 1.3),
                 "director_pause_cap_ms": int(dir_pausecap or 0),
-                "sr_auto": bool(ctx.shared.get("sr_auto")),
-                "sr_steps": int(ctx.shared.get("sr_steps") or 35),
+                "sr_auto": bool(sr_auto_now),
+                "sr_steps": int(sr_steps_now or 35),
             })
             SS.append_history(
                 req.text or "", _hv,
@@ -1357,10 +1362,10 @@ def render(ctx: AppContext):
         # 一条龙：卸引擎 → AudioSR 48k → 卸 AudioSR → 重载引擎。产出进
         # 第二个输出窗，原始 22k 结果原样保留在第一个窗（对比听）。
         sr_src = str(out_audio_value or "")
-        if ctx.shared.get("sr_auto") and sr_src and os.path.isfile(sr_src):
+        if sr_auto_now and sr_src and os.path.isfile(sr_src):
             try:
                 _sr_path, _sr_rep = _do_superres(
-                    sr_src, steps=int(ctx.shared.get("sr_steps") or 35))
+                    sr_src, steps=int(sr_steps_now or 35))
                 if _sr_path:
                     sr_out_val = _sr_path
                 info += _sr_rep
@@ -1384,21 +1389,21 @@ def render(ctx: AppContext):
                           outputs=[synth_log_out])
 
     gen_btn.click(
-        on_generate, inputs=all_inputs,
+        # 尾部追加 sr_auto/sr_steps：执行时直读组件当前值（Gradio 在触发
+        # 时取最新状态，无论来自用户拨动还是程序更新）——此前走
+        # ctx.shared 中转，只在 change 事件写入，页面加载后未拨动过开关
+        # 就读不到（显示点亮但不超分，关开一次才生效）。
+        on_generate, inputs=all_inputs + [sr_auto_cb, sr_steps_sl],
         outputs=[out_audio, out_info, sb, lora_state_html, polish_md,
                  out_audio_sr],
     )
 
     # ---------- ✨ AudioSR 超分（对当前结果 / 生成后自动） ----------
 
-    # 勾选与步数不进 all_inputs（位置接线守卫的 22/54 不动）：
-    # change 事件写入 shared，on_generate 与 on_superres 都从这里读。
-    sr_auto_cb.change(
-        lambda v: ctx.shared.__setitem__("sr_auto", bool(v)),
-        inputs=[sr_auto_cb], outputs=None)
-    sr_steps_sl.change(
-        lambda v: ctx.shared.__setitem__("sr_steps", int(v or 35)),
-        inputs=[sr_steps_sl], outputs=None)
+    # 勾选与步数在 gen_btn.click 的 inputs 尾部直传（不进 all_inputs：
+    # 位置接线守卫的 22/54 不动）；手动超分也直读组件。两处都不经
+    # ctx.shared —— 中转层只在 change 时写入，程序性更新（历史应用/
+    # 清除记忆）不触发 change，双真相源必然失同步（2026-10-04 bug）。
 
     @LOG.ui_guard("synthesize.on_superres", slow_sec=5.0)
     def on_superres(path, steps):
@@ -2441,7 +2446,7 @@ def render(ctx: AppContext):
             gr.update(value=float(P.get("director_f0_expand").default)),   # F0 扩张
             gr.update(value=bool(P.get("emo_unlock_vector_cap").default)),  # 解锁上限
             gr.update(value=bool(P.get("emo_extrapolate").default)),     # 外推
-            gr.update(value=False),                                      # 自动超分
+            gr.update(value=True),                                       # 自动超分（默认开）
             gr.update(value=35),                                         # 超分步数
         ]
         assert len(ups) == len(reset_targets)
