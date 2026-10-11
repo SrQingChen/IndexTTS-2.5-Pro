@@ -1402,16 +1402,34 @@ def match_band_profile(y: np.ndarray, sr: int, target: Dict[str, Any],
     gain_db[freqs > 11500] = gain_db[-1]      # Nyquist 之上持平
     g = 10.0 ** (gain_db / 20.0)
     # STFT 增益 + ISTFT（overlap-add, hop=n_fft//4）
+    # **浊音门控**（2026-10-11 气声染色修复）：带增益只作用于**浊音帧**——
+    # 气声/静音帧是噪声主导的宽谱，套上每频段增益等于给呼吸"染色"
+    # （实测：对齐后气声 2-4k 能量占比 36%→81%，尖锐共鸣气音——用户
+    # 核心投诉）。门控曲线：语音带能量在 [0.35, 1.0]×p60 间线性过渡，
+    # 帧间 5 帧平滑防边沿伪影。
     hop = n_fft // 4
     win = np.hanning(n_fft).astype(np.float32)
     if len(y) < n_fft:
         return y
+    segs: List[np.ndarray] = []
+    idxs: List[int] = []
+    for i in range(0, len(y) - n_fft + 1, hop):
+        segs.append(np.fft.rfft(y[i:i + n_fft] * win))
+        idxs.append(i)
+    S = np.stack(segs, axis=1)
+    mag = np.abs(S)
+    vb = (freqs > 300) & (freqs < 3000)
+    e_vb = np.mean(mag[vb] ** 2, axis=0)
+    p60 = float(np.percentile(e_vb, 60)) + 1e-12
+    gate = np.clip((e_vb / p60 - 0.35) / (1.0 - 0.35), 0.0, 1.0)
+    gate = np.minimum(gate * 1.5, 1.0)
+    k_sm = 5
+    gate = np.convolve(gate, np.ones(k_sm) / k_sm, mode="same")
+    g_frame = 1.0 + (g[:len(freqs), None] - 1.0) * gate[None, :]
     out = np.zeros(len(y) + n_fft, dtype=np.float32)
     wsum = np.zeros(len(y) + n_fft, dtype=np.float32)
-    for i in range(0, len(y) - n_fft + 1, hop):
-        seg = y[i:i + n_fft] * win
-        spec = np.fft.rfft(seg)
-        seg2 = np.fft.irfft(spec * g[:len(spec)], n=n_fft)
+    for j, i in enumerate(idxs):
+        seg2 = np.fft.irfft(S[:, j] * g_frame[:, j], n=n_fft)
         out[i:i + n_fft] += seg2 * win
         wsum[i:i + n_fft] += win * win
     valid = wsum > 1e-6
@@ -2118,6 +2136,86 @@ def limit_voiced_hf(y: np.ndarray, sr: int,
                 len(clusters))
     return out.astype(np.float32), len(clusters)
 
+
+
+def soften_breath_hiss(y: np.ndarray, sr: int,
+                       lo_hz: float = 8000.0,
+                       hi_hz: float = 11000.0,
+                       trigger_ratio: float = 0.15,
+                       target_ratio: float = 0.06,
+                       max_cut_db: float = 9.0,
+                       min_frames: int = 4) -> Tuple[np.ndarray, int]:
+    """气声段高频嘶声软化（2026-10-11 尖锐气音根治件）。
+
+    实测频谱画像：真人参考的呼吸 8.5~11kHz 仅占其高频能量的 ~8%，
+    而合成输出达 ~38%（模型从游戏VO素材学到的嘶型呼吸）——8-11kHz
+    恰在人耳最敏感的「尖锐/哨音」听感区，是「尖锐气音」的主体。
+
+    动作：气声帧（语音带 <0.35×p60，与 de-esser 同判据）里 8~11kHz
+    嘶声超过语音参考 trigger_ratio 的帧，把该带压向 target_ratio
+    （限幅 max_cut_db）。**宽带均匀削减**（不做子带选择性——那是
+    造出共鸣染色的同类错误），呼吸变成「更软」而不是「被挖洞」。
+    浊音帧零接触。返回 (波形, 处理簇数)。
+    """
+    was_int = np.issubdtype(np.asarray(y).dtype, np.integer)
+    yf = (np.asarray(y, dtype=np.float32) / 32768.0 if was_int
+          else np.asarray(y, dtype=np.float32))
+    if len(yf) < sr // 2:
+        return y, 0
+    from scipy.signal import butter, sosfiltfilt
+    hi = min(sr / 2 * 0.98, hi_hz)
+    if lo_hz >= hi:
+        return y, 0
+    sos_h = butter(4, [lo_hz / (sr / 2), hi / (sr / 2)],
+                   btype="band", output="sos")
+    sos_v = butter(4, [300.0 / (sr / 2), 3000.0 / (sr / 2)],
+                   btype="band", output="sos")
+    hiss = sosfiltfilt(sos_h, yf)
+    vb = sosfiltfilt(sos_v, yf)
+    fr = int(sr * 0.01)
+    n = len(yf) // fr
+    if n < 20:
+        return y, 0
+    e_h = np.sqrt(np.mean(hiss[:n * fr].reshape(n, fr) ** 2, axis=1) + 1e-12)
+    e_v = np.sqrt(np.mean(vb[:n * fr].reshape(n, fr) ** 2, axis=1) + 1e-12)
+    ref = float(np.percentile(e_v, 60)) + 1e-9
+    breath = e_v < ref * 0.35
+    over = breath & (e_h > ref * trigger_ratio)
+    clusters, i = [], 0
+    while i < n:
+        if over[i]:
+            j = i
+            while j < n and over[j]:
+                j += 1
+            if j - i >= min_frames:
+                clusters.append((i, j))
+            i = j
+        else:
+            i += 1
+    if not clusters:
+        return y, 0
+    target = ref * target_ratio
+    floor = target * (10 ** (-float(max_cut_db) / 20.0))
+    gain = np.ones(n, dtype=np.float32)
+    for a, b in clusters:
+        eh = e_h[a:b] + 1e-9
+        want = np.clip(target / eh, floor / eh, 1.0)
+        gain[a:b] = np.minimum(gain[a:b], want)
+    atk = max(1, int(0.010 * sr) // fr)
+    rel = max(1, int(0.040 * sr) // fr)
+    sm = gain.copy()
+    for k in range(1, n):
+        if sm[k] < sm[k - 1]:
+            sm[k] = max(sm[k], sm[k - 1] - 1.0 / atk)
+        else:
+            sm[k] = min(sm[k], sm[k - 1] + 1.0 / rel)
+    # 帧索引 → 采样位置插值（fr=帧步长样本数；/sr 会差 100 倍——首版事故）
+    gain_s = np.interp(np.arange(len(yf)) / fr, np.arange(n), sm)
+    out = yf - hiss * (1.0 - gain_s)
+    if was_int:
+        return (np.clip(out * 32767.0, -32767, 32767).astype(np.int16),
+                len(clusters))
+    return out.astype(np.float32), len(clusters)
 
 
 def repair_truncated_tail(y: np.ndarray, sr: int,
