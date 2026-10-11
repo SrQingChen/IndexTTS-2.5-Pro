@@ -1184,12 +1184,14 @@ def render(ctx: AppContext):
                     try:
                         _yp, _srp = AL.load_audio(res["path"])
                         _zp, _nw = AL.suppress_wet_hf(_yp, _srp)
-                        if _nw:
+                        _zp, _nt = AL.limit_voiced_hf(_zp, _srp)
+                        if _nw or _nt:
                             import soundfile as _sfw2
                             _sfw2.write(res["path"], _zp, _srp,
                                         subtype="PCM_16")
                             _log_sink.append(
-                                f"✅ 间隙湿高频抑制：{_nw} 处")
+                                f"✅ 高频治理：间隙湿爆冲 {_nw} 处 · "
+                                f"浊音撕裂 {_nt} 处")
                     except Exception as _e:
                         _log_sink.append(
                             f"· 湿高频抑制失败（不影响输出）："

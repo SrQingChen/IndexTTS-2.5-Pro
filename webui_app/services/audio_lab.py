@@ -709,6 +709,19 @@ def enhance(
                 steps.append(f"句内静音封顶 {pause_cap_ms:.0f} ms"
                              f"（压缩 {n_capped} 处超长停顿）")
 
+        # 2.7) 高频过量治理（2026-10-11）：游戏VO分离人声普遍带强齿音/
+        # 气声高频（锁暝素材 2.6~10% 浊音帧 HF 超语音 12dB）。训练前压制，
+        # LoRA 才不会把撕裂感学进权重。两级：间隙湿爆冲 + 浊音撕裂限幅
+        #（+12dB 天花板=已验收基线；正常齿音 +8~12dB 不受影响）。
+        try:
+            y, n_wet = suppress_wet_hf(y, sr)
+            y, n_tear = limit_voiced_hf(y, sr)
+            if n_wet or n_tear:
+                steps.append(f"高频过量治理（间隙爆冲 {n_wet} 处 · "
+                             f"浊音撕裂 {n_tear} 处）")
+        except Exception:
+            pass
+
         # 3) 降噪（高频段保留原始信号，避免把齿音/气息细节一起压掉）
         if denoise and denoise_strength > 0:
             y2, did = _denoise(y, sr, denoise_strength, denoise_keep_high_hz)
@@ -2028,7 +2041,86 @@ def suppress_wet_hf(y: np.ndarray, sr: int,
     return out.astype(np.float32), len(clusters)
 
 
+
+def limit_voiced_hf(y: np.ndarray, sr: int,
+                    ceiling_db: float = 12.0,
+                    max_cut_db: float = 10.0,
+                    min_frames: int = 2) -> tuple:
+    """浊音区高频「撕裂」限幅器（2026-10-11 锁暝系统撕裂取证根治件）。
+
+    用户实锤：不是个别间隙爆冲，而是**每个稍高音高的浊音段**都有高频
+    撕裂感——实体=浊音帧内 5.5~11kHz 带能量超过语音带(0.3-3kHz) 12dB
+    以上的帧（真机测量：锁暝合成 2.6~10% 的浊音帧超限，被用户接受的
+    达妮娅基线仅 0.3~0.8%；真人参考本身也有 2.4%——角色演法+克隆放大
+    的叠加）。 ceiling 以已验收基线校准。
+
+    动作：超限帧把 HF 带压回天花板（限幅 max_cut_db，快压 10ms / 慢放
+    40ms，同 suppress_wet_hf 的 de-esser 包络）；正常齿音（+8~12dB 内）
+    与浊音谐波零接触。与 suppress_wet_hf（间隙爆冲）互补：一个管间隙、
+    一个管浊音，合起来覆盖「痰+撕裂」两类高频过量。
+    int16/float 均可，返回 (波形, 处理帧数)。
+    """
+    was_int = np.issubdtype(np.asarray(y).dtype, np.integer)
+    yf = (np.asarray(y, dtype=np.float32) / 32768.0 if was_int
+          else np.asarray(y, dtype=np.float32))
+    if len(yf) < sr // 2:
+        return y, 0
+    from scipy.signal import butter, sosfiltfilt
+    hi = min(sr / 2 * 0.98, 11000.0)
+    sos_hf = butter(4, [5500.0 / (sr / 2), hi / (sr / 2)],
+                    btype="band", output="sos")
+    sos_vb = butter(4, [300.0 / (sr / 2), 3000.0 / (sr / 2)],
+                    btype="band", output="sos")
+    hf = sosfiltfilt(sos_hf, yf)
+    vb = sosfiltfilt(sos_vb, yf)
+    fr = int(sr * 0.01)
+    n = len(yf) // fr
+    if n < 20:
+        return y, 0
+    e_hf = np.sqrt(np.mean(hf[:n * fr].reshape(n, fr) ** 2, axis=1) + 1e-12)
+    e_vb = np.sqrt(np.mean(vb[:n * fr].reshape(n, fr) ** 2, axis=1) + 1e-12)
+    voiced = e_vb > np.percentile(e_vb, 40)
+    ratio = e_hf / (e_vb + 1e-9)
+    ceiling = 10 ** (float(ceiling_db) / 20.0)
+    over = voiced & (ratio > ceiling)
+    # 簇化：≥min_frames 连续（防孤立帧毛刺）
+    clusters, i = [], 0
+    while i < n:
+        if over[i]:
+            j = i
+            while j < n and over[j]:
+                j += 1
+            if j - i >= min_frames:
+                clusters.append((i, j))
+            i = j
+        else:
+            i += 1
+    if not clusters:
+        return y, 0
+    max_cut = 10 ** (-float(max_cut_db) / 20.0)
+    gain = np.ones(n, dtype=np.float32)
+    for a, b in clusters:
+        want = np.clip(ceiling * e_vb[a:b] / (e_hf[a:b] + 1e-9),
+                       max_cut, 1.0)
+        gain[a:b] = np.minimum(gain[a:b], want)
+    atk = max(1, int(0.010 * sr) // fr)
+    rel = max(1, int(0.040 * sr) // fr)
+    sm = gain.copy()
+    for k in range(1, n):
+        if sm[k] < sm[k - 1]:
+            sm[k] = max(sm[k], sm[k - 1] - 1.0 / atk)
+        else:
+            sm[k] = min(sm[k], sm[k - 1] + 1.0 / rel)
+    gain_s = np.interp(np.arange(len(yf)) / fr, np.arange(n), sm)
+    out = yf - hf * (1.0 - gain_s)
+    if was_int:
+        return (np.clip(out * 32767.0, -32767, 32767).astype(np.int16),
+                len(clusters))
+    return out.astype(np.float32), len(clusters)
+
+
 def repair_truncated_tail(y: np.ndarray, sr: int,
+
 
                           thresh_db: float = -35.0,
                           min_tail_s: float = 0.03,

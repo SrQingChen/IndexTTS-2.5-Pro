@@ -82,13 +82,14 @@ class ArtifactItem:
     origin: str = ""           # 一键三连 / 手动 —— 从产物元数据推断
     note: str = ""             # 状态补充（如「训练进行中」「含 3 个 checkpoint」）
     protected: bool = False    # True = 只展示不可删（按钮置灰）
+    group: str = ""            # 训练组（角色名）：同一次一键三连产出的资源归同组
 
     def to_dict(self) -> Dict[str, Any]:
         return {
             "key": self.key, "kind": self.kind, "name": self.name,
             "path": self.path, "size": self.size, "n_files": self.n_files,
             "mtime": self.mtime, "origin": self.origin, "note": self.note,
-            "protected": self.protected,
+            "protected": self.protected, "group": self.group,
         }
 
 
@@ -133,6 +134,47 @@ class ScanResult:
 # 扫描
 # ---------------------------------------------------------------------------
 
+def assign_groups(items: List[ArtifactItem]) -> None:
+    """把产物归到「训练组」（2026-01-11 用户需求：打包显示便于快捷清理）。
+
+    组 = 角色名。成员关系：
+      · train_run:<char>_gpt / <char>_cfm → 该角色（训练对是一组的锚点）；
+      · dataset:<name> → 训练过它的角色（run.json 的 dataset 字段反查）；
+      · oneclick / eval / train_int / lora 产物名含角色名 → 该角色。
+    其余（合成 / bon / 缓存 / 音色库等）不属于训练组，留空。
+    """
+    chars: Dict[str, List[ArtifactItem]] = {}
+    for it in items:
+        if it.kind == "train_run":
+            base = (it.name.rsplit("_", 1)[0]
+                    if it.name.endswith(("_gpt", "_cfm")) else it.name)
+            chars.setdefault(base, []).append(it)
+    from webui_app.training import runs as RN
+    ds2char: Dict[str, set] = {}
+    try:
+        for ri in RN.list_runs():
+            base = (ri.name.rsplit("_", 1)[0]
+                    if ri.name.endswith(("_gpt", "_cfm")) else ri.name)
+            if ri.dataset:
+                ds2char.setdefault(ri.dataset, set()).add(base)
+    except Exception:
+        pass
+    for it in items:
+        g = ""
+        if it.kind == "train_run":
+            g = (it.name.rsplit("_", 1)[0]
+                 if it.name.endswith(("_gpt", "_cfm")) else it.name)
+        elif it.kind == "dataset":
+            cs = sorted(ds2char.get(it.name) or set())
+            g = "+".join(cs)
+        elif it.kind in ("oneclick", "eval", "train_int", "lora"):
+            for base in chars:
+                if base and base in it.name:
+                    g = base
+                    break
+        it.group = g
+
+
 def scan(cfg: AppConfig) -> ScanResult:
     """盘点全部产物目录。只读磁盘，不加载任何模型。"""
     res = ScanResult(scanned_at=time.time())
@@ -146,6 +188,10 @@ def scan(cfg: AppConfig) -> ScanResult:
             res.warnings.append(f"{fn.__name__.strip('_')}: {type(e).__name__}: {e}")
     order = {k: n for n, (k, *_r) in enumerate(CATEGORIES)}
     res.items.sort(key=lambda i: (order.get(i.kind, 99), -i.mtime))
+    try:
+        assign_groups(res.items)
+    except Exception as e:
+        res.warnings.append(f"groups: {type(e).__name__}: {e}")
     return res
 
 

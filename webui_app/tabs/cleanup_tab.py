@@ -64,6 +64,18 @@ def _summary_html(items: List[Dict[str, Any]]) -> str:
         + "".join(chips) + "</div>")
 
 
+def _groups_header(items: List[Dict[str, Any]],
+                   groups: Dict[str, List[Dict[str, Any]]]) -> str:
+    grouped = sum(len(v) for v in groups.values())
+    gsize = human_size(sum(i["size"] for v in groups.values() for i in v))
+    return (
+        '<div class="ix-section-title"><span class="ix-ico">👥</span>'
+        f'按训练组打包 · {len(groups)} 组 · <span class="ix-mono">{gsize}</span>'
+        f' · {grouped} 项</div>'
+        '<div class="ix-section-desc">一次一键三连/训练产生的 LoRA 对、数据集、'
+        '评选与评测产物打包成组 —— 整组清理最省心。</div>')
+
+
 def _kind_header(kind: str, items: List[Dict[str, Any]]) -> str:
     icon, label, desc = AR.CATEGORY_INFO[kind]
     size = human_size(sum(i["size"] for i in items))
@@ -165,6 +177,50 @@ def render(ctx: AppContext):
         if not items:
             gr.HTML(T.tip("没有扫描到任何产物。点上方「重新扫描」，或先去合成/训练一些东西。"))
             return
+
+        # ---- 按训练组打包（2026-01-11 用户需求）----
+        groups: Dict[str, List[Dict[str, Any]]] = {}
+        for it in items:
+            if it.get("group"):
+                groups.setdefault(it["group"], []).append(it)
+        if groups:
+            with gr.Column(elem_classes=["ix-section"]):
+                gr.HTML(_groups_header(items, groups))
+                for gname, members in sorted(
+                        groups.items(),
+                        key=lambda kv: -sum(i["size"] for i in kv[1])):
+                    gsize = human_size(sum(i["size"] for i in members))
+                    kinds = {}
+                    for i in members:
+                        lab = AR.CATEGORY_INFO.get(i["kind"], ("", i["kind"], ""))
+                        kinds[lab[1]] = kinds.get(lab[1], 0) + 1
+                    detail = " · ".join(f"{k}×{n}" for k, n in kinds.items())
+                    with gr.Row():
+                        gr.HTML(
+                            '<div style="display:flex;align-items:baseline;'
+                            'gap:10px;padding:7px 0">'
+                            f'<div style="font-weight:600">👥 {_esc(gname)}'
+                            f'<span class="ix-mono" style="opacity:.75;'
+                            f'font-weight:400"> · {gsize} · {len(members)} 项'
+                            f'（{_esc(detail)}）</span></div></div>')
+                        deletable = [i for i in members if not i.get("protected")]
+                        if deletable:
+                            gbtn = gr.Button(
+                                f"🗑 删除整组（{len(deletable)}）",
+                                size="sm", variant="stop", scale=0,
+                                min_width=150)
+
+                            def _grp(m=deletable):
+                                return _open_modal(m, "")
+
+                            gbtn.click(
+                                _grp, inputs=[],
+                                outputs=[pending_state, pending_kind_state,
+                                         modal_detail, modal])
+                gr.HTML(T.hint(
+                    "「训练组」= 同一角色一次一键三连/训练产出的全部资源"
+                    "（GPT+CFM 运行、数据集、评选试听、评测、中间文件、导出权重）"
+                    "——整组删除一次清干净；受保护项（训练中）自动跳过。"))
 
         by_kind: Dict[str, List[Dict[str, Any]]] = {}
         for it in items:

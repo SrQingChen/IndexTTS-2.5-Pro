@@ -813,11 +813,12 @@ def perform(
             # 「爆冲→参考→下一块再克隆」的反馈回路。
             try:
                 wav, _n_wet = AL.suppress_wet_hf(wav, SR)
-                if _n_wet:
+                wav, _n_tear = AL.limit_voiced_hf(wav, SR)
+                if _n_wet or _n_tear:
                     sf.write(cand_paths[chosen_k], wav, SR,
                              subtype="PCM_16")
             except Exception as _e:
-                _n_wet = 0
+                _n_wet = _n_tear = 0
                 log.warning("湿高频抑制失败（跳过）：%s", _e)
 
             # ---- 块内停顿「数量+时长」双治理（2026-10-02 散感彻底根治）----
@@ -859,6 +860,7 @@ def perform(
                               "cap_ms_effective": _cap_eff,
                               "punct_band": [_pf, _pc],
                               "wet_hf_clusters": _n_wet,
+                              "voiced_tear_clusters": _n_tear,
                               "audit": gov_audit}
             else:
                 _gov_entry = {"enabled": False,
