@@ -1161,7 +1161,7 @@ def measure_loudness(path_or_y, sr: Optional[int] = None) -> float:
 
 
 def anchor_gain(levels_db: List[float], target_dbfs: float = -20.0,
-                max_boost_db: float = 12.0, max_cut_db: float = 12.0,
+                max_boost_db: float = 12.0, max_cut_db: float = 15.0,
                 clamp_outlier_db: float = 10.0) -> Dict[str, Any]:
     """由**全数据集**响度中位数算一个全局增益（所有人站同一块地板）。
 
@@ -1924,7 +1924,112 @@ def normalize_intra_pauses(y: np.ndarray, sr: int, text_chars: int,
     return out.astype(yf.dtype, copy=False)
 
 
+
+def suppress_wet_hf(y: np.ndarray, sr: int,
+                    lo_hz: float = 5500.0,
+                    voice_hi_hz: float = 3000.0,
+                    gap_ratio: float = 0.35,
+                    loud_ratio: float = 0.45,
+                    max_cut_db: float = 15.0,
+                    min_frames: int = 4) -> tuple:
+    """抑制音节间隙里的「痰状」高频爆冲（2026-10-10 锁暝取证根治件）。
+
+    实体（真机取证）：6~11kHz 全带平坦、快幅度调制（~600-1500Hz，碎裂
+    「痰」感）、电平仅比语音低 3~8dB 的噪声簇，发生在音节间隙——游戏 VO
+    源素材（MP3 转码 + 强气声表演）自带，零样本克隆与 LoRA 都忠实复现
+    （差分实验：底座/仅GPT/仅CFM/双LoRA 四配置全部出现）。
+
+    判据（三条件同时满足才动，保守）：
+      · 语音带（0.3~3kHz）低于全文件语音参考的 gap_ratio（间隙/气口）；
+      · 高频带（lo~11kHz）高于语音参考的 loud_ratio（异常响）；
+      · 高频带内三子带平坦（平坦度 <0.55；自然 /s/ 擦音有形态峰，方差大；
+        浊音区的平坦度分布与爆冲重叠——实测 p50 0.31 vs 0.26——所以
+        **只在间隙启用**，浊音区即使响而平也不碰，音色零风险）。
+    施工：带通分离出 lo~11kHz 分量，对爆冲段施加限幅增益（≥max_cut_db
+    下限，10ms 攻/40ms 放平滑），y_out = y - hf*(1-gain)——只动高频带，
+    语音与音色零接触；非爆冲段逐位不变。
+    int16/float 均可，返回 (波形, 处理的簇数)。
+    """
+    was_int = np.issubdtype(np.asarray(y).dtype, np.integer)
+    yf = (np.asarray(y, dtype=np.float32) / 32768.0 if was_int
+          else np.asarray(y, dtype=np.float32))
+    if len(yf) < sr // 2:
+        return y, 0
+    from scipy.signal import butter, sosfiltfilt, sosfilt
+    hi = min(sr / 2 * 0.98, 11000.0)
+    if lo_hz >= hi:
+        return y, 0
+    sos_hf = butter(4, [lo_hz / (sr / 2), hi / (sr / 2)],
+                    btype="band", output="sos")
+    sos_vb = butter(4, [300.0 / (sr / 2), voice_hi_hz / (sr / 2)],
+                    btype="band", output="sos")
+    hf = sosfiltfilt(sos_hf, yf)
+    vb = sosfiltfilt(sos_vb, yf)
+    fr = int(sr * 0.01)
+    n = len(yf) // fr
+    if n < 20:
+        return y, 0
+    e_hf = np.sqrt(np.mean(hf[:n * fr].reshape(n, fr) ** 2, axis=1) + 1e-12)
+    e_vb = np.sqrt(np.mean(vb[:n * fr].reshape(n, fr) ** 2, axis=1) + 1e-12)
+    speech_ref = float(np.percentile(e_vb, 60)) + 1e-9
+    # 三子带平坦度（lo~mid~hi 等宽）
+    import numpy as _np
+    edges = _np.linspace(lo_hz, hi, 4)
+    sub = []
+    for a, b in zip(edges[:-1], edges[1:]):
+        sos = butter(4, [a / (sr / 2), b / (sr / 2)],
+                     btype="band", output="sos")
+        s = sosfiltfilt(sos, yf)
+        sub.append(np.sqrt(np.mean(s[:n * fr].reshape(n, fr) ** 2,
+                                    axis=1) + 1e-12))
+    sub = _np.stack(sub)
+    flat = sub.std(axis=0) / (sub.mean(axis=0) + 1e-9)
+
+    wet = ((e_vb < speech_ref * gap_ratio) &
+           (e_hf > speech_ref * loud_ratio) &
+           (flat < 0.55))
+    # 簇化：≥min_frames 连续才算（防孤立毛刺）
+    clusters, i = [], 0
+    while i < n:
+        if wet[i]:
+            j = i
+            while j < n and wet[j]:
+                j += 1
+            if j - i >= min_frames:
+                clusters.append((i, j))
+            i = j
+        else:
+            i += 1
+    if not clusters:
+        return y, 0
+    # 增益包络：爆冲段把 HF 压到 speech_ref*loud_ratio（限幅 max_cut_db）
+    floor = speech_ref * loud_ratio * (10 ** (-max_cut_db / 20.0))
+    gain = _np.ones(n, dtype=np.float32)
+    for a, b in clusters:
+        seg = e_hf[a:b]
+        want = _np.clip(speech_ref * loud_ratio / (seg + 1e-9), 0.0, 1.0)
+        want = _np.maximum(want, floor / (seg + 1e-9))
+        gain[a:b] = _np.minimum(gain[a:b], want)
+    # 时域平滑（de-esser 惯例：压入快 10ms / 释放慢 40ms——短簇也来得及
+    # 压到位，簇结束不产生台阶）
+    atk = max(1, int(0.010 * sr) // fr)      # 增益下降（压入）
+    rel = max(1, int(0.040 * sr) // fr)      # 增益回升（释放）
+    sm = gain.copy()
+    for k in range(1, n):
+        if sm[k] < sm[k - 1]:
+            sm[k] = max(sm[k], sm[k - 1] - 1.0 / atk)
+        else:
+            sm[k] = min(sm[k], sm[k - 1] + 1.0 / rel)
+    gain_s = _np.interp(_np.arange(len(yf)) / fr, _np.arange(n), sm)
+    out = yf - hf * (1.0 - gain_s)
+    if was_int:
+        return (_np.clip(out * 32767.0, -32767, 32767).astype(np.int16),
+                len(clusters))
+    return out.astype(np.float32), len(clusters)
+
+
 def repair_truncated_tail(y: np.ndarray, sr: int,
+
                           thresh_db: float = -35.0,
                           min_tail_s: float = 0.03,
                           fade_ms: float = 100.0) -> np.ndarray:

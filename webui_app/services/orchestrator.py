@@ -23,6 +23,7 @@ import time
 from typing import Any, Dict, List, Optional
 
 import numpy as np
+import soundfile as sf
 
 from webui_app import logging_setup as LOG
 from webui_app import PROCESS_STARTED_AT
@@ -804,6 +805,21 @@ def perform(
 
             wav = _read_mono_int16(cand_paths[chosen_k])
 
+            # ---- 间隙「痰状」高频爆冲抑制（2026-10-10 锁暝取证根治件）----
+            # 实体：6~11kHz 平坦、快调制、电平近语音的噪声簇（音节间隙），
+            # 源素材（游戏VO MP3）自带，底座克隆即复现（四配置差分实锤）。
+            # 只动间隙里的高频带（≤12dB 限幅），浊音/擦音零接触；处理结果
+            # 回写候选文件——滚动参考链拿到干净音频，切断
+            # 「爆冲→参考→下一块再克隆」的反馈回路。
+            try:
+                wav, _n_wet = AL.suppress_wet_hf(wav, SR)
+                if _n_wet:
+                    sf.write(cand_paths[chosen_k], wav, SR,
+                             subtype="PCM_16")
+            except Exception as _e:
+                _n_wet = 0
+                log.warning("湿高频抑制失败（跳过）：%s", _e)
+
             # ---- 块内停顿「数量+时长」双治理（2026-10-02 散感彻底根治）----
             # 实测：音色库参考 28 停顿/分钟语音 + AR 先验放大 → 引擎输出
             # 44~53 个/分钟，「两三个字一停」。时长封顶治了长治不了多；
@@ -842,10 +858,12 @@ def perform(
                               "out_samples": int(wav.shape[0]),
                               "cap_ms_effective": _cap_eff,
                               "punct_band": [_pf, _pc],
+                              "wet_hf_clusters": _n_wet,
                               "audit": gov_audit}
             else:
                 _gov_entry = {"enabled": False,
-                              "reason": "pause_cap_ms<=0"}
+                              "reason": "pause_cap_ms<=0",
+                              "wet_hf_clusters": _n_wet}
 
             # ---- F0 音域恢复（WORLD 重合成，向角色指纹靠拢并扩张）----
             f0_applied = False

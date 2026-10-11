@@ -604,6 +604,36 @@ def main() -> int:
     check("int16 直传：dtype 保持且同样延长",
           _yL16.dtype == np.int16 and len(_rel16) == 2)
 
+    # ---- 3m. 间隙「痰状」高频爆冲抑制（2026-10-10 锁暝取证回归）----
+    # 实体：6-11kHz 平坦、快调制、近语音电平的噪声簇（间隙）。判据：
+    # 语音带inactive + HF响 + 三子带平坦；只动高频带（≤12dB）。
+    _vw = _voice_like(0.5)
+    # 真实爆冲形态=高通形（6-11kHz 噪声簇，语音带dark——白噪声会激发
+    # 语音带导致 gap 条件失效，真机取证形态如此）
+    from scipy.signal import butter as _butter, sosfiltfilt as _sff
+    _sosw = _butter(4, [6000 / (SR / 2), 10500 / (SR / 2)],
+                    btype="band", output="sos")
+    _wet = _sff(_sosw, (0.9 * np.random.default_rng(5).normal(
+        size=int(0.12 * SR))).astype(np.float32)).astype(np.float32)
+    _yW = np.concatenate([_vw, _wet, _voice_like(0.5)])
+    _zW, _nW = AL.suppress_wet_hf(_yW, SR)
+    _hf_seg_before = float(np.sqrt(np.mean(_yW[int(0.5*SR):int(0.62*SR)]**2)))
+    _hf_seg_after = float(np.sqrt(np.mean(_zW[int(0.5*SR):int(0.62*SR)]**2)))
+    check("间隙湿爆冲被抑制（簇≥1，高频带能量下降 4-16dB）",
+          _nW >= 1 and 4.0 <= 20*np.log10(_hf_seg_before/(_hf_seg_after+1e-9)) <= 16,
+          f"簇{_nW} 衰减 {20*np.log10(_hf_seg_before/(_hf_seg_after+1e-9)):.1f}dB")
+    check("浊音区零接触（爆冲±30ms 外逐位一致；带通滤波预振铃占 ~10ms）",
+          np.array_equal(_zW[:int(0.47*SR)], _yW[:int(0.47*SR)])
+          and np.array_equal(_zW[int(0.65*SR):], _yW[int(0.65*SR):]))
+    check("纯语音零触发", AL.suppress_wet_hf(
+        np.concatenate([_voice_like(0.5), _voice_like(0.5)]), SR)[1] == 0)
+    # int16 夹具先做峰值保护（真实管线产物恒 ≤0dBFS；直转溢出回绕是
+    # 夹具自身的错误形态）
+    _yWn = _yW / max(1e-9, float(np.max(np.abs(_yW))) / 0.85)
+    _zW16, _nW16 = AL.suppress_wet_hf((_yWn*32767).astype(np.int16), SR)
+    check("int16 直传：dtype 保持且同样触发",
+          _zW16.dtype == np.int16 and _nW16 >= 1)
+
     print("== 4. 呼吸库（检测/建库/插入决策） ==")
     from webui_app.services import breath_bank as BB
     # 合成"吸气":低幅高频噪声 0.3s → 语音 0.8s

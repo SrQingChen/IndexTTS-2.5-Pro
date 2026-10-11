@@ -1180,6 +1180,20 @@ def render(ctx: AppContext):
                             _log_sink.append(
                                 f"· F0 恢复失败（不影响输出）："
                                 f"{type(_e).__name__}: {_e}")
+                    # 间隙「痰状」高频爆冲抑制（2026-10-10，与编排器同一把刀）
+                    try:
+                        _yp, _srp = AL.load_audio(res["path"])
+                        _zp, _nw = AL.suppress_wet_hf(_yp, _srp)
+                        if _nw:
+                            import soundfile as _sfw2
+                            _sfw2.write(res["path"], _zp, _srp,
+                                        subtype="PCM_16")
+                            _log_sink.append(
+                                f"✅ 间隙湿高频抑制：{_nw} 处")
+                    except Exception as _e:
+                        _log_sink.append(
+                            f"· 湿高频抑制失败（不影响输出）："
+                            f"{type(_e).__name__}: {_e}")
             finally:
                 _lp.stop()
 
