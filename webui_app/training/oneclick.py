@@ -1051,29 +1051,6 @@ def stage_optimize(dataset: str, opt: OneClickOptions,
             LOG.get_logger("oneclick.optimize").warning(
                 "F0 指纹计算失败（跳过）：%s", _e2)
 
-        # ---- S2.7 语调指纹（2026-10-11 用户提案：把演员的问句上翘/
-        # 陈述下落实测成画像，推理端按 LoRA 绑定自动套用）----
-        # 问句样本通常稀疏（锁暝 3/55），画像带 N 计数，推理端 N<3 的
-        # 项自动回退通用默认——稀疏不可怕，瞎用才可怕。
-        try:
-            _imetrics: List[Dict[str, Any]] = []
-            _imax = 40
-            for _i, (_u, _w) in enumerate(_pool):
-                if _i >= _imax or (should_stop and should_stop()):
-                    break
-                _txt = (getattr(_u, "text", "") or
-                        getattr(_u, "asr_text", "") or "")
-                if not _txt.strip():
-                    continue
-                _wy, _wsr = AL.load_audio(_w)
-                _imetrics.extend(AL.analyze_intonation_clip(_wy, _wsr, _txt))
-            if _imetrics:
-                _ip = AL.aggregate_intonation_profile(_imetrics)
-                DS.write_marker(dataset, "intonation", _ip)
-                out["intonation"] = _ip
-        except Exception as _e2:
-            LOG.get_logger("oneclick.optimize").warning(
-                "语调指纹计算失败（跳过）：%s", _e2)
     except Exception as _e:
         LOG.get_logger("oneclick.optimize").warning(
             "响度锚定失败（跳过，不影响训练）：%s: %s",
@@ -1698,9 +1675,6 @@ def stage_train(dataset: str, engine, tuning: Dict[str, Any],
                 _kw2["spectral_profile"] = _sp2
             if _f0fp:
                 _kw2["f0_fingerprint"] = _f0fp
-            _ip = DS.read_marker(dataset, "intonation")
-            if _ip:
-                _kw2["intonation_profile"] = _ip
             if _kw2:
                 RN.update_run(row["run"], **_kw2)
     except Exception as _e:

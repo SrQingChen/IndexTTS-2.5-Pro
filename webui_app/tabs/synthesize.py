@@ -1072,13 +1072,6 @@ def render(ctx: AppContext):
         # 记下本次参数快照，供「预设管理」页的「保存当前参数」使用
         ctx.shared["last_gen_values"] = dict(raw)
         req = INF.GenRequest.from_ui(raw, cfg)
-        # 语调手动标记（层②）：文本内 [+2.5st]/[升]/[降] 解析后剥离——
-        # 标记绝不能进合成文本（会被读出）。edits 留到合成后施工。
-        _mk_edits: list = []
-        try:
-            req.text, _mk_edits = AL.parse_intonation_markup(req.text or "")
-        except Exception:
-            _mk_edits = []
         # 自动超分的产出走第 6 个输出（out_audio_sr）；提前 return 的分支
         # 也要带上它（gr.update() = 不动第二个输出窗）。
         sr_out_val = gr.update()
@@ -1187,62 +1180,6 @@ def render(ctx: AppContext):
                             _log_sink.append(
                                 f"· F0 恢复失败（不影响输出）："
                                 f"{type(_e).__name__}: {_e}")
-                    # 语调三层（2026-10-11）：手动标记 ramps + 自动规则
-                    #（指纹来自挂载的 LoRA run，N≥3 才用其幅度）
-                    try:
-                        _ifp = {}
-                        if lora_run:
-                            from webui_app.training import runs as _RN2
-                            _ifp = dict((_RN2.read_run(lora_run) or {})
-                                        .get("intonation_profile") or {})
-                        _dur2 = AL.audio_duration(res["path"]) or 0
-                        _yp2, _srp2 = AL.load_audio(res["path"])
-                        _sil2 = []
-                        _fr3 = int(_srp2 * 0.025)
-                        _nn3 = len(_yp2) // _fr3
-                        if _nn3 >= 2:
-                            _e3 = np.sqrt(np.mean(
-                                (_yp2[:_nn3 * _fr3]).reshape(_nn3, _fr3) ** 2,
-                                axis=1) + 1e-12)
-                            _q3 = (20 * np.log10(_e3 + 1e-12)) < -35
-                            _j3 = 0
-                            while _j3 < _nn3:
-                                if _q3[_j3]:
-                                    _k3 = _j3
-                                    while _k3 < _nn3 and _q3[_k3]:
-                                        _k3 += 1
-                                    if (_k3 - _j3) * 0.025 >= 0.15:
-                                        _sil2.append((_j3 * 0.025,
-                                                      (_k3 - _j3) * 0.025))
-                                    _j3 = _k3
-                                else:
-                                    _j3 += 1
-                        _ramps2: list = []
-                        if _mk_edits:
-                            _sp3 = AL.char_time_spans(
-                                req.text, _dur2, _sil2)
-                            _ramps2.extend(AL.markup_edits_to_ramps(
-                                _mk_edits, _sp3, _dur2))
-                        _ar, _ad = AL.build_intonation_ramps(
-                            req.text, _srp2, _dur2, _sil2, profile=_ifp)
-                        _ramps2.extend(_ar)
-                        if _ramps2:
-                            _zp3, _ni3 = AL.edit_f0_contour(_yp2, _srp2,
-                                                            _ramps2)
-                            if _ni3 == -1:
-                                _log_sink.append("· 语调塑形跳过：>30s "
-                                                 "（长文本请用导演模式）")
-                            elif _ni3 > 0:
-                                import soundfile as _sfw3
-                                _sfw3.write(res["path"], _zp3, _srp2,
-                                            subtype="PCM_16")
-                                _log_sink.append(
-                                    f"✅ 语调塑形 {_ni3} 段"
-                                    + (f"（{_ad}）" if _ad else
-                                       "（手动标记）"))
-                    except Exception as _e:
-                        _log_sink.append(f"· 语调塑形失败（不影响输出）："
-                                         f"{type(_e).__name__}: {_e}")
                     # 间隙「痰状」高频爆冲抑制（2026-10-10，与编排器同一把刀）
                     try:
                         _yp, _srp = AL.load_audio(res["path"])
