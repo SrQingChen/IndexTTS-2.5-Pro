@@ -641,8 +641,8 @@ def main() -> int:
     _qt = "你最近好吗？"
     _sp_q = AL.char_time_spans(_qt, len(_qy2) / SR, [])
     _rq, _dq = AL.build_intonation_ramps(_qt, SR, len(_qy2) / SR, [])
-    check("问句自动上翘：ramp 末2字 0→+2.5st",
-          len(_rq) == 1 and abs(_rq[0][3] - 2.5) < 1e-6
+    check("问句自动上翘：ramp 末2字 0→+1.8st（撕裂线校准）",
+          len(_rq) == 1 and abs(_rq[0][3] - 1.8) < 1e-6
           and _rq[0][1] >= _sp_q[3][0], f"{_rq} | {_dq}")
     _zq, _nq = AL.edit_f0_contour(_qy2.copy(), SR, _rq)
     check("轮廓编辑器：F0 实际抬升（末段中位 ≥+1.5st）",
@@ -660,18 +660,23 @@ def main() -> int:
     check("标记钳 ±3st（防痰音边界）", _big == [(1, 3.0)])
     _rqe, _ = AL.build_intonation_ramps(
         "你最近好吗？", SR, len(_qy2) / SR, [],
-        profile={"question_rise": {"n": 3, "median_st": 3.0}})
-    check("语调指纹绑定：N≥3 时幅度取角色实测值",
-          abs(_rqe[0][3] - 3.0) < 1e-6, f"{_rqe}")
+        profile={"question_rise": {"n": 3, "median_st": 1.6}})
+    check("语调指纹绑定：N≥3 且明显上翘(>1st)时取角色实测值",
+          abs(_rqe[0][3] - 1.6) < 1e-6, f"{_rqe}")
     _rqn, _ = AL.build_intonation_ramps(
         "你最近好吗？", SR, len(_qy2) / SR, [],
         profile={"question_rise": {"n": 1}})
-    check("指纹 N<3 回退通用默认", abs(_rqn[0][3] - 2.5) < 1e-6)
+    check("指纹 N<3 回退通用默认", abs(_rqn[0][3] - 1.8) < 1e-6)
     _rqf, _ = AL.build_intonation_ramps(
         "你最近好吗？", SR, len(_qy2) / SR, [],
         profile={"question_rise": {"n": 10, "median_st": -0.76}})
     check("指纹方向保护：演员不上翘（-0.76st）也不翻转问句方向",
-          abs(_rqf[0][3] - 2.5) < 1e-6, f"{_rqf}")
+          abs(_rqf[0][3] - 1.8) < 1e-6, f"{_rqf}")
+    _rqb, _ = AL.build_intonation_ramps(
+        "你最近好吗？", SR, len(_qy2) / SR, [],
+        profile={"question_rise": {"n": 10, "median_st": 3.0}})
+    check("撕裂线约束：演员实测 +3st 也钳到 2.2", abs(_rqb[0][3] - 2.2) < 1e-6,
+          f"{_rqb}")
 
     print("== 4. 呼吸库（检测/建库/插入决策） ==")
     from webui_app.services import breath_bank as BB

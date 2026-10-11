@@ -2142,9 +2142,16 @@ def edit_f0_contour(y: np.ndarray, sr: int,
     偏移曲线。施工：harvest 提取 F0 → 浊音帧乘 2^(offset/12) →
     cheaptrick/d4c 用**原始谱包络**重合成（音色不变，只动音高）。
 
-    安全边界：逐帧偏移钳 ±max_st（默认 ±3 半音，防痰音）；长于 30s 的
-    输入直接跳过（WORLD 内存安全界，与 restore_f0_range 同款）；
-    浊音帧不足的静音/气声段由 harvest 自己判 f0=0，天然跳过。
+    安全边界（2026-10-11 两起事故后定稿）：
+      · 逐帧偏移钳 ±max_st（默认 ±3 半音，防痰音）；
+      · **区域限定**：ramp 区间（±50ms 余量）之外的采样**逐位保真**——
+        整块 WORLD 重合成会把全句擦音/气声/瞬态重渲染（真机实测整句
+        「高音破碎」，WORLD 的 cheaptrick/d4c 无法复原未建模的高频细节）；
+      · **浊音强度门控**：harvest 会在气声/底噪里误检出 F0（真机实测：
+        ramp 覆盖到句末静音时，间隙被乘上上翘=长出音高化爆冲，6-11kHz
+        与邻区差 64dB）——只有 d4c 低周期性的强浊音帧才采用重合成，
+        其余帧用原样本，软掩码 10ms 压入 / 40ms 释放消接缝；
+      · 长于 30s 的输入直接跳过（WORLD 内存安全界）。
     int16/float 均可，返回 (波形, 应用的段数)。
     """
     was_int = np.issubdtype(np.asarray(y).dtype, np.integer)
@@ -2189,10 +2196,28 @@ def edit_f0_contour(y: np.ndarray, sr: int,
     y2 = y2[:len(yf)]
     if len(y2) < len(yf):
         y2 = np.concatenate([y2, np.zeros(len(yf) - len(y2), np.float32)])
+
+    # ---- 软掩码：区域限定 × 浊音强度门控（事故防线，见 docstring）----
+    ff_ap = np.linspace(0, sr / 2, ap.shape[1])
+    apb = np.mean(ap[:, (ff_ap > 300) & (ff_ap < 4000)], axis=1)
+    strong = voiced & (apb < 0.55)            # 强浊音：气声/底噪误检被排除
+    region = np.zeros(len(f0), dtype=bool)
+    margin = 0.05
+    for a, b, _x0, _x1 in ramps:
+        region |= (tf >= max(0.0, a - margin)) & (tf <= b)
+    mask_f = (strong & region & (np.abs(off) > 0.05)).astype(np.float32)
+    # 帧域平滑（压入 1 帧=5ms，释放 8 帧=40ms），再插值到样本域
+    sm = mask_f.copy()
+    for k in range(1, len(sm)):
+        sm[k] = max(sm[k], sm[k - 1] * 0.92)   # 释放 ~40ms
+    mask_s = np.interp(np.arange(len(yf)) / sr, tf, sm).astype(np.float32)
+    out = yf + mask_s * (y2 - yf)
+
+    n_applied = int(len(ramps))
     if was_int:
-        return (np.clip(y2 * 32767.0, -32767, 32767).astype(np.int16),
-                len(ramps))
-    return y2.astype(np.float32), len(ramps)
+        return (np.clip(out * 32767.0, -32767, 32767).astype(np.int16),
+                n_applied)
+    return out.astype(np.float32), n_applied
 
 
 def build_intonation_ramps(text: str, sr: int, duration: float,
@@ -2216,15 +2241,18 @@ def build_intonation_ramps(text: str, sr: int, duration: float,
         return [], ""
     prof = profile or {}
     qr = prof.get("question_rise") or {}
-    rise_st = 2.5
+    rise_st = 1.8   # 上翘会整体搬高谐波（+1st≈+6%频率），在嘶哑边缘的
+                    # 嗓音上 +2.5st 实测越过撕裂线——1.8st 仍清晰可闻且安全
     # 指纹语义（2026-10-11 实测校准）：问句**必须升**是语言规范——指纹只能
     # 在"上翘体制内"调节幅度（演员明显上翘 median>1st 才采纳其值），不能
     # 把方向翻转成不翘/下降。实测锁暝素材问句中位 -0.76st（游戏VO疲惫
     # 演法）——直接采纳会让问句依然不翘，违背用户核心诉求。
     if (int(qr.get("n") or 0) >= 3 and qr.get("median_st") is not None
             and float(qr["median_st"]) > 1.0):
+        # 演员明显上翘：采纳其实测幅度（撕裂线约束 ≤2.2st——上翘整体搬高
+        # 谐波，+2.5st 实测在嘶哑边缘嗓音上越线）
         try:
-            rise_st = float(np.clip(float(qr["median_st"]), 1.0, 3.0))
+            rise_st = float(np.clip(float(qr["median_st"]), 1.0, 2.2))
         except (TypeError, ValueError):
             pass
     # 字符 → 时间
