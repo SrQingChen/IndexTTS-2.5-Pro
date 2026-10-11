@@ -2010,9 +2010,15 @@ def run_oneclick(engine, options: OneClickOptions,
         try:
             os.makedirs(out_dir, exist_ok=True)
             rep_md = rep.markdown()
+            payload = asdict(rep)
+            # phase_cb 是运行时回调（函数对象），进 JSON 会炸——此前
+            # json.dump 在函数字段上抛 TypeError 且文件已开写，留下
+            # **截断的 report.json**，UI 读不到评分数据（排行榜全 None）。
+            # 序列化前剔除一切不可 JSON 化的运行时字段。
+            payload.pop("phase_cb", None)
             with open(os.path.join(out_dir, "report.json"), "w",
                       encoding="utf-8") as f:
-                json.dump({"report": asdict(rep)}, f, ensure_ascii=False, indent=2)
+                json.dump({"report": payload}, f, ensure_ascii=False, indent=2)
             with open(os.path.join(out_dir, "report.md"), "w",
                       encoding="utf-8") as f:
                 f.write(rep_md)
