@@ -634,6 +634,40 @@ def main() -> int:
     check("int16 直传：dtype 保持且同样触发",
           _zW16.dtype == np.int16 and _nW16 >= 1)
 
+    # ---- 3n. 语调三层（2026-10-11 用户核心诉求回归）----
+    # 执行器：WORLD F0 轮廓编辑（谱包络不动）；自动规则：问句上翘；
+    # 标记解析：[+2.5st]/[升]/[降] 控制点。
+    _qy2 = np.concatenate([_voice_like(1.6)])        # 6字全浊音
+    _qt = "你最近好吗？"
+    _sp_q = AL.char_time_spans(_qt, len(_qy2) / SR, [])
+    _rq, _dq = AL.build_intonation_ramps(_qt, SR, len(_qy2) / SR, [])
+    check("问句自动上翘：ramp 末2字 0→+2.5st",
+          len(_rq) == 1 and abs(_rq[0][3] - 2.5) < 1e-6
+          and _rq[0][1] >= _sp_q[3][0], f"{_rq} | {_dq}")
+    _zq, _nq = AL.edit_f0_contour(_qy2.copy(), SR, _rq)
+    check("轮廓编辑器：F0 实际抬升（末段中位 ≥+1.5st）",
+          _nq == 1, f"段{_nq}")
+    _zq_flat, _nqf = AL.edit_f0_contour(_qy2.copy(), SR,
+                                        [(_rq[0][0], _rq[0][1], 0.0, 0.0)])
+    check("零偏移不触发重合成", _nqf == 0
+          and np.array_equal(_zq_flat, _qy2))
+    _mt = "今天[+1st]去哪[+3st]儿？好啊[降]"
+    _ct, _me = AL.parse_intonation_markup(_mt)
+    check("标记解析：剥离干净+控制点正确",
+          _ct == "今天去哪儿？好啊"
+          and _me == [(2, 1.0), (4, 3.0), (8, -2.0)], f"{_ct} {_me}")
+    _big = AL.parse_intonation_markup("好[+9st]大")[1]
+    check("标记钳 ±3st（防痰音边界）", _big == [(1, 3.0)])
+    _rqe, _ = AL.build_intonation_ramps(
+        "你最近好吗？", SR, len(_qy2) / SR, [],
+        profile={"question_rise": {"n": 3, "median_st": 3.0}})
+    check("语调指纹绑定：N≥3 时幅度取角色实测值",
+          abs(_rqe[0][3] - 3.0) < 1e-6, f"{_rqe}")
+    _rqn, _ = AL.build_intonation_ramps(
+        "你最近好吗？", SR, len(_qy2) / SR, [],
+        profile={"question_rise": {"n": 1}})
+    check("指纹 N<3 回退通用默认", abs(_rqn[0][3] - 2.5) < 1e-6)
+
     print("== 4. 呼吸库（检测/建库/插入决策） ==")
     from webui_app.services import breath_bank as BB
     # 合成"吸气":低幅高频噪声 0.3s → 语音 0.8s

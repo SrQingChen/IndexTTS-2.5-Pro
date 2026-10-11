@@ -2119,7 +2119,283 @@ def limit_voiced_hf(y: np.ndarray, sr: int,
     return out.astype(np.float32), len(clusters)
 
 
+
+# ===========================================================================
+# 语调（intonation）三层控制：执行器 / 自动规则 / 手动标记
+# 2026-10-11 · 用户核心诉求：问句末尾上翘、随情绪与语言的自然起伏
+# 调研对齐：Into-TTS 模板法、Corkey 2023 语调控制、W3C SSML prosody、
+# Morrison C-DAR 轮廓编辑——全部落在本项目已有的 WORLD 分析/重合成设施上。
+# ===========================================================================
+
+#: 语调偏移的绝对安全边界（半音）。阶段20教训：女声谐波稀疏，大偏移让
+#: 谐波与谱包络错位出痰音——±3st 与 restore_f0_range 的逐帧限幅同源。
+INTONATION_MAX_ST = 3.0
+
+
+def edit_f0_contour(y: np.ndarray, sr: int,
+                    ramps: List[tuple],
+                    max_st: float = INTONATION_MAX_ST) -> Tuple[np.ndarray, int]:
+    """F0 轮廓编辑器：按「半音渐变段」重塑浊音区的音高，谱包络不动。
+
+    ramps: [(t_start_s, t_end_s, st_start, st_end)]——段内偏移从 st_start
+    线性渐变到 st_end（半音域，正=升调）；段外偏移 0。多段拼接成整条
+    偏移曲线。施工：harvest 提取 F0 → 浊音帧乘 2^(offset/12) →
+    cheaptrick/d4c 用**原始谱包络**重合成（音色不变，只动音高）。
+
+    安全边界：逐帧偏移钳 ±max_st（默认 ±3 半音，防痰音）；长于 30s 的
+    输入直接跳过（WORLD 内存安全界，与 restore_f0_range 同款）；
+    浊音帧不足的静音/气声段由 harvest 自己判 f0=0，天然跳过。
+    int16/float 均可，返回 (波形, 应用的段数)。
+    """
+    was_int = np.issubdtype(np.asarray(y).dtype, np.integer)
+    yf = (np.asarray(y, dtype=np.float32) / 32768.0 if was_int
+          else np.asarray(y, dtype=np.float32))
+    ramps = [(float(a), float(b), float(x), float(v))
+             for a, b, x, v in (ramps or [])
+             if float(b) > float(a)]
+    if not ramps or len(yf) < sr // 2:
+        return y, 0
+    if len(yf) > sr * 30:
+        return y, -1                          # 超长：调用方自行提示走导演模式
+    try:
+        import pyworld as pw
+    except Exception:
+        return y, 0
+    y64 = yf.astype(np.float64)
+    f0, t = pw.harvest(y64, sr, f0_floor=70.0, f0_ceil=600.0,
+                       frame_period=5.0)
+    voiced = f0 > 0
+    if int(voiced.sum()) < 20:
+        return y, 0
+    tf = t[:len(f0)]
+    # 逐帧偏移曲线：段内线性渐变，段间保持
+    off = np.zeros(len(f0), dtype=np.float64)
+    for a, b, x0, x1 in ramps:
+        m = (tf >= a) & (tf <= b)
+        if not m.any():
+            continue
+        span = max(1e-6, b - a)
+        frac = np.clip((tf[m] - a) / span, 0.0, 1.0)
+        off[m] = x0 + (x1 - x0) * frac
+    off = np.clip(off, -float(max_st), float(max_st))
+    if float(np.abs(off[voiced]).max()) < 0.05:
+        return y, 0                           # 有效偏移过小：不值得重合成
+    new_f0 = f0.copy()
+    new_f0[voiced] = f0[voiced] * (2.0 ** (off[voiced] / 12.0))
+    sp = pw.cheaptrick(y64, f0, t, sr)
+    ap = pw.d4c(y64, f0, t, sr)
+    y2 = np.asarray(pw.synthesize(new_f0, sp, ap, sr, frame_period=5.0),
+                    dtype=np.float32)
+    y2 = y2[:len(yf)]
+    if len(y2) < len(yf):
+        y2 = np.concatenate([y2, np.zeros(len(yf) - len(y2), np.float32)])
+    if was_int:
+        return (np.clip(y2 * 32767.0, -32767, 32767).astype(np.int16),
+                len(ramps))
+    return y2.astype(np.float32), len(ramps)
+
+
+def build_intonation_ramps(text: str, sr: int, duration: float,
+                           silences: List[tuple],
+                           profile: Optional[Dict[str, Any]] = None
+                           ) -> Tuple[List[tuple], str]:
+    """自动语调规则（层①）：标点驱动的问句上翘/感叹强调 ramps。
+
+    规则（v1，逐短语）：
+      · `？`结尾：短语尾部 ~35%（末2-3音节）从 0 渐变到 rise_st——幅度
+        优先取**语调指纹**（该演员自己的问句实测分布，N≥3 才用），
+        否则通用默认 +2.5st；
+      · `！`结尾：末 1~2 音节 +1.5st 峰值强调；
+      · `。`：v1 不动（模型自带的陈述下落已存在，强加反而做作）；
+      · 非句末短语（，、）不动——短语中途的语调交给模型。
+    ramps 坐标基于 char_time_spans 的字符时间映射（静音感知）。
+    返回 (ramps, 说明)。
+    """
+    n = len(text or "")
+    if n == 0 or duration <= 0:
+        return [], ""
+    prof = profile or {}
+    qr = prof.get("question_rise") or {}
+    rise_st = 2.5
+    if int(qr.get("n") or 0) >= 3 and qr.get("median_st") is not None:
+        try:
+            rise_st = float(np.clip(float(qr["median_st"]), 1.0, 3.0))
+        except (TypeError, ValueError):
+            pass
+    # 字符 → 时间
+    spans = char_time_spans(text, duration, silences)
+    if len(spans) < n:
+        return [], ""
+    # 短语切分（标点粘在前短语尾）
+    phrases: List[tuple] = []
+    start = 0
+    for i, ch in enumerate(text):
+        if ch in _PUNCT_CHARS:
+            phrases.append((start, i, ch))
+            start = i + 1
+    if start < n:
+        phrases.append((start, n - 1, ""))
+    ramps: List[tuple] = []
+    applied: List[str] = []
+    for p0, p1, punct in phrases:
+        if punct not in ("？", "!"):
+            continue
+        tail_chars = max(1, min(3, (p1 - p0) // 3))
+        c0 = max(p0, p1 - tail_chars)
+        t0 = spans[c0][0]
+        t1 = spans[p1][1]
+        if punct == "？":
+            st = rise_st
+        else:
+            st = 1.5
+        if t1 - t0 < 0.08:
+            continue
+        ramps.append((t0, t1, 0.0, st))
+        applied.append(f"{punct}@{t0:.2f}s+{st:.1f}st")
+    return ramps, "; ".join(applied)
+
+
+_MARKUP_RE = None
+
+
+def parse_intonation_markup(text: str) -> Tuple[str, List[tuple]]:
+    """手动标记解析（层②）：从文本剥离 [+2.5st]/[-1st]/[升]/[降] 标记，
+    返回 (净文本, [(净文本字符下标, st)])。
+
+    语义（控制点模型）：标记出现在哪个字前面，就定义该字位置上的 F0
+    偏移；相邻控制点之间线性渐变，最后一个控制点之后保持到短语尾。
+    示例：`今天[+1st]去哪[+3st]儿？` → 「去哪儿」一路爬升到 +3st。
+    [升] = +2st、[降] = -2st 的中文糖。标记不进合成文本（否则会被读出）。
+    """
+    global _MARKUP_RE
+    if _MARKUP_RE is None:
+        import re as _re
+        _MARKUP_RE = _re.compile(r"\[([+-]?\d+(?:\.\d+)?st|升|降)\]",
+                                 _re.IGNORECASE)
+    edits: List[tuple] = []
+    out: List[str] = []
+    pos = 0
+    for m in _MARKUP_RE.finditer(text or ""):
+        out.append(text[pos:m.start()])
+        pos = m.end()
+        tok = m.group(1).lower()
+        if tok == "升":
+            st = 2.0
+        elif tok == "降":
+            st = -2.0
+        else:
+            try:
+                st = float(tok[:-2])
+            except ValueError:
+                continue
+        st = float(np.clip(st, -INTONATION_MAX_ST, INTONATION_MAX_ST))
+        edits.append((len("".join(out)), st))
+    out.append(text[pos:])
+    clean = "".join(out)
+    return clean, edits
+
+
+def markup_edits_to_ramps(edits: List[tuple],
+                          spans: List[tuple],
+                          phrase_end_s: float) -> List[tuple]:
+    """标记控制点 → ramps：控制点间线性渐变，末点保持到短语尾。"""
+    pts = [(spans[min(idx, len(spans) - 1)][0], st)
+           for idx, st in edits if idx < len(spans)] if spans else []
+    if not pts:
+        return []
+    ramps: List[tuple] = []
+    if pts[0][1] != 0.0:
+        ramps.append((max(0.0, pts[0][0] - 0.25), pts[0][0], 0.0, pts[0][1]))
+    for (ta, sa), (tb, sb) in zip(pts[:-1], pts[1:]):
+        if sb != sa and tb > ta:
+            ramps.append((ta, tb, sa, sb))
+    last_t, last_s = pts[-1]
+    if phrase_end_s > last_t and last_s != 0.0:
+        ramps.append((last_t, phrase_end_s, last_s, last_s))
+    return ramps
+
+
+
+def analyze_intonation_clip(y: np.ndarray, sr: int,
+                            text: str) -> List[Dict[str, Any]]:
+    """单条素材的逐短语语调测量（训练时语调指纹的原料）。
+
+    按标点切短语 → char_time_spans 对齐 → 每个短语测「末音节窗口」的
+    F0 首尾变化（半音）：问句（？）记 rise，句号记 fall。f0=0 的无声
+    帧自动跳过。返回 [{punct, rise_st}, ...]（每短语一条）。
+    """
+    if not text or len(y) < sr // 2:
+        return []
+    try:
+        import pyworld as pw
+    except Exception:
+        return []
+    y64 = np.asarray(y, dtype=np.float64)
+    f0, t = pw.harvest(y64, sr, f0_floor=70.0, f0_ceil=600.0,
+                       frame_period=5.0)
+    if len(f0) < 20 or not (f0 > 0).any():
+        return []
+    fr_s = 0.005
+
+    def _win_st(a: float, b: float) -> Optional[float]:
+        """[a,b]s 窗口内首1/3 vs 末1/3 的浊音中位 F0 差（半音，正=升）。"""
+        ia, ib = int(a / fr_s), min(len(f0), int(b / fr_s))
+        if ib - ia < 6:
+            return None
+        w = f0[ia:ib]
+        k = max(2, (ib - ia) // 3)
+        head = w[:k]; head = head[head > 0]
+        tail = w[-k:]; tail = tail[tail > 0]
+        if len(head) < 3 or len(tail) < 3:
+            return None
+        mh, mt = float(np.median(head)), float(np.median(tail))
+        if mh <= 0 or mt <= 0:
+            return None
+        return 12.0 * np.log2(mt / mh)
+
+    dur = len(y) / sr
+    spans = char_time_spans(text, dur, [])
+    if len(spans) < len(text):
+        return []
+    out: List[Dict[str, Any]] = []
+    start = 0
+    for i, ch in enumerate(text):
+        if ch in _PUNCT_CHARS and ch in "？！。":
+            p0, p1 = start, i
+            if p1 > p0:
+                tail_chars = max(1, min(3, (p1 - p0) // 3))
+                c0 = max(p0, p1 - tail_chars)
+                a = spans[c0][0]
+                b = spans[p1][1]
+                d = _win_st(a, b)
+                if d is not None and abs(d) < 8.0:
+                    out.append({"punct": ch, "rise_st": round(d, 2),
+                                "n_chars": p1 - p0})
+            start = i + 1
+    return out
+
+
+def aggregate_intonation_profile(metrics: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """逐短语测量 → 语调指纹。N<2 的项只记条数（推理端据此回退通用默认）。"""
+    q = [m["rise_st"] for m in metrics if m["punct"] == "？"]
+    st = [m["rise_st"] for m in metrics if m["punct"] == "。"]
+    ex = [m["rise_st"] for m in metrics if m["punct"] == "！"]
+
+    def _stat(v: List[float]) -> Dict[str, Any]:
+        if len(v) < 2:
+            return {"n": len(v)}
+        return {"n": len(v),
+                "median_st": round(float(np.median(v)), 2),
+                "p25": round(float(np.percentile(v, 25)), 2),
+                "p75": round(float(np.percentile(v, 75)), 2)}
+
+    return {"question_rise": _stat(q), "statement_fall": _stat(st),
+            "exclaim": _stat(ex), "total_phrases": len(metrics)}
+
+
 def repair_truncated_tail(y: np.ndarray, sr: int,
+
+
 
 
                           thresh_db: float = -35.0,

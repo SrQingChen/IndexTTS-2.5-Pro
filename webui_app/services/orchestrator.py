@@ -296,12 +296,14 @@ def perform(
     # 逐块目标响度从它采样（爆发响/平静轻），没有指纹则保持旧行为。
     _loudness_fp: Dict[str, Any] = {}
     _f0_fp: Dict[str, Any] = {}
+    _intonation_fp: Dict[str, Any] = {}
     if lora_run:
         try:
             from webui_app.training import runs as _RN
             _rj = _RN.read_run(lora_run) or {}
             _loudness_fp = dict(_rj.get("loudness_fingerprint") or {})
             _f0_fp = dict(_rj.get("f0_fingerprint") or {})
+            _intonation_fp = dict(_rj.get("intonation_profile") or {})
         except Exception:
             _loudness_fp = {}
     if _loudness_fp:
@@ -941,6 +943,56 @@ def perform(
                             gain_db=float(stress_gain_db))
                 except Exception as e:
                     log.warning("重音定位失败（跳过）：%s", e)
+
+            # ---- 语调（2026-10-11 三层架构）：自动规则（问句上翘/感叹
+            # 强调）+ 语调指纹（演员自己的幅度，N≥3 才用）+ 手动标记
+            #（文本内 [+2.5st]/[升] 解析，标记不进合成文本）。施工在
+            # governance 之后（时序对齐），WORLD 只动 F0 谱包络不动。
+            try:
+                _ramps: List[tuple] = []
+                _mk_clean, _mk_edits = AL.parse_intonation_markup(blk_text)
+                _sil_map = []
+                if _mk_edits or True:
+                    _fr2 = int(SR * 0.025)
+                    _nn2 = len(wav) // _fr2
+                    if _nn2 >= 2:
+                        _e2 = np.sqrt(np.mean(
+                            (wav[:_nn2 * _fr2].astype(np.float32)
+                             / 32768.0).reshape(_nn2, _fr2) ** 2,
+                            axis=1) + 1e-12)
+                        _q2 = (20 * np.log10(_e2 + 1e-12)) < -35
+                        _j2 = 0
+                        while _j2 < _nn2:
+                            if _q2[_j2]:
+                                _k2 = _j2
+                                while _k2 < _nn2 and _q2[_k2]:
+                                    _k2 += 1
+                                if (_k2 - _j2) * 0.025 >= 0.15:
+                                    _sil_map.append((_j2 * 0.025,
+                                                     (_k2 - _j2) * 0.025))
+                                _j2 = _k2
+                            else:
+                                _j2 += 1
+                _mk_text = blk_text
+                if _mk_edits:
+                    _mk_text = _mk_clean
+                    _spans2 = AL.char_time_spans(_mk_text, len(wav) / SR,
+                                                 _sil_map)
+                    _ramps.extend(AL.markup_edits_to_ramps(
+                        _mk_edits, _spans2, len(wav) / SR))
+                _auto_r, _auto_desc = AL.build_intonation_ramps(
+                    _mk_text, SR, len(wav) / SR, _sil_map,
+                    profile=(_intonation_fp or None))
+                _ramps.extend(_auto_r)
+                if _ramps:
+                    wav, _n_int = AL.edit_f0_contour(wav, SR, _ramps)
+                    if _n_int == -1:
+                        log.info("块 %d 超 30s，语调塑形跳过", bi + 1)
+                    elif _n_int > 0:
+                        log.info("块 %d 语调塑形 %d 段：%s", bi + 1,
+                                 _n_int, _auto_desc or "手动标记")
+            except Exception as _e:
+                log.warning("语调塑形失败（跳过）：%s", _e)
 
             # ---- 韵尾延长（2026-10-03 收音急促根治件，第三处定稿位）----
             # 爱弥斯类 LoRA 把标点前收音渲染成 ≤30ms 陡坡（8 候选全如此，
