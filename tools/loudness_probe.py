@@ -667,6 +667,11 @@ def main() -> int:
         "你最近好吗？", SR, len(_qy2) / SR, [],
         profile={"question_rise": {"n": 1}})
     check("指纹 N<3 回退通用默认", abs(_rqn[0][3] - 2.5) < 1e-6)
+    _rqf, _ = AL.build_intonation_ramps(
+        "你最近好吗？", SR, len(_qy2) / SR, [],
+        profile={"question_rise": {"n": 10, "median_st": -0.76}})
+    check("指纹方向保护：演员不上翘（-0.76st）也不翻转问句方向",
+          abs(_rqf[0][3] - 2.5) < 1e-6, f"{_rqf}")
 
     print("== 4. 呼吸库（检测/建库/插入决策） ==")
     from webui_app.services import breath_bank as BB

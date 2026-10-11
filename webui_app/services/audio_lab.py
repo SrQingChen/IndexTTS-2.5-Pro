@@ -2217,7 +2217,12 @@ def build_intonation_ramps(text: str, sr: int, duration: float,
     prof = profile or {}
     qr = prof.get("question_rise") or {}
     rise_st = 2.5
-    if int(qr.get("n") or 0) >= 3 and qr.get("median_st") is not None:
+    # 指纹语义（2026-10-11 实测校准）：问句**必须升**是语言规范——指纹只能
+    # 在"上翘体制内"调节幅度（演员明显上翘 median>1st 才采纳其值），不能
+    # 把方向翻转成不翘/下降。实测锁暝素材问句中位 -0.76st（游戏VO疲惫
+    # 演法）——直接采纳会让问句依然不翘，违背用户核心诉求。
+    if (int(qr.get("n") or 0) >= 3 and qr.get("median_st") is not None
+            and float(qr["median_st"]) > 1.0):
         try:
             rise_st = float(np.clip(float(qr["median_st"]), 1.0, 3.0))
         except (TypeError, ValueError):
