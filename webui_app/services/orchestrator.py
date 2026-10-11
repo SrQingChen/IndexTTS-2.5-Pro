@@ -645,6 +645,10 @@ def perform(
         if prev_path:
             # 衔接连续性择优：同情绪块间才罚（情绪转换是有意的风格变化）
             pen += _register_jump_penalty(path, prev_path)
+            # 音色亮度连续性（2026-10-11 发闷周期治理）：候选头部质心偏离
+            # 上一块尾部越远罚越重（双向对称，只选连续不选暗/亮方向）——
+            # 抑制「几句发闷几句恢复」的块间音色漂移
+            pen += min(0.10, _centroid_jump(path, prev_path) * 0.05)
         return float(r["reward"]) - pen
 
     # 逐块目标响度：先采完整序列再做**限步平滑**（首块=中位，相邻 ≤2.5dB）
@@ -881,6 +885,22 @@ def perform(
                     f0_applied = True
                 f0_note = str(rr.get("error") or
                               (f"k={rr.get('k')}" if rr.get("ok") else ""))
+
+            # ---- 块输出频谱对齐（2026-10-11 发闷周期根治件）----
+            # 实测（达妮娅新 9 块）：块间谱质心 963~1597 摆 1.66 倍，发闷块
+            # 的 2-5kHz 共鸣峰区塌陷（响度正常）——CFM 扩散采样+BoN 选择的
+            # 联合方差。把每块输出频谱拉向**演员自己的平均画像**
+            #（spectral_profile，±4dB 温和钳制）：偏离平均=偏离演员音色，
+            # 拉回即恢复。已在目标附近的块增益≈0 零接触。
+            if _spectral_fp:
+                try:
+                    _yf = wav.astype(np.float32) / 32768.0
+                    _ym = AL.match_band_profile(_yf, SR, _spectral_fp,
+                                                max_db=4.0)
+                    wav = np.clip(_ym * 32767.0, -32767,
+                                  32767).astype(np.int16)
+                except Exception as _e:
+                    log.warning("块输出频谱对齐失败（跳过）：%s", _e)
 
             # ---- 逐块响度（响度指纹迁移）：从角色自己的响度分布采样目标 ----
             # 爆发块从响端、平静块从轻端 —— "这句该响那句该轻"来自角色本人
