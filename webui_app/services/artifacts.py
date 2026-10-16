@@ -52,6 +52,8 @@ CATEGORIES: List[Tuple[str, str, str, str]] = [
     ("voice",     "🎙", "音色库条目",   "voice_bank/ 中保存的音色（含体检记录）"),
     ("emotion",   "😊", "情感参考库",   "emotion_bank/ 中入库的情感参考（导演台情感路由用）"),
     ("lab",       "🔬", "工作台切片",   "outputs/lab/ 下的智能切片与降噪归一文件"),
+    ("cover",     "🎤", "翻唱产物",     "outputs/cover/ 下的翻唱会话（干声/BGM/成品/报告）"),
+    ("vc",        "🎧", "变声产物",     "outputs/vc/ 下的文件变声与实时录制"),
     ("synth",     "🔊", "合成音频",     "outputs/ 根目录下的单次合成结果（含台本旁车）"),
     ("batch",     "🧾", "批量任务",     "outputs/tasks/ 下的批量合成产物"),
     ("state",     "🧭", "导演台与状态", "outputs/state/ 下的台本缓存 / LLM 配置 / 参数记忆等（删除后果见各条说明）"),
@@ -181,7 +183,7 @@ def scan(cfg: AppConfig) -> ScanResult:
     for fn in (_scan_oneclick, _scan_eval, _scan_bon, _scan_train_runs,
                _scan_lora, _scan_train_int, _scan_datasets, _scan_voices,
                _scan_emotion, _scan_lab, _scan_synth, _scan_batch,
-               _scan_state, _scan_cache):
+               _scan_state, _scan_cache, _scan_cover, _scan_vc):
         try:
             res.items.extend(fn(cfg))
         except Exception as e:                     # 单类失败不连累整页
@@ -442,6 +444,40 @@ def _scan_bon(cfg: AppConfig) -> List[ArtifactItem]:
     return out
 
 
+def _scan_cover(cfg: AppConfig) -> List[ArtifactItem]:
+    """AI 翻唱会话产物（每首一组：分离干声/BGM/转换人声/成品/报告）。"""
+    out = []
+    for p in _dir_children(os.path.join(cfg.output_dir, "cover")):
+        size, nfiles, mtime = _walk_stat(p)
+        name = os.path.basename(p)
+        has_mix = os.path.isfile(os.path.join(p, "06_mix.wav"))
+        out.append(ArtifactItem(
+            key=f"cover:{name}", kind="cover", name=name,
+            path=_rel(p), size=size, n_files=nfiles, mtime=mtime,
+            note=("含混音成品" if has_mix else "干声/报告"),
+        ))
+    return out
+
+
+def _scan_vc(cfg: AppConfig) -> List[ArtifactItem]:
+    """AI 变声产物（文件变声与实时录制，单文件粒度）。"""
+    root = os.path.join(cfg.output_dir, "vc")
+    out = []
+    if not os.path.isdir(root):
+        return out
+    for f in sorted(os.listdir(root)):
+        p = os.path.join(root, f)
+        if not os.path.isfile(p):
+            continue
+        out.append(ArtifactItem(
+            key=f"vc:{f}", kind="vc", name=f,
+            path=_rel(p), size=os.path.getsize(p), n_files=1,
+            mtime=os.path.getmtime(p),
+            note="文件变声/实时录制",
+        ))
+    return out
+
+
 def _scan_emotion(cfg: AppConfig) -> List[ArtifactItem]:
     """情感参考库条目（导演台情感路由的素材）。"""
     from webui_app.services import emotion_bank as EB
@@ -468,6 +504,8 @@ def _scan_state(cfg: AppConfig) -> List[ArtifactItem]:
         "synthesis_state.json": "合成页参数记忆 · 删后界面恢复默认值",
         "lora_profiles.json":  "角色双通道档案 · 删后需重新存档",
         "last_prompt.wav":     "参考音频缓存 · 删后自动重建",
+        "cover_state.json":    "翻唱页参数记忆 · 删后界面恢复默认值",
+        "vc_state.json":       "变声页参数记忆 · 删后界面恢复默认值",
     }
     out = []
     for p in _dir_children(state_dir):
@@ -515,6 +553,8 @@ def _root_of(cfg: AppConfig, kind: str) -> Optional[str]:
         "voice":     os.path.join(PROJECT_ROOT, "voice_bank"),
         "emotion":   os.path.join(PROJECT_ROOT, "emotion_bank"),
         "lab":       os.path.join(cfg.output_dir, "lab"),
+        "cover":     os.path.join(cfg.output_dir, "cover"),
+        "vc":        os.path.join(cfg.output_dir, "vc"),
         "synth":     cfg.output_dir,
         "batch":     cfg.tasks_dir,
         "state":     os.path.join(cfg.output_dir, "state"),

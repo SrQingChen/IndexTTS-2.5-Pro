@@ -91,6 +91,11 @@ dependencies = [
 # To install the WebUI support, use `uv sync --extra webui` (or `--all-extras`).
 webui = [
   "gradio==5.45.0",
+  # AI变声实时（阶段45）：PortAudio 绑定，纯 wheel 无编译；未装时变声页
+  # 退化为「文件变声」模式（vc_realtime.sd_available 探测降级）。
+  "sounddevice>=0.5.0",
+  # WORLD 声码器（F0 移植/音域分析，audio_lab 惰性使用，svc_f0 依赖）。
+  "pyworld>=0.3.4",
 ]
 # 参考音频降噪（可选）。**没装也能用**：增强链会在报告里写明「降噪已跳过」，
 # 其余步骤（高通 / 裁静音 / 响度归一 / 重采样）照常执行。
@@ -100,6 +105,14 @@ webui = [
 # 安装：`uv sync --extra denoise`（或 uv pip install noisereduce）
 denoise = [
   "noisereduce>=3.0.3",
+]
+# AI翻唱人声分离/去混响（阶段45，可选）。audio-separator 的 torch 依赖区间
+# (>=2.3,<3) 与本项目 torch 2.8 兼容；未装时翻唱页「原歌曲」入口降级提示，
+# 选「干净人声」可绕过分离。安装：uv sync --extra separation
+# （或 pip install "audio-separator[gpu]"）。首跑自动下载权重到
+# checkpoints/separators/（约 1GB，模型页可见）。
+separation = [
+  "audio-separator[gpu]>=0.30",
 ]
 # To install the DeepSpeed support, use `uv sync --extra deepspeed` (or `--all-extras`).
 deepspeed = [

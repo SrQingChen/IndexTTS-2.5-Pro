@@ -38,6 +38,8 @@ from webui_app.services.engine import EngineError
 TAB_SPECS: List[Tuple[str, str, str, str]] = [
     ("syn",    "🎙 合成",       "webui_app.tabs.synthesize", "单条合成 · 全参数 · 实时提示"),
     ("lab",    "🔬 音频工作台", "webui_app.tabs.audio_lab",  "体检 · 智能切片 · 降噪归一 · 音色库"),
+    ("cover",  "🎤 AI翻唱",     "webui_app.tabs.cover_tab",  "源歌→角色音色 · 分离去混响 · F0旋律移植 · BGM回混"),
+    ("vc",     "🎧 AI变声",     "webui_app.tabs.vc_tab",     "实时麦克风变声 · 多档位 · 文件变声"),
     ("emobank","🎭 情感参考库", "webui_app.tabs.emotion_bank_tab",
      "角色×情绪打标 · 导演模式的路由数据源"),
     ("batch",  "📦 批量",       "webui_app.tabs.batch",      "多行文本 / JSONL · 进度 · 打包"),

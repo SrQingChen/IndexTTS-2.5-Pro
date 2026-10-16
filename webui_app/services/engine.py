@@ -259,6 +259,9 @@ class TTSEngine:
         # 同一段情感描述反复用（调参、批量合成）时缓存收益很大。
         self._emo_cache: Dict[str, List[float]] = {}
         self.qwen_device_pref = "auto"   # auto | cuda | cpu
+        # 变声/翻唱实时会话租约：会话进行中 unload() 被拒绝，防止推理线程
+        # 手里的 tts 引擎被别的页面卸掉（引用还在但显存被动过）。
+        self._svc_leases: List[str] = []
 
     # -- 事件回调（供 UI 显示进度）-----------------------------------------
 
@@ -364,9 +367,17 @@ class TTSEngine:
             )
             return self.stats
 
-    def unload(self) -> EngineStats:
-        """卸载主模型，归还显存。"""
+    def unload(self, bypass_svc: bool = False) -> EngineStats:
+        """卸载主模型，归还显存。
+
+        bypass_svc=True 仅供**持有 svc 租约的管线自身**临时卸载（翻唱链的
+        分离/超分段）——外部调用一律走拦截。
+        """
         with self._lock:
+            if self._svc_leases and not bypass_svc:
+                raise EngineError(
+                    f"实时会话进行中（{'、'.join(self._svc_leases)}），"
+                    "请先在对应页面停止会话再卸载引擎。")
             if _busy_runner_engine_req() == "loaded":
                 # 任务线程手里还攥着 tts 的引用，这里删自己的引用并不会
                 # 释放显存 —— 状态条却会说已卸载。用户接着加载就得到
@@ -377,6 +388,19 @@ class TTSEngine:
             self._unload_locked()
             self._emit("unloaded", "模型已卸载，显存已释放")
             return self.stats
+
+    # ------------------------------------------------------------------
+    # SVC 会话租约（AI 变声实时 / 长翻唱转换期间引擎常驻保护）
+    # ------------------------------------------------------------------
+    def begin_svc(self, label: str) -> None:
+        """登记一个占用引擎的实时会话；期间 unload() 被拒绝。"""
+        with self._lock:
+            self._svc_leases.append(label)
+
+    def end_svc(self, label: str) -> None:
+        with self._lock:
+            if label in self._svc_leases:
+                self._svc_leases.remove(label)
 
     def _unload_locked(self):
         self.release_qwen_locked()

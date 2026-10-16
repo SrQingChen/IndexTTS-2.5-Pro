@@ -70,6 +70,12 @@ GROUP_TITLES: Dict[str, str] = {
     "optim":    "训练 · 优化器与调度",
     "dpo":      "训练 · DPO 偏好优化",
     "reward":   "评测 · 奖励指标",
+    "cover_in":    "翻唱 · 输入与预处理",
+    "cover_vc":    "翻唱 · 转换核心",
+    "cover_f0":    "翻唱 · F0 音高",
+    "cover_post":  "翻唱 · 后处理与超分",
+    "cover_mix":   "翻唱 · 自动合成混音",
+    "vc_realtime": "变声 · 实时",
 }
 
 REGISTRY: Dict[str, Param] = {}
@@ -127,5 +133,15 @@ def register_training_params() -> None:
         pass
 
 
+def register_cover_params() -> None:
+    """登记翻唱/变声参数（阶段 45）。"""
+    try:
+        from webui_app.params_cover import build
+        build(_reg, Param)
+    except ImportError:
+        pass
+
+
 register_inference_params()
 register_training_params()
+register_cover_params()
