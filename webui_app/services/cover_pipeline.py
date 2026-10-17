@@ -378,7 +378,11 @@ def run_cover(ctx, req: CoverRequest, progress: Optional[Callable] = None,
             if res.ok:
                 vocal = res.y
             _log(f"[F0] r={metrics.get('f0_r', '-')} → {metrics.get('mode_used', '-')}，"
-                 f"移调 {semis:+d}st")
+                 f"移调 {semis:+d}st"
+                 + (f"（50 音分内 {metrics.get('within_50c', 0):.0%}）"
+                    if metrics.get("within_50c") is not None else ""))
+            _p(0.82, f"F0 完成（{metrics.get('mode_used', '-')}，"
+                     f"移调 {semis:+d} 半音），进入后处理")
         f0_path = os.path.join(out_dir, "04_f0_vocal.wav")
         AL.save_audio(f0_path, vocal, ENGINE_SR)
         report["f0"] = f0_report
@@ -413,6 +417,7 @@ def run_cover(ctx, req: CoverRequest, progress: Optional[Callable] = None,
             applied.append("峰值保护")
         report["post"] = {"applied": applied}
         timings["post"] = round(time.perf_counter() - t0, 1)
+        _p(0.84, "后处理完成" + ("（" + "、".join(applied) + "）" if applied else ""))
 
         # ---------- 7) 超分（可选，默认关；17.8× 实时耗时警示） ----------
         vocal_sr = ENGINE_SR
@@ -423,11 +428,18 @@ def run_cover(ctx, req: CoverRequest, progress: Optional[Callable] = None,
             if not SR.available():
                 _log("[超分] audiosr 未安装，跳过")
             else:
-                _log("[超分] 卸载引擎 → AudioSR（约 17.8× 实时耗时）")
+                dur_s = len(vocal) / ENGINE_SR
+                est_min = dur_s * 17.8 / 60.0
+                _p(0.85, "超分前卸载引擎（AudioSR 显存互斥）")
+                _log(f"[超分] 卸载引擎 → AudioSR（约 17.8× 实时；"
+                     f"{dur_s:.0f}s 人声预计 {est_min:.0f} 分钟）")
                 if bool(getattr(engine.stats, "loaded", False)):
                     engine.unload(bypass_lease=svc_lease)
                 base = os.path.join(out_dir, "05_vocal_final_22k.wav")
                 AL.save_audio(base, vocal, ENGINE_SR)
+                # 这一步可能长达几十分钟：进度必须停在“超分中”，
+                # 否则心跳会一直显示上一条 F0 文案，看起来像卡死。
+                _p(0.86, f"超分中（AudioSR → 48k，预计约 {est_min:.0f} 分钟）")
                 r = SR.enhance_file(base, ddim_steps=int(req.sr_steps))
                 SR.release_all()
                 if r.get("ok"):
@@ -436,8 +448,10 @@ def run_cover(ctx, req: CoverRequest, progress: Optional[Callable] = None,
                     vocal_sr = r.get("sr", 48000)
                     report["sr"] = {"ok": True, "seconds": r.get("seconds"),
                                     "sr": vocal_sr, "steps": req.sr_steps}
+                    _p(0.92, f"超分完成（{r.get('seconds', 0):.0f}s）")
                 else:
                     report["sr"] = {"ok": False, "error": r.get("error")}
+                    _p(0.92, "超分失败（回退 22k 人声）")
                 timings["superres"] = round(time.perf_counter() - t0, 1)
 
         final_path = sr_path or os.path.join(out_dir, "05_vocal_final_22k.wav")
@@ -556,8 +570,10 @@ def _quality_report(vocal_path: str, ref_path: str, f0_report: Dict,
     except Exception as exc:
         q["analyze_error"] = str(exc)
     if "f0_r" in f0_report:
-        q["f0_r"] = f0_report["f0_r"]
+        q["f0_r"] = f0_report["f0_r"]          # 移植后探针（20s 代表段）
+        q["f0_r_pre"] = f0_report.get("f0_r_pre")
         q["octave_err"] = f0_report.get("octave_err")
+        q["within_50c"] = f0_report.get("within_50c")
         q["f0_mode_used"] = f0_report.get("mode_used")
     q["pass_line"] = {
         "ss": "≥0.75（对角色参考）",

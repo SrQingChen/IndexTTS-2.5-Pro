@@ -359,7 +359,10 @@ def render(ctx: AppContext) -> Dict[str, Any]:
             if "ss" in q:
                 lines.append(f"- 音色相似度 SS = **{q['ss']}**（参考线 ≥0.75）")
             if "f0_r" in q:
-                lines.append(f"- F0 轮廓相关 = **{q['f0_r']}**（参考线 ≥0.85）")
+                extra = (f"，50 音分内 {q['within_50c']:.0%}"
+                         if q.get("within_50c") is not None else "")
+                lines.append(f"- F0 轮廓相关 = **{q['f0_r']}**"
+                             f"（移植前 {q.get('f0_r_pre', '-')}{extra}；参考线 ≥0.85）")
             an = q.get("analyze", {})
             if an:
                 lines.append(f"- 体检：{an.get('grade', '-')} / SNR {an.get('snr_db', 0):.1f}dB"

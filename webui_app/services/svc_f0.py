@@ -39,7 +39,9 @@ FRAME_PERIOD_MS = 5.0       # pyworld 网格（颤音 5-7Hz 采样密度足够�
 FFT_SIZE = 2048             # 2^ceil(log2(3*22050/55))，f0_floor=55 的联动值
 
 HARVEST_WINDOW_SEC = 30.0   # 分窗护栏（与 audio_lab.f0_stats 的 30s 一致）
-HARVEST_OVERLAP_SEC = 1.0   # 窗间重叠，中心线切换 + 帧域线性淡化
+HARVEST_OVERLAP_SEC = 1.0   # 长曲分窗时的重叠（只取中心帧，不做平均）
+HARVEST_EDGE_TRIM_SEC = 1.0  # 长曲分窗丢弃首尾各 1s（窗边缘 F0 不可靠）
+HARVEST_FULL_MAX_SEC = 720.0  # ≤12 分钟整段 harvest（常规歌曲）
 
 REPAIR_CENT_THRESHOLD = 40.0    # 局部修复：偏差阈值（音分）
 REPAIR_MIN_MS = 80.0             # 局部修复：最短持续时间
@@ -66,58 +68,58 @@ def frames_of(duration_samples: int, sr: int, frame_period_ms: float = FRAME_PER
 def harvest_f0(y: np.ndarray, sr: int,
                f0_floor: float = F0_FLOOR_HZ, f0_ceil: float = F0_CEIL_HZ,
                frame_period: float = FRAME_PERIOD_MS) -> np.ndarray:
-    """全曲 F0：分窗 harvest + 重叠区线性淡化拼接。返回 5ms 网格 f0（清音=0）。
+    """全曲 F0（5ms 网格，清音=0）。
 
-    单窗 30s 是内存护栏；300s@22k 实测 RTF≈0.22（CPU），一首 4 分钟歌约 1 分钟。
+    **不再对分窗结果做线性平均**（2026-10-17 实锤）：旧实现用 30s 窗+1s
+    重叠，在重叠区把两个窗边缘的 F0 相加平均——窗边缘常有八度/半频错误，
+    平均后得到 223/264/364 这类中间值，看起来像“F0 跳变/接线错误”。
+    现在：
+    - ≤12 分钟（常规歌曲）整段一次 harvest（pyworld 内存线性，实测
+      300s@22k 67s 可跑；项目历史上 43.7M 样本才 abort）；
+    - 更长才分窗，且**丢弃每窗首尾 1s**、只取窗中心帧，按绝对帧号拼接，
+      重叠/边缘不做任何数值平均。
     """
     pw = _require_pyworld()
     y = np.asarray(y, dtype=np.float64)
     n = len(y)
-    if n < int(0.2 * sr):  # 不足 0.2s 无浊音统计意义
+    if n < int(0.2 * sr):
         return np.zeros(max(frames_of(n, sr, frame_period), 1), dtype=np.float64)
 
-    win = int(HARVEST_WINDOW_SEC * sr)
-    hop = win - int(HARVEST_OVERLAP_SEC * sr)
-    if n <= win:
+    if n <= int(HARVEST_FULL_MAX_SEC * sr):
         f0, _t = pw.harvest(y, sr, f0_floor=f0_floor, f0_ceil=f0_ceil,
                             frame_period=frame_period)
         return np.asarray(f0, dtype=np.float64)
 
-    total_frames = frames_of(n, sr, frame_period)
-    out = np.zeros(total_frames, dtype=np.float64)
-    weight = np.zeros(total_frames, dtype=np.float64)
-
+    total = frames_of(n, sr, frame_period)
+    out = np.zeros(total, dtype=np.float64)
+    filled = np.zeros(total, dtype=bool)
+    win = int(HARVEST_WINDOW_SEC * sr)
+    trim = int(HARVEST_EDGE_TRIM_SEC * sr)
+    hop = max(1, win - 2 * trim)
+    tf = max(1, int(round(trim / (frame_period / 1000.0))))
     start = 0
+    first = True
     while start < n:
         seg = y[start:min(start + win, n)]
-        f0, t = pw.harvest(seg, sr, f0_floor=f0_floor, f0_ceil=f0_ceil,
-                           frame_period=frame_period)
+        f0, _t = pw.harvest(seg, sr, f0_floor=f0_floor, f0_ceil=f0_ceil,
+                            frame_period=frame_period)
         f0 = np.asarray(f0, dtype=np.float64)
-        # 该窗帧 k 的时间戳（秒）→ 全曲网格帧号
         base = int(round((start / sr) / (frame_period / 1000.0)))
-        idx = base + np.arange(len(f0))
-        valid = idx < total_frames
-        if not np.any(valid):
-            break
-        idx_v = idx[valid]
-        f0_v = f0[valid]
-        # 重叠区（与前窗）做帧域线性淡化：窗内前 1s 从 0→1
-        fade_frames = int(HARVEST_OVERLAP_SEC * 1000.0 / frame_period)
-        w = np.ones(len(idx_v), dtype=np.float64)
-        if start > 0 and fade_frames > 0:
-            k = np.arange(len(idx_v))
-            w = np.minimum(w, np.clip(k / max(fade_frames, 1), 0.0, 1.0))
-        out[idx_v] += f0_v * w
-        weight[idx_v] += w
+        a = base if first else base + tf
+        b = base + len(f0) - (0 if start + win >= n else tf)
+        a = max(0, a); b = min(total, b)
+        ra, rb = a - base, b - base
+        if rb > ra:
+            out[a:b] = f0[ra:rb]
+            filled[a:b] = True
         if start + win >= n:
             break
         start += hop
-
-    weight[weight < 1e-6] = 1.0
-    f0 = out / weight
-    # 淡化边界可能出现非物理 0→均值压低，浊音帧低于 floor 的清零
-    f0[(f0 > 0) & (f0 < f0_floor * 0.8)] = 0.0
-    return f0
+    if not filled.all():
+        idx = np.where(filled)[0]
+        if len(idx):
+            out[~filled] = np.interp(np.where(~filled)[0], idx, out[idx])
+    return out
 
 
 def f0_median(f0: np.ndarray) -> float:
@@ -151,6 +153,11 @@ def octave_shift_semis(src_f0: np.ndarray, ref_f0: np.ndarray,
         return 0
     # 移调量 = 把**源**音区搬**上/下**到目标音区（shift_f0 作用在源 F0 上）
     cents = 1200.0 * math.log2(mr / ms)
+    # 同音区（±8 半音内）保留原调：翻唱首先要保调/保旋律，不能因为
+    # “参考说话音高不同”就整首降八度（用户 390Hz 源 vs 257Hz 参考，
+    # 旧逻辑选 -12，既改调又踩 WORLD 下行八度的坑）。
+    if abs(cents) <= 800.0:
+        return 0
     return int(round(cents / 1200.0) * 12)
 
 
@@ -207,10 +214,46 @@ def f0_correlation(f0_a: np.ndarray, f0_b: np.ndarray) -> Tuple[float, float, in
     la_c, lb_c = la - la.mean(), lb - lb.mean()
     denom = math.sqrt(float((la_c ** 2).sum()) * float((lb_c ** 2).sum()))
     r = float((la_c * lb_c).sum() / denom) if denom > 1e-9 else 0.0
+    # 注意：这里先在 log2 域做**全局**八度对齐，再统计 |cents|>600。
+    # 旧写法用 round(cents/1200) 残差，会把局部的 ±12 半音跳变也当成 0
+    # （1200 音分的残差为 0），对“缺基频导致的局部高八度”完全失明。
     cents = 1200.0 * (la - lb)
-    residual = np.abs(cents - np.round(cents / 1200.0) * 1200.0)
-    err = float((residual > 600.0).mean())
+    err = float((np.abs(cents) > 600.0).mean())
     return r, err, n_voiced
+
+
+def _probe_metrics(y: np.ndarray, sr: int, target_f0: np.ndarray,
+                   seconds: float = 20.0) -> dict:
+    """移植后的代表段指标（自动选目标浊音最多的 20s 窗）。
+
+    返回 {r, octave_err, within_50c, voiced}。20s harvest 约几秒，
+    比整首再跑一遍 harvest 便宜得多，足以反映局部八度跳变/抖动。
+    """
+    tf = int(seconds * 1000.0 / FRAME_PERIOD_MS)
+    if len(target_f0) <= tf or len(y) < int(seconds * sr):
+        f = harvest_f0(y, sr)
+        r, e, n = f0_correlation(f, target_f0)
+        return {"r": round(r, 4), "octave_err": round(e, 4), "voiced": n}
+    # 目标浊音密度最高的窗口（步长 5s）
+    step = max(1, int(5.0 * 1000.0 / FRAME_PERIOD_MS))
+    best_s, best_v = 0, -1
+    for st in range(0, len(target_f0) - tf + 1, step):
+        v = int((target_f0[st:st + tf] > 0).sum())
+        if v > best_v:
+            best_v, best_s = v, st
+    a = int(best_s * FRAME_PERIOD_MS / 1000.0 * sr)
+    b = min(len(y), a + int(seconds * sr))
+    f = harvest_f0(y[a:b], sr)
+    tgt = target_f0[best_s:best_s + len(f)]
+    r, e, n = f0_correlation(f, tgt)
+    both = (f > 0) & (tgt > 0)
+    within = 0.0
+    if both.sum() >= 5:
+        la = np.log2(f[both]); lb = np.log2(tgt[both])
+        lb = lb + np.round(np.median(la - lb))
+        within = float((np.abs(1200.0 * (la - lb)) <= 50.0).mean())
+    return {"r": round(r, 4), "octave_err": round(e, 4),
+            "within_50c": round(within, 4), "voiced": n}
 
 
 # ---------------------------------------------------------------------------
@@ -279,15 +322,28 @@ def _interp_to_grid(f0: np.ndarray, n_frames: int) -> np.ndarray:
     return out
 
 
+def _probe_voiced_median(y: np.ndarray, sr: int, seconds: float = 4.0) -> float:
+    """短片段的浊音中位 F0（用于移植后的快速自检，harvest 4s 很便宜）。"""
+    if len(y) < int(0.4 * sr):
+        return 0.0
+    seg = int(seconds * sr)
+    start = min(max(0, int(len(y) * 0.3)), max(0, len(y) - seg))
+    f0 = harvest_f0(y[start:start + seg], sr)
+    return f0_median(f0)
+
+
 def world_replace_f0(y: np.ndarray, sr: int, new_f0: np.ndarray,
                      vuv_gate: bool = True) -> TransplantResult:
     """全曲 F0 移植（保长）。
 
-    - 包络/非周期性用**转换输出自身**的 f0 分析（声道包络是物理属性），
-      激励用 new_f0 合成 —— WORLD 分析-修改-重合成的标准做法。
-    - vuv_gate=True：只在**输出侧浊音帧**替换 F0（防 voiced/unvoiced 错位垃圾声）。
-    - 保长：synthesize 后 [:len(y)]，不足补零（restore_f0_range 模式）。
-    - 谱自检（RMS±4dB / <1kHz 占比±20pp）：不达标回退原波形（韵尾延长的守卫模式）。
+    **包络分析策略是方向相关的**（2026-10-17 实锤，此前固定用合成-F0）：
+    - 上行移调（目标中位 ≥ 输出中位）：用**合成 F0**分析包络——用原 F0 分析
+      会在目标谐波处落在包络谷，合成后基频缺失、被感知成低八度；
+    - 下行移调（目标中位 < 输出中位）：用**输出自身 F0**分析包络——用合成
+      F0（更低）分析会把奇次谐波当成 0，合成后基频被抹掉、harvest 锁到原
+      八度（用户 372→195 实测：中位只降到 305、r 反降）。
+    移植后用 4s 探针核对中位音高，偏差 >0.5 八度则换另一种策略；谱自检
+    （RMS±4dB / <1kHz 占比±20pp）不过则回退原波形。
     """
     y = np.asarray(y, dtype=np.float32)
     if len(y) < int(0.3 * sr):
@@ -299,25 +355,48 @@ def world_replace_f0(y: np.ndarray, sr: int, new_f0: np.ndarray,
 
     new_f0 = _interp_to_grid(np.asarray(new_f0, dtype=np.float64), len(f0_out))
     f0_synth = f0_out.copy()
-    if vuv_gate:
-        gate = f0_out > 0
-    else:
-        gate = np.ones(len(f0_out), dtype=bool)
+    gate = (f0_out > 0) if vuv_gate else np.ones(len(f0_out), dtype=bool)
     use = gate & (new_f0 > 0)
     f0_synth[use] = new_f0[use]
 
+    tgt_med = f0_median(new_f0)
+    out_med = f0_median(f0_out)
+    # 目标明显低于输出 → 下行，用输出 F0 分析包络；否则用合成 F0
+    use_synth_env = not (tgt_med > 0 and out_med > 0 and tgt_med < out_med * 0.94)
+
     pw = _require_pyworld()
+
+    def _render(synth_env: bool) -> np.ndarray:
+        _f, _t, sp, ap = _world_analyze(
+            y, sr, synth_f0=f0_synth if synth_env else None)
+        out = pw.synthesize(f0_synth, sp, ap, sr,
+                            frame_period=FRAME_PERIOD_MS)
+        out = np.asarray(out, dtype=np.float32)
+        if len(out) >= len(y):
+            return out[:len(y)]
+        return np.pad(out, (0, len(y) - len(out)))
+
     try:
-        _f0a, t, sp, ap = _world_analyze(y, sr, synth_f0=f0_synth)
-        y2 = pw.synthesize(f0_synth, sp, ap, sr, frame_period=FRAME_PERIOD_MS)
+        y2 = _render(use_synth_env)
     except Exception as exc:
         return TransplantResult(False, y, reason=f"synthesize 失败: {exc}")
-    y2 = np.asarray(y2, dtype=np.float32)
-    # 保长（对拍红线）
-    if len(y2) >= len(y):
-        y2 = y2[:len(y)]
-    else:
-        y2 = np.pad(y2, (0, len(y) - len(y2)))
+
+    # 探针自检：中位音高应接近目标；否则换另一种包络策略
+    if tgt_med > 0:
+        p2 = _probe_voiced_median(y2, sr)
+        if p2 > 0 and abs(math.log2(p2 / tgt_med)) > 0.5:
+            try:
+                y_alt = _render(not use_synth_env)
+                p_alt = _probe_voiced_median(y_alt, sr)
+                if p_alt > 0 and abs(math.log2(p_alt / tgt_med)) <                         abs(math.log2(p2 / tgt_med)):
+                    y2 = y_alt
+            except Exception:
+                pass
+        p_final = _probe_voiced_median(y2, sr)
+        if p_final > 0 and abs(math.log2(p_final / tgt_med)) > 0.5:
+            return TransplantResult(False, y,
+                                    reason="F0 移植未收敛（中位音高偏差 >0.5 八度，回退）",
+                                    mode="full")
 
     if not _spectral_guard(y, y2, sr):
         return TransplantResult(False, y, reason="谱自检未过（回退原输出）",
@@ -451,6 +530,9 @@ def transplant_f0(y: np.ndarray, sr: int, src_f0: np.ndarray, out_f0: Optional[n
     if mode == "force":
         res = world_replace_f0(y, sr, src)
         metrics["mode_used"] = res.mode
+        if res.ok:
+            metrics["f0_r_pre"] = metrics.get("f0_r")
+            metrics.update(_probe_metrics(res.y, sr, src))
         return res, metrics
     # auto
     if r >= 0.75:
@@ -459,10 +541,15 @@ def transplant_f0(y: np.ndarray, sr: int, src_f0: np.ndarray, out_f0: Optional[n
             metrics["mode_used"] = "repair"
             metrics["repaired_segments"] = res.repaired_segments
             metrics["repaired_sec"] = round(res.repaired_sec, 2)
+            metrics["f0_r_pre"] = metrics.get("f0_r")
+            metrics.update(_probe_metrics(res.y, sr, src))
             return res, metrics
         metrics["repair_fallback"] = res.reason
     res = world_replace_f0(y, sr, src)
     metrics["mode_used"] = res.mode if res.ok else "fallback"
+    if res.ok:
+        metrics["f0_r_pre"] = metrics.get("f0_r")
+        metrics.update(_probe_metrics(res.y, sr, src))
     return res, metrics
 
 

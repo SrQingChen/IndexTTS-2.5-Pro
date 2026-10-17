@@ -75,6 +75,12 @@ class TestSvcF0:
         assert svc_f0.octave_shift_semis(src, src) == 0
         assert svc_f0.octave_shift_semis(ref, src) == -12
         assert svc_f0.octave_shift_semis(src, ref, manual=-5) == -5
+        # 同音区不同音区（390 vs 257，-7.2st）→ 保留原调 0（实锤回归）
+        assert svc_f0.octave_shift_semis(np.full(100, 390.0),
+                                         np.full(100, 257.0)) == 0
+        # 跨音区（男 120 vs 女 257）→ +12
+        assert svc_f0.octave_shift_semis(np.full(100, 120.0),
+                                         np.full(100, 257.0)) == 12
 
     def test_shift_f0(self):
         f0 = np.array([0.0, 220.0, 440.0])
@@ -128,6 +134,15 @@ class TestSvcF0:
         assert len(res.y) == len(y), "保长红线（对拍）"
         f0_new = svc_f0.harvest_f0(res.y, SR)
         assert abs(svc_f0.f0_median(f0_new) - 440.0) < 20
+
+    def test_world_replace_downward_octave(self):
+        """下行八度必须用输出 F0 分析包络（旧实现只降到 305Hz，实锤回归）。"""
+        y = _harmonic(440.0, 1.5)
+        src_f0 = np.full(svc_f0.frames_of(len(y), SR), 220.0)
+        res = svc_f0.world_replace_f0(y, SR, src_f0)
+        assert res.ok, res.reason
+        med = svc_f0.f0_median(svc_f0.harvest_f0(res.y, SR))
+        assert abs(med - 220.0) < 20, f"下行八度未收敛: {med}"
 
     def test_world_replace_garbage_rejects(self):
         """白噪声（无浊音结构）不应崩溃；要么回退要么安全输出。"""
