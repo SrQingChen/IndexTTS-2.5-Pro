@@ -280,6 +280,18 @@ BS-Roformer 与 UVR-DeEcho-DeReverb 已做加载冒烟（6.0s / 0.1s）。
 4. 镜像冷缓存偶发 404（重试即 206）；YAML 只有 944 字节，旧的 1024B
    “就绪阈值”会把它判缺失导致每次推理重下——现按类型阈值（YAML 200B /
    权重 1MiB），且探到的体重<1MiB 视为探测失败。
+5. **separate() 返回相对文件名**（2026-10-17 用户「原歌曲」首次翻唱失败）：
+   audio-separator 0.47 的 `common_separator.py:530` 用单参数 `os.path.join`
+   生成输出名，返回的是相对名；管线用 CWD 调 `os.path.isfile` 判定，导致
+   “两轨已写出却报未找到人声”。`_stem_path` 现按 `out_dir` 解析相对路径。
+6. **模型名里的 "vocals" 污染 stem 匹配**：输出名为
+   `000_(other)_vocals_mel_band_roformer.wav`，旧子串匹配会把伴奏轨当人声。
+   现先剥掉模型名再匹配，并对人声候选排除 instrumental/other 类关键词；
+   去混响的 `no_reverb` 干声不被 `reverb` 排除规则误杀（排除只用于人声
+   分离 both=True）。
+7. **失败路径不落 report.json**：`run_cover` 的早退（依赖缺失/分离失败/VC
+   失败）直接 return，跳过报告写盘，用户无据可查。现统一改为 `_Fail`，
+   经 finally 恢复引擎后仍写完整 report.json；UI 侧也补 warning 日志。
 
 **已知环境告警**：`onnxruntime-gpu 1.31`（CUDA 13 编译）与项目 torch
 `2.8+cu128`（CUDA 12.8）不匹配，启动时打印 cublasLt/cudart 加载失败。

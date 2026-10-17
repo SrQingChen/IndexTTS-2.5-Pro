@@ -197,6 +197,10 @@ class _Stop(Exception):
     pass
 
 
+class _Fail(Exception):
+    """可预期的失败：走统一出口（finally 恢复引擎 + 落 report.json）。"""
+
+
 def _check_stop(should_stop):
     if should_stop is not None and should_stop():
         raise _Stop()
@@ -249,8 +253,9 @@ def run_cover(ctx, req: CoverRequest, progress: Optional[Callable] = None,
         if req.input_state == "song":
             from webui_app.services import separation as SEP
             if not SEP.available():
-                return {**report, "error": "audio-separator 未安装："
-                        " pip install \"audio-separator[gpu]\"，或在输入状态选择『干净人声』绕过分离"}
+                raise _Fail("audio-separator 未安装：pip install "
+                            "\"audio-separator[gpu]\"，或在输入状态选择"
+                            "『干净人声』绕过分离")
             _log("[分离] 卸载引擎 → 人声分离（不改时长，保对拍）")
             if was_loaded or bool(getattr(engine.stats, "loaded", False)):
                 engine.unload(bypass_svc=True)
@@ -262,7 +267,7 @@ def run_cover(ctx, req: CoverRequest, progress: Optional[Callable] = None,
                 raise _Stop()
             _check_stop(should_stop)
             if not sep_res.get("ok"):
-                return {**report, "error": f"分离失败: {sep_res.get('error')}"}
+                raise _Fail(f"分离失败: {sep_res.get('error')}")
             vocal_path = sep_res["vocals"]
             bgm_path = sep_res.get("instrumental")
             _log(f"[分离] 完成 {sep_res['seconds']}s → {os.path.basename(vocal_path)}")
@@ -336,7 +341,7 @@ def run_cover(ctx, req: CoverRequest, progress: Optional[Callable] = None,
         if not conv.ok:
             if conv.reason == "用户停止":
                 raise _Stop()
-            return {**report, "error": f"VC 转换失败: {conv.reason}"}
+            raise _Fail(f"VC 转换失败: {conv.reason}")
         vc_path = os.path.join(out_dir, "03_converted_22k.wav")
         AL.save_audio(vc_path, conv.wav, ENGINE_SR)
         report["vc"] = {"chunks": conv.chunks, **conv.timing}
@@ -480,6 +485,8 @@ def run_cover(ctx, req: CoverRequest, progress: Optional[Callable] = None,
     except _Stop:
         report["error"] = "用户停止"
         report["stopped"] = True
+    except _Fail as exc:
+        report["error"] = str(exc)
     except Exception as exc:
         report["error"] = f"{type(exc).__name__}: {exc}"
         import traceback

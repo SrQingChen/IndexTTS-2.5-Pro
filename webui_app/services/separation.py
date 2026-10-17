@@ -445,12 +445,33 @@ def _make_separator(out_dir: str):
     )
 
 
-def _stem_path(files: List[str], keys: List[str]) -> Optional[str]:
-    """从 separate() 返回的输出文件名里按关键字找 stem。"""
+def _stem_path(files: List[str], keys: List[str], out_dir: str,
+               model_name: str = "", exclude_keys: Optional[List[str]] = None
+               ) -> Optional[str]:
+    """从 separate() 返回里定位 stem，返回**绝对路径**。
+
+    两个实锤坑（2026-10-17 用户翻唱失败）：
+    1. audio-separator 0.47 部分路径返回**相对文件名**（common_separator.py:530
+       的 os.path.join 只有一个参数）。直接 os.path.isfile 会以 CWD 判定，
+       于是“人声明明写出来了却报未找到”。
+    2. 输出名形如 `000_(other)_vocals_mel_band_roformer.wav`——模型名里
+       带 "vocals"，用子串匹配会把 other/伴奏轨当成人声。必须先从文件名里
+       剥掉模型名再匹配；人声候选还要排除 instrumental 类关键词。
+    """
+    ex = [k.lower() for k in (exclude_keys or [])]
+    model_l = (model_name or "").lower()
     for f in files:
-        base = os.path.basename(f).lower()
-        if any(k.lower() in base for k in keys):
-            return f
+        p = f if os.path.isabs(f) else os.path.join(out_dir, os.path.basename(f))
+        if not os.path.isfile(p):
+            continue
+        base = os.path.basename(p).lower()
+        stem_area = base[:-4] if base.endswith(".wav") else base
+        if model_l:
+            stem_area = stem_area.replace(model_l, "")
+        if any(k in stem_area for k in ex):
+            continue
+        if any(k.lower() in stem_area for k in keys):
+            return p
     return None
 
 
@@ -526,8 +547,11 @@ def _run_sep(src_path: str, out_dir: str, model_name: str,
         return {"ok": False, "error": f"分离失败: {exc}", "model": model_name}
 
     seconds = time.perf_counter() - t0
-    vocals = _stem_path(files, vocal_keys)
-    instrumental = _stem_path(files, inst_keys) if both else None
+    # 排除规则只用于“人声 vs 伴奏”（both=True）。去混响的干声叫
+    # no_reverb，若拿 inst_keys=["reverb"] 去排除会把干声误杀。
+    vocals = _stem_path(files, vocal_keys, out_dir, model_name,
+                        exclude_keys=inst_keys if both else None)
+    instrumental = _stem_path(files, inst_keys, out_dir, model_name) if both else None
     ok_v = vocals is not None and os.path.isfile(vocals)
     if not ok_v:
         release_all()

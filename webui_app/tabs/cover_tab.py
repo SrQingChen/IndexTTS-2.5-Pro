@@ -332,6 +332,8 @@ def render(ctx: AppContext) -> Dict[str, Any]:
                 lp.stop()
 
             if not report.get("ok"):
+                LOG.get_logger("cover").warning("翻唱失败：%s",
+                                                report.get("error", "未知错误"))
                 return (f"❌ 失败：{report.get('error', '未知错误')}",
                         None, None, [])
             return _render_report(report)

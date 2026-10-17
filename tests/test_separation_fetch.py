@@ -38,6 +38,41 @@ class TestMirrors:
                         "https://b/https://github.com/x/y",
                         "https://github.com/x/y"]
 
+    def test_stem_path_resolves_relative_and_model_name(self, tmp_path):
+        """实锤回归：0.47 返回相对文件名；模型名里的 "vocals" 不能把
+        other 轨当成人声。"""
+        model = "vocals_mel_band_roformer"
+        other = tmp_path / f"000_(other)_{model}.wav"
+        voc = tmp_path / f"000_(vocals)_{model}.wav"
+        other.write_bytes(b"x")
+        voc.write_bytes(b"x")
+        files = [other.name, voc.name]          # 相对文件名
+        got_v = S._stem_path(files, ["vocals", "vocal"], str(tmp_path),
+                             model, exclude_keys=["instrumental", "other"])
+        got_i = S._stem_path(files, ["instrumental", "other"], str(tmp_path), model)
+        assert got_v == str(voc)
+        assert got_i == str(other)
+
+    def test_stem_path_dereverb_prefers_no_reverb(self, tmp_path):
+        """去混响干声 no_reverb 不能被“reverb”排除规则误杀。"""
+        model = "UVR-DeEcho-DeReverb"
+        wet = tmp_path / f"000_(reverb)_{model}.wav"
+        dry = tmp_path / f"000_(no_reverb)_{model}.wav"
+        wet.write_bytes(b"x")
+        dry.write_bytes(b"x")
+        got = S._stem_path([wet.name, dry.name],
+                           ["no_reverb", "noreverb", "dry", "vocals", "vocal"],
+                           str(tmp_path), model, exclude_keys=None)
+        assert got == str(dry)
+
+    def test_stem_path_no_vocals_not_vocals(self, tmp_path):
+        model = "some_model"
+        p = tmp_path / f"000_no_vocals_{model}.wav"
+        p.write_bytes(b"x")
+        got = S._stem_path([p.name], ["vocals"], str(tmp_path), model,
+                           exclude_keys=["no_vocals", "instrumental"])
+        assert got is None
+
     def test_all_exposed_models_have_pairs(self):
         exposed = set(S.VOCALS_MODELS.values()) | set(S.DEREVERB_MODELS.values())
         for name in exposed:
@@ -164,15 +199,17 @@ class TestRunSepPrefetch:
             def load_model(self, model_filename):
                 pass
             def separate(self, path):
-                v = out_dir / "vocals.wav"
-                i = out_dir / "instrumental.wav"
+                v = out_dir / "000_(vocals)_some_model.wav"
+                i = out_dir / "000_(other)_some_model.wav"
                 v.write_bytes(b"x" * 100)
                 i.write_bytes(b"y" * 100)
-                return [str(v), str(i)]
+                # 0.47 实锤：返回相对文件名，管线必须自行解析
+                return [i.name, v.name]
 
         monkeypatch.setattr(S, "_make_separator", lambda out: _Sep())
         monkeypatch.setattr(S, "_vram_free_gb", lambda: 6.0)
         r = S._run_sep(str(src), str(out_dir), S.DEFAULT_VOCALS,
-                       ["vocals"], ["instrumental"])
+                       ["vocals"],
+                       ["instrumental", "accompaniment", "no_vocals", "other"])
         assert r["ok"], r
         assert r["instrumental"]

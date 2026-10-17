@@ -361,6 +361,42 @@ class TestCoverPipeline:
         assert rep.get("ok"), f"clean 路由失败: {rep.get('error')}"
         assert os.path.isfile(os.path.join(rep["out_dir"], "02_dry_vocal_22k.wav"))
 
+    def test_run_cover_failure_writes_report(self):
+        """失败也必须落 report.json（2026-10-17 用户翻唱断链时无报告可查）。"""
+        import tempfile
+        from unittest.mock import patch
+        import soundfile as sf
+        from webui_app.services import separation as SEP
+        tmp = tempfile.mkdtemp()
+        src = os.path.join(tmp, "src.wav")
+        ref = os.path.join(tmp, "ref.wav")
+        sf.write(src, _melody(seconds=1.5), SR, subtype="PCM_16")
+        sf.write(ref, _harmonic(330.0, 1.5), SR, subtype="PCM_16")
+
+        class _Stats:
+            loaded = False
+        class _Eng:
+            stats = _Stats()
+            def load(self): _Stats.loaded = True
+            def unload(self, bypass_svc=False): _Stats.loaded = False
+            def begin_svc(self, label): pass
+            def end_svc(self, label): pass
+            def lora_status(self): return []
+        class _Ctx:
+            engine = _Eng()
+
+        req = CP.CoverRequest(src_path=src, input_state="song", ref_path=ref,
+                              f0_mode="off")
+        with patch.object(SEP, "available", lambda: False):
+            rep = CP.run_cover(_Ctx(), req)
+        assert not rep.get("ok")
+        assert "audio-separator" in (rep.get("error") or "")
+        rp = os.path.join(rep["out_dir"], "report.json")
+        assert os.path.isfile(rp), "失败路径必须写 report.json"
+        import json
+        disk = json.load(open(rp, encoding="utf-8"))
+        assert disk.get("ok") is False and disk.get("error")
+
     def test_highpass(self):
         low = _harmonic(40.0, 1.0)   # 40Hz 低频
         out = CP.highpass(low, SR, 70.0)
