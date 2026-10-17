@@ -7,30 +7,35 @@
 
 # IndexTTS-2.5 Pro
 
-**零样本语音克隆 · 导演模式逐句编排 · 一键三连全自动训练 · LoRA 自训练 · DPO 对齐 · A/B 评测 · 合并部署**
+**零样本语音克隆 · 导演模式逐句编排 · 一键三连全自动训练 · 🎤 AI 翻唱 / 变声 · E1-T 歌声高音外推 · 8GB 显存友好**
 
-基于 [IndexTTS-2.5](https://github.com/index-tts/index-tts) 构建的增强工程：**底座模型与推理引擎一行不改**，
-在它周围补齐三件上游没有的事——一个 **14 页可视化控制台**、一条 **完整的自训练流水线**、
-一层 **推理期的表现力系统**（导演模式 / 逐句情感路由 / Best-of-N 择优）。
+基于 [IndexTTS-2.5](https://github.com/index-tts/index-tts) 构建的增强工程。上游给了业界领先的
+「声音」，本项目补齐让它「**演起来**」「**练起来**」「**唱起来**」的全部工程：
 
-**最省事的入口是「🚀 一键三连」**：丢一段长音频或一堆短音频进去，点一个按钮，
-它会自动切片、降噪归一、SenseVoice 识别与对齐（专名拼音纠错）、按数据量挑参数、
-训练 LoRA、真机打分择优，最后交付评分最高的模型并直接挂到推理页可用。
+- **一个 16 页可视化控制台** —— 每个参数带悬停提示与参数手册；
+- **一条完整自训练流水线** —— LoRA（GPT 语气 + CFM 音色）→ DPO 对齐 → 自动 A/B → 合并部署；
+- **一层推理期表现力系统** —— 导演模式 / 逐句情感路由 / Best-of-N 择优 / 停顿五层治理；
+- **原生歌声引擎（2026-10）** —— 绕 GPT 的 AI 翻唱/变声管线 + **E1-T 音高·技巧条件化歌声模型**
+  （把「音高 → 音色」的映射学进 CFM，让说话参考也能唱出稳定高音，而不是靠移调硬拉）。
 
-[![Author](https://img.shields.io/badge/作者-SrQingChen-blue?logo=github)](https://github.com/SrQingChen)
-[![Repo](https://img.shields.io/badge/GitHub-IndexTTS--2.5--Pro-181717?logo=github)](https://github.com/SrQingChen/IndexTTS-2.5-Pro)
-[![Base](https://img.shields.io/badge/上游-IndexTTS--2.5-D0021B)](https://github.com/index-tts/index-tts)
-[![Model](https://img.shields.io/badge/底座模型-零改动-505050)](#1-项目简介)
-[![Version](https://img.shields.io/badge/版本-2026.09-6C8EBF)](#8-自训练指南从数据集到部署)
+**最省事的入口是「🚀 一键三连」**：丢一段长音频进去点一个按钮，自动切片、降噪、
+SenseVoice 识别对齐、按数据量挑参数、训练 LoRA、真机打分择优，交付即用。
+**最好玩的入口是「🎤 AI 翻唱」**：原歌曲进、角色音色出，自动分离去混响、旋律移植、
+BGM 回混；训练过 E1-T capability 后高音区不再嘶哑。
 
-[![Tests](https://img.shields.io/badge/测试-26套%20·%201644项通过-3Cb043)](#9-测试与验证)
-[![E2E](https://img.shields.io/badge/真机验收-7套端到端-2E8B57)](#9-测试与验证)
-[![VRAM](https://img.shields.io/badge/显存-8GB%20友好-9B59B6)](#4-环境要求)
-[![Platform](https://img.shields.io/badge/平台-Windows%20·%20Linux-007EC6)](#4-环境要求)
+[![Author](https://img.shields.io/badge/作者-SrQingChen-2f6fed?logo=github&logoColor=white)](https://github.com/SrQingChen)
+[![Upstream](https://img.shields.io/badge/上游-IndexTTS--2.5-e34c26?logo=github&logoColor=white)](https://github.com/index-tts/index-tts)
+[![Weights](https://img.shields.io/badge/上游权重-零改动·hash守护-brightgreen)](#9-测试与验证)
+[![Singing](https://img.shields.io/badge/E1--T-音高·技巧条件化歌声-ff69b4)](#714-原生歌声引擎ai-翻唱--变声--e1-t)
+[![Cover](https://img.shields.io/badge/AI翻唱-分离·移植·回混-9b59b6)](#714-原生歌声引擎ai-翻唱--变声--e1-t)
+[![BoN](https://img.shields.io/badge/Best--of--N-逐句择优-f39c12)](#2-核心特性)
+[![Tests](https://img.shields.io/badge/测试-123项通过-3Cb043)](#9-测试与验证)
+[![VRAM](https://img.shields.io/badge/显存-8GB%20友好-8e44ad)](#4-环境要求)
+[![Platform](https://img.shields.io/badge/平台-Windows%20%7C%20Linux-007EC6?logo=windows&logoColor=white)](#4-环境要求)
 [![Python](https://img.shields.io/badge/Python-3.10%20%7C%203.11-3776AB?logo=python&logoColor=white)](#4-环境要求)
-[![License](https://img.shields.io/badge/许可-分层（见下）-yellow)](#13-许可证)
+[![License](https://img.shields.io/badge/许可-分层·GPL--3.0%20新增代码-yellow)](#13-许可证)
 
-[功能特性](#2-核心特性) · [与上游对照](#1-项目简介) · [界面预览](#3-界面总览) · [安装](#5-安装) · [快速上手](#6-快速上手) · [自训练指南](#8-自训练指南从数据集到部署) · [测试验证](#9-测试与验证) · [FAQ](#10-常见问题-faq) · [许可证](#13-许可证)
+[功能特性](#2-核心特性) · [与上游对照](#1-项目简介) · [安装](#5-安装) · [快速上手](#6-快速上手) · [AI 翻唱 / E1-T](#714-原生歌声引擎ai-翻唱--变声--e1-t) · [自训练指南](#8-自训练指南从数据集到部署) · [测试验证](#9-测试与验证) · [许可证](#13-许可证)
 
 </div>
 
@@ -60,13 +65,14 @@
 
 IndexTTS-2.5 Pro 是 [IndexTTS-2.5](https://github.com/index-tts/index-tts) 的增强分支，由 [SrQingChen](https://github.com/SrQingChen) 开发维护。
 
-上游提供了业界领先的零样本语音克隆**模型**。本项目不改模型，围绕它补齐三块工程侧能力：
+上游提供了业界领先的零样本语音克隆**模型**。本项目围绕它补齐四块工程侧能力：
 
-1. **一个真正好用的可视化控制台。** 上游的 `webui.py` 是单页长表单，参数挤在一起、没有提示、没有工作流。本项目将其重构为 **14 个职责清晰的功能页**：每个参数都带悬停提示与参数手册，并新增参考音频工作台、情感参考库、批量生产、预设管理、模型下载、系统监控、产物清理等页面。
+1. **一个真正好用的可视化控制台。** 上游的 `webui.py` 是单页长表单，参数挤在一起、没有提示、没有工作流。本项目将其重构为 **16 个职责清晰的功能页**：每个参数都带悬停提示与参数手册，并新增参考音频工作台、情感参考库、批量生产、预设管理、模型下载、系统监控、AI 翻唱 / 变声页、产物清理等页面。
 2. **一条完整的自训练流水线。** 上游只有推理。本项目实现了 **LoRA 自训练（GPT 语气 + CFM 音色）→ DPO 偏好对齐 → 自动 A/B 评测 → 合并部署** 的完整闭环，并配有九道泛化保护防线，专门解决「微调完读错字、语气发飘」这类常见翻车。
-3. **一层推理期的表现力系统（2026-09 新增）。** 上游长文本按标点切段后插**固定 200ms 静音**拼接、整段共用一份情感条件。本项目的**导演模式**把文本交给导演层逐句拆分、标情绪、排停顿（按标点与情绪浮动 + 抖动），再逐句合成拼接；每句按情绪自动路由到「情感参考库」里该角色的参考音频；还可开启**逐句 Best-of-N 择优**（多候选 + 四项 reward 重排，打分跑 CPU 不抢显存）—— 这是「音色像但语气平」的系统性解法。
+3. **一层推理期的表现力系统（2026-09）。** 上游长文本按标点切段后插**固定 200ms 静音**拼接、整段共用一份情感条件。本项目的**导演模式**把文本交给导演层逐句拆分、标情绪、排停顿，再逐句合成拼接；每句按情绪自动路由到「情感参考库」里该角色的参考音频；还可开启**逐句 Best-of-N 择优** —— 「音色像但语气平」的系统性解法。
+4. **原生歌声引擎（2026-10）。** 上游是纯语音模型，唱歌高音必破。本项目新增**绕 GPT 的原生翻唱/变声管线**（分离→去混响→内容保持转换→旋律移植→BGM 回混），并进一步落地 **E1-T 歌声条件化模型**：用公开歌声数据教会 CFM「这个音高/技巧下音色该长什么样」（逐帧 TimbreConditioner 残差，YingMusic-SVC 同构 + 零初始化护栏），让**只有说话参考的角色**也能唱出音色不崩的高音 —— 采样级移调（WORLD）退居兜底。
 
-**工程红线：** 官方 `webui.py` 一行未改，`indextts/` 推理引擎原样使用。本项目的全部改动都是新增文件，两个入口可以并存、互不干扰。
+**工程红线：** 官方 `webui.py` 一行未改；上游**权重**（s2mel.pth / gpt.pth / BigVGAN）字节级零改动并由 hash 测试守护。E1-T 对上游**模型代码**做了可选参数 + 配置门控级的修改（`f0=None` 时逐位等价原路径，冻结参照测试固化），歌声第二曲线使用独立权重与配置（`s2mel_singing.pth` / `config_singing.yaml`），默认 TTS 永不加载 —— 详见 [NOTICE](NOTICE) 与 [E1-T 规划](docs/dev-plan-e1t-2026-10.md)。
 
 ### 与上游的能力对照
 
@@ -97,18 +103,32 @@ IndexTTS-2.5 Pro 是 [IndexTTS-2.5](https://github.com/index-tts/index-tts) 的�
 | 自动 A/B 评测 | ❌ | ✅ 同文本同种子对比，WER / 声纹 / 情绪 / reward 四指标 + 逐条试听 |
 | 合并部署 | ❌ | ✅ ΔW 合并回独立权重；adapter 强度旋钮 0~1.5 实时调 |
 
-#### ③ 工程化与体验
+#### ③ 歌声与翻唱（2026-10 批次，上游完全没有）
 
 | 能力 | 上游 | 本项目 |
 |---|:---:|---|
-| 界面 | ❌ 单页长表单 | ✅ 14 个功能页，共用一份参数注册表（含全部新参数的详细手册） |
+| AI 翻唱 | ❌ | ✅ **原生管线**（绕 GPT：分离→去混响→w2v-BERT 内容保持转换→旋律移植→BGM 回混），对拍红线全链守护（块级保长/头偏移补回/静音块直通） |
+| 高音嘶哑 | ❌ 语音模型唱歌必破 | ✅ **E1-T 音高·技巧条件化**：逐帧 TimbreConditioner 残差（连续归一化 log-F0 + uv 通道 + 软截断 + 零初始化），说话参考也能唱稳高音；WORLD 移调退居兜底 |
+| 唱法技巧 | ❌ | ✅ 7 类 technique 条件（mixed/falsetto/breathy/pharyngeal/vibrato/glissando/control）+ 轻量分类器自动标注 |
+| 高音择优 | ❌ | ✅ **BoN 高音块择优**：HNR + 50 音分内 + 八度错误 + 全局掉八度罚 + SS 奖励重排 |
+| AI 变声 | ❌ | ✅ 文件/准实时双模式，流式分块 + 左上下文 + 等功率淡化（WORLD 方向感知移植） |
+| 音域适配 | ❌ | ✅ 分数音区映射（保旋律）+ 整首降调/人声升回两档输出 + SHC 八度估计错误修正 |
+| 显存 | — | ✅ 30s 智能分块 + 编码器分窗 + GPT 让出 + 阶段卸载（C2）+ OOM 自动降档 |
+
+#### ④ 工程化与体验
+
+| 能力 | 上游 | 本项目 |
+|---|:---:|---|
+| 界面 | ❌ 单页长表单 | ✅ 16 个功能页，共用一份参数注册表（含全部新参数的详细手册） |
 | 参考音频工具 | ❌ | ✅ 体检打分 / 智能切片 / 分频段降噪 / 音色库 |
 | 拼音纠音 | 手写标注 | ✅ 候选音列表 + 词表过滤 + `<字|拼音>` 一键插入 |
 | 模型下载 | 手动 | ✅ 完整性审计 + 镜像优先三级回退 + 断点续传 |
 | 批量生产 | 部分 | ✅ 多行 / JSONL 驱动 + 进度可视 + 打包下载 |
 | 产物管理 | ❌ 手动翻目录 | ✅ 清理页：逐项明细 + 确认弹窗 + 越权防护 |
 
-> **不做什么**：不改上游推理代码、不 fork 模型权重、不做蒸馏/量化改造 —— 上游更新时本项目原地跟进。
+> **不做什么**：不 fork 模型权重、不做蒸馏/量化改造；上游权重的字节级零改动由
+> `tests/baseline_tts_hashes.json` + 回归测试守护。E1-T 对上游模型代码的修改是
+> 「可选参数默认 None + 配置门控」级（详见 NOTICE 第 6 条），`f0=None` 时逐位等价。
 
 ---
 
@@ -181,26 +201,28 @@ IndexTTS-2.5 Pro 是 [IndexTTS-2.5](https://github.com/index-tts/index-tts) 的�
 
 顶栏是实时状态条：GPU 型号、引擎加载状态、显存占用、低显存模式、QwenEmotion 状态一目了然。主区上方为功能页导航，右侧提供可折叠的参数详解，鼠标悬停任意参数都有逐项提示。
 
-### 14 个功能页
+### 16 个功能页
 
 ![合成页（含导演模式）](assets/ui/01_synthesis.png)
 
 | 页面 | 干什么 |
 |---|---|
 | 🎙 **合成** | 单条合成全参数 + **导演模式**（逐句编排 / 情感路由 / 逐句择优 BoN / 双解锁实验开关）+ `<字|拼音>` 读音标注 |
+| 🎤 **AI 翻唱** | 原歌曲/干声 → 角色音色整曲翻唱：分离去混响 · F0 旋律移植 · 音域适配 · **E1-T 歌声模型**（音高/技巧条件化 + BoN 高音择优）· BGM 回混 · report.json |
+| 🎧 **AI 变声** | 文件/准实时变声，流式分块 + 左上下文 + 等功率淡化 |
 | 🔬 **音频工作台** | 体检打分 · 智能切片 · 分频段降噪归一 · 音色库管理 |
 | 🎭 **情感参考库** | 角色 × 8 情绪归档示范台词，支持 emotion2vec **自动打标入库** —— 导演模式逐句路由的数据源 |
 | 📦 **批量** | 多行文本 / JSONL 驱动，进度实时，结果打包下载 |
 | 💾 **预设** | 参数快照，与官方 `webui.py` 互通 |
 | 🚀 **一键三连** | 丢音频进来一个按钮全自动：切片 → 优化 → SenseVoice 识别对齐 → 自动调参 → 训练 → 真机择优 |
-| 🗂 **数据集** | 建集 / 导入 / 补文本 / train-val 划分 / 特征离线提取（断点续提） |
-| 🎓 **训练** | GPT / CFM / DPO 三目标 LoRA 训练 + 🎭 表现力预设 + 保险库 |
+| 🗂 **数据集** | 建集 / 导入 / 补文本 / train-val 划分 / 特征离线提取（断点续提，singing 模式带 F0/技巧标签） |
+| 🎓 **训练** | GPT / CFM / DPO 三目标 LoRA 训练 + 🎭 表现力预设 + 保险库（CFM 支持 singing 条件训练） |
 | ⚖️ **对齐** | 候选合成 → 奖励打分 → DPO 偏好对构造 |
-| 🏁 **评测/部署** | A/B 对比 · adapter 挂载强度旋钮 · 合并独立权重 · 泛化保护面板 |
+| 🏁 **评测/部署** | A/B 对比 · adapter 挂载强度旋钮 · 合并独立权重（含 cfm_singing 歌声合并）· 泛化保护面板 |
 | 📥 **模型** | 资源审计 + 镜像优先三级回退下载，断点续传 |
-| 🖥 **系统** | 显存监控 · 环境体检 · 调试日志 · 缓存维护 |
+| 🖥 **系统** | 显存监控 · 环境体检 · 调试日志 · 缓存维护 · 连续性模式/阶段卸载开关 |
 | 🧹 **清理** | 全部产物逐条盘点，单项/整类删除，确认弹窗 + 越权防护 |
-| 📖 **手册** | 架构原理 + 全部参数逐项说明（含导演模式/训练/一键三连全部旋钮）+ 配方 + 排查 |
+| 📖 **手册** | 架构原理 + 全部参数逐项说明（含导演模式/训练/翻唱/E1-T 全部旋钮）+ 配方 + 排查 |
 
 > 「🎙 合成」页里还内嵌了一块 <b>LoRA 音色模型</b> 面板：直接选训练记录与档位、
 > 调强度旋钮、挂载/卸载，挂上之后照常点「生成」就是那个音色。
@@ -252,7 +274,7 @@ uv sync --extra webui
 uv run tools/model_fetcher.py --version 2.5 --all
 
 # 4) 启动
-uv run webui_pro.py          # 本项目：14 页控制台
+uv run webui_pro.py          # 本项目：16 页控制台
 uv run webui.py              # 上游：单页界面（原样保留，可对照使用）
 ```
 
@@ -660,6 +682,92 @@ IndexTTS-2.5 是零样本 TTS，音色几乎完全由参考音频决定（CAMPPl
 - **走正规删除通道**：数据集、训练记录、音色分别调用各自的删除 API，索引文件（如音色库 `index.json`）同步更新，不会留下悬空条目；
 - 与「🖥 系统 → 磁盘清理」的分工：系统页是**快速清空整目录**（合成产物 / 工作台中间件 / 批量任务），清理页是**看清楚每一项再决定删不删**。
 
+### 7.14 原生歌声引擎（AI 翻唱 / 变声 / E1-T）
+
+> 完整规划见 `docs/dev-plan-ai-cover-vc-2026-10.md`（翻唱/变声）与
+> `docs/dev-plan-e1t-2026-10.md`（E1-T 歌声条件化）；实施记录见
+> `docs/dev-log-e1t-impl-2026-10.md`。
+
+**🎤 AI 翻唱（离线整曲）**
+
+```
+原歌曲 → BS-Roformer 人声分离（保对拍）→ UVR 去混响 → 预处理（去DC/边缘静音/增益保护）
+      → 原生 VC 转换（绕 GPT：w2v-BERT 内容 + RVQ 量化重构 + CFM 渲染 + BigVGAN）
+      → F0 旋律移植（WORLD 方向感知）→ 后处理（高通/间隙de-esser/浊音HF限幅/频谱对齐）
+      → 可选 AudioSR 超分 → 可选 BGM 回混 → report.json 质量报告（SS/F0/体检）
+```
+
+实现方式与工程红线：
+
+- **内容保持转换**：复用引擎的 w2v-BERT → 语义码本量化重构（变体 A，与 TTS 生成同域）
+  → length_regulator → CFM，只换音色不换内容；**不经过 GPT**（歌声不需要文本自回归）。
+- **对拍四守护**：块级严格保长（trim/pad 到源窗样本数）、预处理裁掉的前奏静音在回混时
+  头偏移补回、分块输入重叠 = 交叉淡化时长（不重叠=每块净丢 40ms）、分离/去混响不改时长。
+- **分块策略**：目标块界 ±5s 搜能量谷（歌唱气口）切点、硬切点吸附 mel 帧栅格 + 90ms
+  加大重叠、纯静音块（间奏）跳过模型保长直通；按显卡总量定安全块长（8GB→30s），
+  空闲显存只收紧不放宽（WDDM 下 free 不可靠）；OOM 自动减半重跑一次。
+- **旋律移植**：harvest 全曲 F0（≤12min 整段，不做会引入中间值的窗平均）→ SHC 式八度
+  估计错误修正（只修短促回返跳变，戏腔真实大跳保留）→ 音区映射 → WORLD 保共振峰移植
+  （上行用合成 F0 分析包络 / 下行用输出自身 F0，方向感知；4s 探针不收敛自动换策略/回退）。
+- **AI 变声页**：同一转换核心的文件/准实时双模式；流式分块 + 2s 左上下文 + 等功率淡化，
+  实时块级 F0 跟随。
+
+**🎵 E1-T 音高·技巧条件化歌声模型（实验性，默认关）**
+
+解决的问题：翻唱在中高音区（350-450Hz）破音 —— 取证实锤主要掉话发生在 CFM 转换阶段，
+而上游 CFM 是纯语音训练、**没有 F0 条件**，高音区的声道/声门源谱包络没学过。
+
+实现方式（三层隔离，默认 TTS 完全不受影响）：
+
+```
+说话参考（身份） + 公开歌声 capability（一次训练，全角色共享） + 角色 identity LoRA（每角色）
+        ↓ 推理
+源干声 F0（SHC 修正 + 分数音区映射）+ technique 标签（分类器/手动/保持）
+        → CFM(F0_emb, Tech_emb, ref identity) → mel → BigVGAN → 可选 BoN 高音择优
+```
+
+- **TimbreConditioner**（`indextts/s2mel/modules/conditioners.py`）：
+  `style_t(t) = style + α·MLP([MLP_f0([z̃;uv]); Emb_tech; style])` 逐帧替换全局 style。
+  连续 speaker 归一化 log2-F0 + 独立 uv 通道 + `4·tanh` 软截断（可外推不饱和）；
+  **残差末层零初始化**（训练起点严格等价原模型）；CFG null 分支**旁路** conditioner
+  （与预训练 null 语义逐位同型，不做会漂移的输入置零）。
+- **训练链**：GTSinger 导入工具（含音频域移调增广，标签与 mel 同源一致）→ singing 特征
+  （F0/tech 与 mel 帧对齐）→ capability LoRA + conditioner 全训 → merge 到
+  `checkpoints/s2mel_singing.pth`（合并白名单只放行歌声新名字，绝不覆盖 s2mel.pth）。
+- **推理编排**：翻唱页勾选「歌声模型」→ 会话内换装 singing CFM（98M 独立副本，结束
+  自动恢复 + 按序卸载 LoRA）→ 逐块条件化转换；F0 auto 模式自动降级为「只测量不移植」
+  （WORLD 全曲移植会重写音色，退居兜底）；报告新增 HNR 代理/高音子集/逐句口径。
+- **BoN 高音择优**：仅对高音块（浊音 p75 ≥ 350Hz）生成 ≤3 候选，奖励 =
+  HNR + 50 音分内 − 八度错误 − **全局掉八度罚** + 声纹相似度，明细进报告。
+- **SYKI 式源高频移植**（可选开关）：转换结果低通 + 源干声 >9kHz 幅度对齐加回，
+  零训练的高频应急（ICASSP 2025 有消融背书；22k 引擎下收益带宽有限，如实标注）。
+
+**🖥 阶段卸载（C2，系统页实验开关）**：`infer_v2_5` 新增可选 `stage_hooks`（默认 None
+=上游原路径），参考特征构建后把 w2v-BERT 搬 CPU、末段 GPT 生成完搬 CPU，把显存让给
+CFM/BigVGAN——收益是更少切段/更长块，不是音质；结束/异常自动搬回。
+
+<details>
+<summary><b>📦 E1-T 能力部署流程（从零到翻唱页可用，约四步）</b></summary>
+
+```bash
+# ① 数据：从 HuggingFace 下载 GTSinger（CC BY-NC-SA 4.0，商用需另获授权）后导入
+.venv/Scripts/python.exe tools/gtsinger_import.py --src D:/data/GTSinger     --dataset gtsinger_zh_en --langs zh,en --pitch-aug "-12,+12"
+
+# ② 特征（singing 模式，带 F0/技巧标签）：数据集页勾选 singing 或 CLI
+.venv/Scripts/python.exe -c "from webui_app.training.features import extract_dataset;     extract_dataset('gtsinger_zh_en', singing=True)"
+
+# ③ capability 训练（训练页 CFM LoRA 勾选 singing；或 CLI 传 cfg_path）
+#    → 合并（评测/部署页，arch 选 cfm_singing）产出 checkpoints/s2mel_singing.pth
+
+# ④ 翻唱页：选角色 identity LoRA + 勾选「歌声模型（E1-T 实验性）」即可
+python tools/e1t_baseline.py        # 顺手生成 G1 评测的基线锚点
+```
+
+角色身份：在 singing base 上按平常流程练一个 CFM LoRA（角色说话 10-60s 即可），
+高音能力来自共享 capability，身份来自角色 LoRA —— **能力一次训练，身份每个角色练一次**。
+声码器歌声微调（可选）：`tools/bigvgan_finetune.py`，外推验证 `tools/vocoder_extrapolation_test.py`。
+</details>
+
 ---
 
 ## 8. 自训练指南（从数据集到部署）
@@ -773,6 +881,19 @@ L3  评测与落地      A/B 自动对比（WER / 声纹相似 / reward）→ �
 
 所有功能都有**可复现的回归测试**，不是「跑通了就完事」。每个探针自报通过 / 失败项数，失败时以非 0 退出码结束；下表数字为最近一次全量实跑结果（2026-09-20 全量 + 2026-09-28/29 表现力与节奏批次，RTX 4060 Laptop 8 GB），合计 **1644 项断言全部通过**。
 
+**2026-10 E1-T 批次新增护栏（pytest 套件，123 项全绿）**：
+
+- `test_tts_regression.py` —— **TTS 三件套 hash 守卫**（s2mel.pth / config.yaml /
+  BigVGAN 字节级未动）+ 默认 config 永不开 f0/technique 条件 + 默认模型无新键；
+- `test_e1t_wiring.py` —— `f0=None,technique=None` **逐位一致**（含 solve_euler
+  冻结上游参照对比）、零初始化残差等价、条件生效性、CFG null 旁路、class_dropout
+  覆盖、位置参数兼容；
+- `test_e1t_features.py / test_e1t_inference.py / test_e1t_guard_merge.py` ——
+  F0 网格对齐、SHC 修正（颤音安全/真实大跳保留）、换装恢复（含异常路径）、
+  SVC 租约防护（挂/卸拒绝 + bypass 豁免）、合并白名单负向用例、静音块/重叠/栅格；
+- `test_webui_syntax.py::test_webui_all_tabs_render` —— **全 Tab 真实渲染冒烟**
+  （断言 `_render_failures` 为空，堵死「测试绿但 UI 崩」的盲区）。
+
 | 测试套件 | 覆盖内容 | 结果 |
 |---|---|---|
 | `tools/guard_test.py` | 泛化保护九道防线 | **194 / 194** |
@@ -784,7 +905,7 @@ L3  评测与落地      A/B 自动对比（WER / 声纹相似 / reward）→ �
 | `tools/eval_probe.py` | A/B 评测台 | **28 / 28** |
 | `tools/merge_probe.py` | 合并 / 挂载（双向数学对账，替身用真实 ModuleDict） | **29 / 29** |
 | `tools/stage2_ui_probe.py` | UI + 后台执行器集成 | **20 / 20** |
-| `tools/build_check.py` | 14 页构建校验 | ✅ |
+| `tools/build_check.py` | 全 Tab 构建校验 | ✅ |
 | `tools/director_probe.py` | 导演层：规则切分/情绪词表/停顿抖动与确定性/**停顿系数缩放**/API JSON 解析与坏输入/回退链/台本预览 | **20 / 20** |
 | `tools/orchestrator_probe.py` | 情感参考库（路由两条安全边界）+ 编排器（桩引擎）：逐句情感 kwargs / alpha 缩放 / 停顿拼接长度 / 逐句种子 / 旁车台本 / 临时清理 / 空台词拒绝 / **BoN 择优与中选种子 / 保留候选落盘 / 表演块合并（行→块、块内零静音、块间停顿、**省略号强制断块、≤40 字块上限、长行守卫、滚动参考续合成**）** | **48 / 48** |
 | `tools/bon_import_probe.py` | BoN 台本 → 偏好对导入：正常对数 / margin 过滤 / 缺文件跳过 / 文本与状态回写 / **幂等（重复导入不翻倍）** / 坏输入 | **11 / 11** |
@@ -1058,7 +1179,7 @@ LoRA 反而让高频略多。见 [§7.2 音频处理链](#72-语音合成) 的�
 
 ```
 webui.py              # 官方入口，原样保留（可对照使用）
-webui_pro.py          # 本项目入口（14 页控制台）
+webui_pro.py          # 本项目入口（16 页控制台）
 start.bat             # Windows 一键启动（环境自检 + 补装 + 启动）
 webui_app/            # 控制台本体
 ├── app.py            #   装配与启动
@@ -1066,7 +1187,7 @@ webui_app/            # 控制台本体
 ├── logging_setup.py  #   调试日志：落盘 / error.log / 环形缓冲 / ui_guard / 全局兜底
 ├── theme.py          #   主题与通用组件
 ├── services/         #   引擎生命周期 / 推理 / 音频工作台 / 音色库 / 纠音 / 监控 / 产物盘点清理
-├── tabs/             #   14 个功能页（每页一个文件）
+├── tabs/             #   16 个功能页（每页一个文件）
 └── training/         #   训练体系
     ├── oneclick.py   #     一键三连：七阶段全自动流水线
     ├── parallel.py   #     CPU 并行（只给纯函数、逐条独立的音频处理用）
@@ -1116,6 +1237,25 @@ datasets/  voice_bank/  training_runs/  outputs/   # 运行期数据目录
 - **训练组打包清理**：清理页按角色分组展示（LoRA 对+数据集+评选+评测+中间件），一键整组删除。
 - **修复 report.json 截断**：phase_cb 回调函数漏进序列化导致 UI 排行榜全 None。
 
+
+### 2026-10 · E1-T 歌声条件化全管线（本批次）
+
+- **E1-T 音高·技巧条件化歌声模型**（默认关）：TimbreConditioner 逐帧残差
+  （零初始化 + 连续归一化 F0 + uv 通道 + 软截断 + CFG null 旁路），capability
+  训练/合并/推理/UI 全链入口，`s2mel_singing.pth` 第二曲线与 TTS 物理隔离
+  （hash 守护 + 逐位一致测试 + 合并白名单）。
+- **翻唱管线强化**：SHC 八度修正、分数音区映射（可关）、technique 条件
+  （auto/manual/preserve）、BoN 高音块择优（含全局掉八度罚）、SYKI 源高频
+  移植开关、报告 HNR/高音子集/逐句口径、`tools/e1t_baseline.py` 基线锚点。
+- **分块与显存**：切点吸附 mel 栅格、谷切 40ms/硬切 90ms 自适应重叠、静音块
+  直通、free-VRAM 只收紧；**阶段卸载 C2**（stage_hooks 可选钩子 + 系统页开关，
+  顺手修复了 C1 连续性复选框未接线的缺陷）。
+- **声码器入口**：`tools/bigvgan_finetune.py`（22k 歌声微调骨架，独立输出目录）
+  + `tools/vocoder_extrapolation_test.py`（Perrotin 式 held-out F0 外推测试）。
+- 测试 123 项全绿（新增 E1-T wiring/特征/推理/白名单/全 Tab 渲染冒烟）；
+  交付过程含独立可行性评审与两轮验收（记录见 `docs/dev-log-e1t-impl-2026-10.md`）。
+
+---
 
 ## 13. 许可证
 
