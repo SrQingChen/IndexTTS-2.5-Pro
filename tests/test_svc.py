@@ -297,6 +297,33 @@ class TestStreamConverter:
 # cover_pipeline（无 GPU 部分）
 # ---------------------------------------------------------------------------
 
+class TestKeyShift:
+    def test_plan_key_shift(self):
+        f0 = np.full(100, 500.0)
+        assert svc_f0.plan_key_shift(f0, "auto", 0, 600) == 0
+        f0 = np.full(100, 900.0)
+        # 900/600 = 1.5 → 12*log2(1.5)=7.02 → ceil 8 → -8
+        assert svc_f0.plan_key_shift(f0, "auto", 0, 600) == -8
+        assert svc_f0.plan_key_shift(f0, "off", -5, 600) == 0
+        assert svc_f0.plan_key_shift(f0, "manual", -5, 600) == -5
+        assert svc_f0.plan_key_shift(f0, "manual", -99, 600) == -12
+
+    def test_shift_vocal_key(self):
+        y = _harmonic(220.0, 1.5)
+        out, eng = CP.shift_vocal_key(y, SR, -5)
+        assert len(out) == len(y)
+        med = svc_f0.f0_median(svc_f0.harvest_f0(out, SR))
+        want = 220.0 * 2 ** (-5 / 12)
+        assert abs(med - want) < 12, f"{med} vs {want} ({eng})"
+
+    def test_shift_audio_librosa(self):
+        y = _harmonic(220.0, 1.0)
+        out = CP.shift_audio_librosa(y, SR, -3)
+        assert len(out) == len(y)
+        med = svc_f0.f0_median(svc_f0.harvest_f0(out, SR))
+        assert abs(med - 220.0 * 2 ** (-3 / 12)) < 15
+
+
 class TestVramScheduling:
     def test_cap_chunk_sec(self, monkeypatch):
         monkeypatch.setattr(svc_core, "_total_vram_gib", lambda: 8.0)

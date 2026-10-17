@@ -61,6 +61,11 @@ class CoverRequest:
     # F0
     f0_mode: str = "auto"                # off / auto / force
     transpose_manual: Optional[int] = None
+    # 音域适配（B 方案；默认 off。非纯增益：可能改调或引入二次移调伪影）
+    key_mode: str = "off"                # off / auto / manual
+    key_semitones: int = 0               # manual: -12..0
+    key_output: str = "lower_key"        # lower_key / original_key
+    key_ceiling_hz: float = 600.0
     # 后处理
     hf_deess: bool = True
     hf_limit: bool = True
@@ -138,6 +143,28 @@ def highpass(y: np.ndarray, sr: int, hz: float = 70.0) -> np.ndarray:
         return np.asarray(sosfiltfilt(sos, y), dtype=np.float32)
     except Exception:
         return y
+
+
+def shift_vocal_key(y: np.ndarray, sr: int, semis: int):
+    """源人声预移调（B 方案）：优先 WORLD（保共振峰），失败回退相位声码器。"""
+    if semis == 0:
+        return y, "none"
+    f0 = svc_f0.harvest_f0(y, sr)
+    res = svc_f0.world_replace_f0(y, sr, svc_f0.shift_f0(f0, semis))
+    if res.ok:
+        return res.y, "world"
+    import librosa
+    return (np.asarray(librosa.effects.pitch_shift(y, sr=sr, n_steps=semis),
+                       dtype=np.float32), "librosa")
+
+
+def shift_audio_librosa(y: np.ndarray, sr: int, semis: int) -> np.ndarray:
+    """伴奏/后移调：相位声码器（时长保持）。大移调会有伪影，报告里会提示。"""
+    if semis == 0:
+        return y
+    import librosa
+    return np.asarray(librosa.effects.pitch_shift(y, sr=sr, n_steps=semis),
+                      dtype=np.float32)
 
 
 def resample(y: np.ndarray, sr: int, target: int) -> np.ndarray:
@@ -304,6 +331,29 @@ def run_cover(ctx, req: CoverRequest, progress: Optional[Callable] = None,
         y, head_cut = preprocess_vocal(y, ENGINE_SR, req.denoise_strength,
                                        trim_edges=True)
         report["head_cut_22k"] = int(head_cut)
+        # 音域适配（B）：先分析源 F0，必要时把源人声整体降调
+        key_info = {"mode": req.key_mode, "output": req.key_output}
+        key_semis = 0
+        src_f0_key = None
+        if req.key_mode != "off":
+            src_f0_key = svc_f0.harvest_f0(y, ENGINE_SR)
+            vv = src_f0_key[src_f0_key > 0]
+            key_info["p99_before"] = (round(float(np.percentile(vv, 99)), 1)
+                                      if len(vv) else 0.0)
+            key_semis = svc_f0.plan_key_shift(src_f0_key, req.key_mode,
+                                              req.key_semitones,
+                                              req.key_ceiling_hz)
+            key_info["semitones"] = key_semis
+            if key_semis != 0:
+                _p(0.20, f"音域适配：源人声降 {-key_semis} 半音")
+                y, keng = shift_vocal_key(y, ENGINE_SR, key_semis)
+                key_info["engine"] = keng
+                if keng == "librosa":
+                    key_info["warn"] = "WORLD 预降调失败，已回退相位声码器"
+                _log(f"[音域] 预降 {key_semis}st（{keng}）")
+            else:
+                _log("[音域] 源音域在舒适上限内，不降调")
+        report["key"] = key_info
         dry_path = os.path.join(out_dir, "02_dry_vocal_22k.wav")
         AL.save_audio(dry_path, y, ENGINE_SR)
         timings["preprocess"] = round(time.perf_counter() - t0, 1)
@@ -363,7 +413,8 @@ def run_cover(ctx, req: CoverRequest, progress: Optional[Callable] = None,
         f0_report: Dict[str, Any] = {"mode": "off"}
         if req.f0_mode != "off":
             _p(0.72, "F0 提取（源）")
-            src_f0 = svc_f0.harvest_f0(y, ENGINE_SR)
+            src_f0 = (src_f0_key if (src_f0_key is not None and key_semis == 0)
+                      else svc_f0.harvest_f0(y, ENGINE_SR))
             _p(0.75, "F0 提取（参考音区）")
             ref_y, ref_sr = AL.load_audio(req.ref_path)
             ref_f0 = svc_f0.harvest_f0(resample(ref_y, ref_sr, ENGINE_SR), ENGINE_SR)
@@ -374,6 +425,7 @@ def run_cover(ctx, req: CoverRequest, progress: Optional[Callable] = None,
             res, metrics = svc_f0.transplant_f0(vocal, ENGINE_SR, mapped,
                                                 out_f0=None, mode=req.f0_mode)
             f0_report = {**metrics, "transpose_semis": semis,
+                         "key_shift_semis": key_semis,
                          "transplant_ok": res.ok, "transplant_reason": res.reason}
             if res.ok:
                 vocal = res.y
@@ -417,6 +469,14 @@ def run_cover(ctx, req: CoverRequest, progress: Optional[Callable] = None,
             applied.append("峰值保护")
         report["post"] = {"applied": applied}
         timings["post"] = round(time.perf_counter() - t0, 1)
+        # 音域适配（B）：仅人声升回原调（会引入二次移调伪影）
+        if key_semis != 0 and req.key_output == "original_key":
+            _p(0.845, f"音域适配：人声升回 {-key_semis} 半音（有移调伪影风险）")
+            vocal = shift_audio_librosa(vocal, ENGINE_SR, -key_semis)
+            key_info["post_shift"] = "librosa"
+            if -key_semis > 4:
+                key_info["warn"] = ("升回幅度较大（>4 半音），建议改用"
+                                    "『整首降调』输出")
         _p(0.84, "后处理完成" + ("（" + "、".join(applied) + "）" if applied else ""))
 
         # ---------- 7) 超分（可选，默认关；17.8× 实时耗时警示） ----------
@@ -465,6 +525,9 @@ def run_cover(ctx, req: CoverRequest, progress: Optional[Callable] = None,
             bgm_src = bgm_path if bgm_path else req.mix_bgm_path
             if bgm_src and os.path.isfile(bgm_src):
                 bgm_y, bgm_sr = AL.load_audio(bgm_src)
+                if key_semis != 0 and req.key_output == "lower_key":
+                    bgm_y = shift_audio_librosa(bgm_y, bgm_sr, key_semis)
+                    key_info["bgm_shift"] = "librosa"
                 _p(0.93, "自动合成（人声+伴奏混音）")
                 # 预处理裁掉的前奏静音补回头部（对拍红线：人声与伴奏同源同时轴）
                 head_pad = int(round(head_cut * vocal_sr / ENGINE_SR))

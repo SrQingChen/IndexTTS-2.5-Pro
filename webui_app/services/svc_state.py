@@ -25,6 +25,8 @@ _COVER_KEYS: Dict[str, str] = {
     "denoise": "float", "variant": "str", "steps": "int", "cfg": "float",
     "ref_seconds": "float", "chunk_sec": "float", "f0_mode": "str",
     "transpose_auto": "bool", "transpose_semis": "int",
+    "key_mode": "str", "key_semitones": "int", "key_output": "str",
+    "key_ceiling": "int",
     "hf_deess": "bool", "hf_limit": "bool", "spectral_match": "bool",
     "breath_soften": "bool", "highpass": "int", "sr_enable": "bool",
     "sr_steps": "int", "auto_mix": "bool", "vocal_gain": "float",
@@ -41,6 +43,7 @@ _VC_KEYS: Dict[str, str] = {
 _CLAMP = {
     "denoise": (0.0, 1.0), "cfg": (0.0, 1.0), "ref_seconds": (5.0, 15.0),
     "chunk_sec": (10.0, 60.0), "transpose_semis": (-24, 24),
+    "key_semitones": (-12, 0), "key_ceiling": (450, 800),
     "highpass": (0, 150), "sr_steps": (10, 100), "vocal_gain": (-6.0, 9.0),
     "steps": (5, 50), "lora_scale": (0.0, 2.0),
 }

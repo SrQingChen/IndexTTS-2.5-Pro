@@ -31,6 +31,12 @@ _VARIANT_TO_KEY = {"A 量化重构（默认）": "A",
                     "B 连续特征直通（实验，歌声易嘶哑）": "B"}
 _F0_TO_KEY = {"auto 自动（推荐）": "auto", "force 全曲移植": "force", "off 关闭": "off"}
 _F0_TO_LABEL = {v: k for k, v in _F0_TO_KEY.items()}
+_KEY_MODE_TO_KEY = {"off 关闭（默认）": "off", "auto 自动降调": "auto",
+                    "manual 手动降调": "manual"}
+_KEY_MODE_TO_LABEL = {v: k for k, v in _KEY_MODE_TO_KEY.items()}
+_KEY_OUT_TO_KEY = {"整首降调（推荐音质）": "lower_key",
+                   "仅人声升回原调（有移调伪影）": "original_key"}
+_KEY_OUT_TO_LABEL = {v: k for k, v in _KEY_OUT_TO_KEY.items()}
 
 
 def _lora_cfm_choices() -> List[Any]:
@@ -57,6 +63,10 @@ def render(ctx: AppContext) -> Dict[str, Any]:
     _st_voice = st.get("ref_voice") if st.get("ref_voice") in bank_names else ""
     _lora_vals = [v for _l, v in _lora_cfm_choices()]
     _st_lora = st.get("lora_run") if st.get("lora_run") in _lora_vals else ""
+    _st_key_mode = _KEY_MODE_TO_LABEL.get(st.get("key_mode", "off"),
+                                          "off 关闭（默认）")
+    _st_key_out = _KEY_OUT_TO_LABEL.get(st.get("key_output", "lower_key"),
+                                        "整首降调（推荐音质）")
     # 音色库选中项 → 参考音频初值（与合成页一致：选择即填入音频组件）
     _initial_ref_audio = None
     if _st_voice:
@@ -134,6 +144,15 @@ def render(ctx: AppContext) -> Dict[str, Any]:
             tr_auto_ck = make_component("cover_transpose_auto", value=bool(st.get("transpose_auto", True)))
             tr_semis_sl = make_component("cover_transpose_semis", value=int(st.get("transpose_semis", 0)))
 
+        gr.Markdown("### ③b 音域适配（B 方案，默认关；不是纯增益）")
+        with gr.Row():
+            key_mode_dd = make_component("cover_key_mode", value=_st_key_mode)
+            key_semis_sl = make_component("cover_key_semitones",
+                                          value=int(st.get("key_semitones", 0)))
+            key_output_dd = make_component("cover_key_output", value=_st_key_out)
+            key_ceiling_sl = make_component("cover_key_ceiling",
+                                            value=int(st.get("key_ceiling", 600)))
+
         gr.Markdown("### ④ 后处理 / 超分 / 混音")
         with gr.Row():
             deess_ck = make_component("cover_hf_deess", value=bool(st.get("hf_deess", True)))
@@ -156,6 +175,7 @@ def render(ctx: AppContext) -> Dict[str, Any]:
         with gr.Row():
             start_btn = gr.Button("🚀 开始翻唱", variant="primary")
             stop_btn = gr.Button("⏹ 停止", variant="stop")
+            safe_btn = gr.Button("🎵 歌声安全预设（A/关超分/0移调）", size="sm")
         log_box = gr.Textbox(label="过程日志", lines=10, max_lines=18, interactive=False)
         timer = gr.Timer(1.0)   # 常开（synthesize 日志窗同款），空闲时显示占位
 
@@ -249,13 +269,24 @@ def render(ctx: AppContext) -> Dict[str, Any]:
 
         stop_btn.click(_stop, outputs=[log_box])
 
+        def _safe_preset():
+            return (gr.update(value="A 量化重构（默认）"),
+                    gr.update(value=25), gr.update(value=0.7),
+                    gr.update(value=False), gr.update(value="auto 自动（推荐）"),
+                    gr.update(value="off 关闭（默认）"))
+
+        safe_btn.click(_safe_preset,
+                       outputs=[variant_dd, steps_sl, cfg_sl, sr_ck,
+                                f0_mode_dd, key_mode_dd])
+
         all_inputs = [src_audio, state_dd, sep_model_dd, dereverb_ck, denoise_sl,
                       ref_voice_dd, ref_audio, lora_run_dd, lora_scale_sl,
                       variant_dd, steps_sl, cfg_sl, ref_sec_sl, chunk_sl,
                       f0_mode_dd, tr_auto_ck, tr_semis_sl,
+                      key_mode_dd, key_semis_sl, key_output_dd, key_ceiling_sl,
                       deess_ck, hflim_ck, spec_ck, breath_ck, hp_sl,
                       sr_ck, sr_steps_sl, mix_ck, bgm_upload, vgain_sl, ln_ck]
-        assert len(all_inputs) == 28, f"cover all_inputs 接线数错误: {len(all_inputs)}"
+        assert len(all_inputs) == 32, f"cover all_inputs 接线数错误: {len(all_inputs)}"
 
         @LOG.ui_guard("cover.start")
         def _start(progress=gr.Progress(), *vals):
@@ -263,6 +294,7 @@ def render(ctx: AppContext) -> Dict[str, Any]:
              ref_bank, ref_audio_value, lora_run, lora_scale,
              variant_lbl, steps, cfg_rate, ref_seconds, chunk_sec,
              f0_lbl, tr_auto, tr_semis,
+             key_mode_lbl, key_semis, key_output_lbl, key_ceiling,
              deess, hflim, spec, breath, hp,
              sr_on, sr_steps, mix_on, bgm_up, vgain, loudnorm) = vals
 
@@ -271,6 +303,9 @@ def render(ctx: AppContext) -> Dict[str, Any]:
             if str(variant_lbl).startswith("B"):
                 gr.Warning("变体 B 是实验档（连续特征直通，分布外），歌声容易嘶哑；"
                            "建议切回 A 量化重构。")
+            if _KEY_MODE_TO_KEY.get(key_mode_lbl, "off") != "off":
+                gr.Warning("音域适配不是纯增益：整首降调会改变调性；仅人声升回"
+                           "会引入二次移调伪影。建议先用 30s 片段 A/B。")
             if sr_on:
                 try:
                     import librosa
@@ -300,6 +335,10 @@ def render(ctx: AppContext) -> Dict[str, Any]:
                 "steps": steps, "cfg": cfg_rate, "ref_seconds": ref_seconds,
                 "chunk_sec": chunk_sec, "f0_mode": _F0_TO_KEY.get(f0_lbl, "auto"),
                 "transpose_auto": tr_auto, "transpose_semis": tr_semis,
+                "key_mode": _KEY_MODE_TO_KEY.get(key_mode_lbl, "off"),
+                "key_semitones": int(key_semis),
+                "key_output": _KEY_OUT_TO_KEY.get(key_output_lbl, "lower_key"),
+                "key_ceiling": int(key_ceiling),
                 "hf_deess": deess, "hf_limit": hflim, "spectral_match": spec,
                 "breath_soften": breath, "highpass": hp, "sr_enable": sr_on,
                 "sr_steps": sr_steps, "auto_mix": mix_on, "vocal_gain": vgain,
@@ -321,6 +360,10 @@ def render(ctx: AppContext) -> Dict[str, Any]:
                 denoise_strength=float(denoise),
                 f0_mode=_F0_TO_KEY.get(f0_lbl, "auto"),
                 transpose_manual=None if tr_auto else int(tr_semis),
+                key_mode=_KEY_MODE_TO_KEY.get(key_mode_lbl, "off"),
+                key_semitones=int(key_semis),
+                key_output=_KEY_OUT_TO_KEY.get(key_output_lbl, "lower_key"),
+                key_ceiling_hz=float(key_ceiling),
                 hf_deess=bool(deess), hf_limit=bool(hflim),
                 spectral_match=bool(spec), breath_soften=bool(breath),
                 highpass_hz=int(hp),
@@ -372,6 +415,13 @@ def render(ctx: AppContext) -> Dict[str, Any]:
                              f"移调 {f0.get('transpose_semis', 0):+d}st")
             if "ss" in q:
                 lines.append(f"- 音色相似度 SS = **{q['ss']}**（参考线 ≥0.75）")
+            key = report.get("key") or {}
+            if key.get("mode", "off") != "off":
+                ks = abs(int(key.get("semitones", 0) or 0))
+                out_lbl = ("整首降调" if key.get("output") == "lower_key"
+                           else "仅人声升回原调")
+                warn = f" · ⚠️ {key['warn']}" if key.get("warn") else ""
+                lines.append(f"- 音域适配：源降 {ks} 半音 · {out_lbl}{warn}")
             if "f0_r" in q:
                 extra = (f"，50 音分内 {q['within_50c']:.0%}"
                          if q.get("within_50c") is not None else "")

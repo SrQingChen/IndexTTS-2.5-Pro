@@ -73,6 +73,7 @@ GROUP_TITLES: Dict[str, str] = {
     "cover_in":    "翻唱 · 输入与预处理",
     "cover_vc":    "翻唱 · 转换核心",
     "cover_f0":    "翻唱 · F0 音高",
+    "cover_key":   "翻唱 · 音域适配",
     "cover_post":  "翻唱 · 后处理与超分",
     "cover_mix":   "翻唱 · 自动合成混音",
     "vc_realtime": "变声 · 实时",

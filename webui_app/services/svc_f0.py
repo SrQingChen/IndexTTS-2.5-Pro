@@ -222,6 +222,30 @@ def f0_correlation(f0_a: np.ndarray, f0_b: np.ndarray) -> Tuple[float, float, in
     return r, err, n_voiced
 
 
+def plan_key_shift(src_f0: np.ndarray, mode: str = "auto",
+                   manual: int = 0, ceiling_hz: float = 600.0) -> int:
+    """音域适配的移调量（半音，≤0）。
+
+    - off: 0；
+    - manual: 手动值（钳 -12..0）；
+    - auto: 源 F0 的 p99 超过 ceiling_hz 时，取**最小的整半音下调**把 p99
+      压回上限；否则 0。只降不升，避免改变音域方向。
+    """
+    if mode == "off":
+        return 0
+    if mode == "manual":
+        return int(max(-12, min(0, int(manual))))
+    v = np.asarray(src_f0, dtype=np.float64)
+    v = v[v > 0]
+    if len(v) < 10 or ceiling_hz <= 0:
+        return 0
+    p99 = float(np.percentile(v, 99))
+    if p99 <= ceiling_hz:
+        return 0
+    semis = int(np.ceil(12.0 * math.log2(p99 / ceiling_hz)))
+    return int(max(-12, min(0, -semis)))
+
+
 def _probe_metrics(y: np.ndarray, sr: int, target_f0: np.ndarray,
                    seconds: float = 20.0) -> dict:
     """移植后的代表段指标（自动选目标浊音最多的 20s 窗）。

@@ -7,6 +7,7 @@ def build(reg, P):
     _input(reg, P)
     _vc(reg, P)
     _f0(reg, P)
+    _key(reg, P)
     _post(reg, P)
     _mix(reg, P)
     _realtime(reg, P)
@@ -125,6 +126,53 @@ r<0.75 全曲移植（旋律完全由源决定）。force 无条件全曲移植�
         kind="slider", minimum=-24, maximum=24, step=1, default=0,
         summary="八度映射自动关闭时的手动微调（±24 内）。",
         info="男→女 +12、女→男 −12；细调 ±2",
+    ))
+
+
+def _key(reg, P):
+    """音域适配（B 方案）：默认关闭，不是纯增益。"""
+    reg(P(
+        key="cover_key_mode", group="cover_key", label="音域适配",
+        kind="dropdown",
+        choices=["off 关闭（默认）", "auto 自动降调", "manual 手动降调"],
+        default="off 关闭（默认）",
+        summary="把源人声整体降调，让模型在舒适音域内转换；只降低高音外推压力，"
+                "不改善音色，且可能改变调性或引入二次移调伪影。",
+        info="默认关；auto 按源 F0 p99 超过上限自动降；整首降调输出音质最好",
+        affects="高音破音压力、调性、可能的移调伪影",
+        detail_md="""
+**为什么需要**：IndexTTS 的 CFM/BigVGAN 是语音训练，源歌高音超出舒适区时
+嘶哑/破音会加重。把源人声整体降 K 半音再转换，可以让模型在更稳的音域工作。
+
+**两种输出**：
+- `整首降调（推荐音质）`：人声与伴奏一起降 K，不升回；避免二次移调，
+  但成品不是原调（属于翻唱改编）。
+- `仅人声升回原调`：伴奏保持原调，人声升回 K；会引入相位声码器伪影，
+  建议 K≤4，超过 4 半音会明显失真。
+
+**实测提醒**：预降 5 半音再升回，campplus SS 0.639→0.664→0.637，净收益≈0；
+它只解决音域，不解决音色。**默认关闭，按歌试验。**
+""",
+        pitfall_md="不是纯增益：整首降调改变调性；仅人声升回有二次移调伪影。",
+    ))
+    reg(P(
+        key="cover_key_semitones", group="cover_key", label="手动降调（半音）",
+        kind="slider", minimum=-12, maximum=0, step=1, default=0,
+        summary="manual 模式生效；负值=降调。",
+        info="建议 -2~-7；先听高音段再定",
+    ))
+    reg(P(
+        key="cover_key_output", group="cover_key", label="输出调性",
+        kind="dropdown",
+        choices=["整首降调（推荐音质）", "仅人声升回原调（有移调伪影）"],
+        default="整首降调（推荐音质）",
+        summary="整首降调避免二次移调；仅人声升回保留原调但有伪影。",
+    ))
+    reg(P(
+        key="cover_key_ceiling", group="cover_key", label="模型舒适音高上限 (Hz)",
+        kind="slider", minimum=450, maximum=800, step=10, default=600,
+        summary="auto 模式：源 F0 p99 超过此值时自动降调。",
+        info="8GB/22k 保守值 600；戏腔可降到 550 更稳",
     ))
 
 
