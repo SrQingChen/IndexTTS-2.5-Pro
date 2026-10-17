@@ -217,3 +217,36 @@ build_app 会把 Tab 渲染异常吞进 `ctx.shared["_render_failures"]`）。
   ASR 对齐、特征已提好的那批音频，特征直接复用不必重提。
 - 测试：TestCharNameOfRun / TestDatasetLabels 共 7 项（后缀剥离、一键三连
   标签、无 run 回退、统计兜底、下拉排序与过滤、默认名）；全套 **147 项绿**。
+---
+
+## 10. 追加（47e）：按实测仓库布局修正拉取/导入链 + 中文子集实测规模
+
+为回答「仅中文全量训练一轮多久」，先探测了 hf-mirror 上的真实仓库——结果发现
+三处按猜测布局写的 bug（用户还没下数据，属于交付前修复，无存量影响）：
+
+1. **拉取清单会挂**：`HfApi().list_repo_files` 的分页 next 链接由 hf-mirror
+   返回时指向 huggingface.co，跟随即直连超时（GTSinger 必分页）。改为裸
+   requests 固定打镜像端点、cursor 回填（`_tree_page`）；且只列**所选语言
+   子树**（URL 路径段形态对齐库实测：repo 斜杠不编码、子路径斜杠编码——
+   两个 400 都是这么踩出来的）。TextGrid/musicxml 不再下载（json 已含
+   全部信息）。
+2. **语言过滤失配**：仓库顶层是全名（Chinese/…）不是码（zh/…）——加
+   `LANG_DIR` 映射，码/全名都能命中；空集仍回退全量（假完成防线）。
+3. **导入器布局/schema 全错**：真实结构
+   `Chinese/ZH-Alto-1/<技巧>/<歌>/<Group>/NNNN.wav`，json 与 wav 同名同目录
+   且是**逐词列表**（word/start_time/end_time + 六技巧逐音素 0/1 标志，
+   无顶层 text）。`iter_phrases` 重写（Group 段识别；Paired_Speech_Group
+   默认跳过；**uid 不含技巧目录** → Control_Group 跨技巧目录重复自动去重）；
+   `load_transcription` 重写（文本=word 拼接，CJK 紧排/拉丁空格；技巧段=
+   逐词标志判定+相邻合并）。旧猜测布局的兼容分支保留。
+
+**中文子集实测规模（镜像 tree API 全量枚举，29s）**：歌声组 7,139 条 wav /
+8.61GB / ≈16.6 小时（平均 8.4s/条）；配对语音另 3,049 条（3.32h，默认不导）；
+中文仅 2 位歌手（ZH-Alto-1 / ZH-Tenor-1）——split_note 已提示建议整人留出。
+
+**训练时长推算（基于本机 6 次真实 CFM run：1.5–2.2s/优化步，batch1×accum8）**：
+去重后约 6–7 千条 → 约 800 步/epoch（+技巧均衡 ~1.3×）→ **一轮约 20–40 分钟**
+（歌声片段平均 1,450 帧 < TTS 的 ~2,000 帧，实际可能落在 15–30 分钟区间）。
+详见向导页/README 的规模提示。
+
+测试：布局遍历/uid 去重/根判定/逐词解析/映射过滤共 +6 项，全套 **153 绿**。

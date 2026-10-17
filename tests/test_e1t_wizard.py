@@ -108,19 +108,27 @@ class TestImportParsing:
 class TestPlanFiles:
     """语言子集过滤（空集防御：宁全量不给假完成）。"""
 
-    def test_lang_subset(self):
-        files = ["structure.json", "README.md",
-                 "zh/s1/a.wav", "zh/s1/a.json", "en/s2/b.wav",
-                 "ja/s3/c.wav", "binary.bin"]
+    def test_lang_subset_with_real_dir_names(self):
+        # 实测：仓库顶层是全名（Chinese/…），过滤用语言码也要能命中
+        files = ["README.md", "dataset_license.md",
+                 "Chinese/ZH-Alto-1/Breathy/s/Breathy_Group/0000.wav",
+                 "Chinese/ZH-Alto-1/Breathy/s/0000.json",
+                 "English/EN-Tenor-1/s/0000.wav",
+                 "Japanese/s/0000.wav", "binary.bin"]
         r = GF.plan_files(files, ["zh", "en"])
         assert r["mode"] == "lang-subset"
-        assert "zh/s1/a.wav" in r["files"] and "en/s2/b.wav" in r["files"]
-        assert "ja/s3/c.wav" not in r["files"]
-        assert "structure.json" in r["files"] and "README.md" in r["files"]
+        assert any(f.startswith("Chinese/") for f in r["files"])
+        assert any(f.startswith("English/") for f in r["files"])
+        assert not any(f.startswith("Japanese/") for f in r["files"])
+        assert "README.md" in r["files"] and "dataset_license.md" in r["files"]
         assert "binary.bin" not in r["files"]
 
+    def test_dir_fullname_also_accepted(self):
+        r = GF.plan_files(["Chinese/a.wav"], ["Chinese"])
+        assert r["mode"] == "lang-subset" and len(r["files"]) == 1
+
     def test_unknown_lang_falls_back_to_full(self):
-        r = GF.plan_files(["zh/a.wav"], ["xx"])
+        r = GF.plan_files(["Chinese/a.wav"], ["xx"])
         assert r["mode"] == "full" and len(r["files"]) == 1
 
     def test_no_langs_means_full(self):
@@ -397,3 +405,96 @@ class TestDatasetLabels:
         # 无角色名 → 用数据集名兜底
         assert WZ.identity_run_default("随便集") == "随便集_singing_identity"
         assert WZ.identity_run_default("") .endswith("_singing_identity")
+
+# ---------------------------------------------------------------------------
+# 47e：真实仓库布局（实测）遍历与逐词 json 解析
+# ---------------------------------------------------------------------------
+
+class TestRealLayoutImport:
+    """Chinese/<Singer>/<Tech>/<Song>/<Group>/NNNN.wav 布局的遍历规则。"""
+
+    def _make_tree(self, tmp_path):
+        base = tmp_path / "GTS"
+        for tech, group, stem in [
+                ("Breathy", "Breathy_Group", "0000"),
+                ("Breathy", "Control_Group", "0000"),
+                ("Vibrato", "Control_Group", "0000"),      # 跨技巧重复的 Control
+                ("Breathy", "Paired_Speech_Group", "0000")  # 配对语音
+                ]:
+            d = base / "Chinese" / "ZH-Alto-1" / tech / "云烟成雨" / group
+            d.mkdir(parents=True)
+            (d / f"{stem}.wav").write_bytes(b"w" * 16)
+            (d / f"{stem}.json").write_text("[]", encoding="utf-8")
+        (base / "English" / "EN-Tenor-1" / "Breathy" / "song"
+         / "Breathy_Group" / "0001.wav").parent.mkdir(parents=True)
+        (base / "English" / "EN-Tenor-1" / "Breathy" / "song"
+         / "Breathy_Group" / "0001.wav").write_bytes(b"w" * 16)
+        return str(base)
+
+    def test_iter_skips_paired_speech_and_maps_lang(self, tmp_path):
+        from webui_app.services import gts_import as GI
+        root = self._make_tree(tmp_path)
+        got = list(GI.iter_phrases(root, langs=["zh"]))
+        groups = {g["group"] for g in got}
+        assert "Paired_Speech_Group" not in groups
+        assert all(g["lang"] == "zh" for g in got)
+        assert groups == {"Breathy_Group", "Control_Group", ""} or             groups <= {"Breathy_Group", "Control_Group"}
+
+    def test_control_uid_dedups_across_techniques(self, tmp_path):
+        from webui_app.services import gts_import as GI
+        root = self._make_tree(tmp_path)
+        uids = {GI._uid_of(g) for g in GI.iter_phrases(root, langs=["zh"])}
+        # Vibrato/Control_Group/0000 与 Breathy/Control_Group/0000 → 同 uid
+        assert len([u for u in uids if "Control_Group" in u]) == 1
+
+    def test_find_root_accepts_real_layout(self, tmp_path):
+        from webui_app.services import gts_import as GI
+        assert GI.find_gtsinger_root(self._make_tree(tmp_path))
+        empty = tmp_path / "not_gts"
+        empty.mkdir()
+        (empty / "x.wav").write_bytes(b"w")
+        assert not GI.find_gtsinger_root(str(empty))
+
+
+class TestRealJsonSchema:
+    """逐词列表 schema（实测样本）的文本拼接与技巧段提取。"""
+
+    def _sample(self):
+        return [
+            {"word": "你", "start_time": 0.0, "end_time": 0.57,
+             "ph": ["n", "i"], "mix": ["0", "0"], "falsetto": ["0", "0"],
+             "breathy": ["1", "1"], "pharyngeal": ["0", "0"],
+             "glissando": ["0", "0"], "vibrato": ["0", "0"]},
+            {"word": "好", "start_time": 0.57, "end_time": 1.10,
+             "ph": ["h"], "mix": ["0"], "falsetto": ["1"],
+             "breathy": ["0"], "pharyngeal": ["0"],
+             "glissando": ["0"], "vibrato": ["0"]},
+            {"word": "呀", "start_time": 1.10, "end_time": 1.60,
+             "ph": ["a"], "mix": ["0"], "falsetto": ["0"],
+             "breathy": ["0"], "pharyngeal": ["0"],
+             "glissando": ["0"], "vibrato": ["0"]},
+        ]
+
+    def test_parse_text_and_segments(self, tmp_path):
+        from webui_app.services import gts_import as GI
+        jp = tmp_path / "0000.json"
+        jp.write_text(json.dumps(self._sample()), encoding="utf-8")
+        text, segs = GI.load_transcription(str(jp))
+        assert text == "你好呀"                      # CJK 紧排
+        assert segs == [[0.0, 0.57, 3],               # breathy=3
+                        [0.57, 1.1, 2]]               # falsetto=2
+
+    def test_english_words_spaced(self, tmp_path):
+        from webui_app.services import gts_import as GI
+        jp = tmp_path / "0001.json"
+        jp.write_text(json.dumps([
+            {"word": "hello", "start_time": 0.0, "end_time": 0.5,
+             "ph": ["hh"], "mix": ["0"], "falsetto": ["0"], "breathy": ["0"],
+             "pharyngeal": ["0"], "glissando": ["0"], "vibrato": ["0"]},
+            {"word": "world", "start_time": 0.5, "end_time": 1.0,
+             "ph": ["w"], "mix": ["0"], "falsetto": ["0"], "breathy": ["0"],
+             "pharyngeal": ["0"], "glissando": ["0"], "vibrato": ["0"]},
+        ]), encoding="utf-8")
+        text, segs = GI.load_transcription(str(jp))
+        assert text == "hello world"
+        assert segs == []                              # 无技巧 → control
