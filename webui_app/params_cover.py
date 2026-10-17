@@ -50,7 +50,7 @@ UVR-DeEcho-DeReverb 去混响 → 预处理；分离人声 → 仅去混响 → 
 def _vc(reg, P):
     reg(P(
         key="cover_variant", group="cover_vc", label="内容通路变体",
-        kind="dropdown", choices=["A 量化重构（默认）", "B 连续特征直通（实验）"],
+        kind="dropdown", choices=["A 量化重构（默认）", "B 连续特征直通（实验，歌声易嘶哑）"],
         default="A 量化重构（默认）",
         summary="A=语义码本 quantize→decode（与 TTS 生成路径同分布，稳）；"
                 "B=连续特征直通（与参考条件槽同构，细节更多但分布外）。",

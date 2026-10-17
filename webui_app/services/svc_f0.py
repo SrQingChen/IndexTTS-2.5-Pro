@@ -531,8 +531,10 @@ def transplant_f0(y: np.ndarray, sr: int, src_f0: np.ndarray, out_f0: Optional[n
         res = world_replace_f0(y, sr, src)
         metrics["mode_used"] = res.mode
         if res.ok:
+            pr = _probe_metrics(res.y, sr, src)
             metrics["f0_r_pre"] = metrics.get("f0_r")
-            metrics.update(_probe_metrics(res.y, sr, src))
+            metrics["f0_r"] = pr.get("r")
+            metrics.update({k: v for k, v in pr.items() if k != "r"})
         return res, metrics
     # auto
     if r >= 0.75:
@@ -541,15 +543,19 @@ def transplant_f0(y: np.ndarray, sr: int, src_f0: np.ndarray, out_f0: Optional[n
             metrics["mode_used"] = "repair"
             metrics["repaired_segments"] = res.repaired_segments
             metrics["repaired_sec"] = round(res.repaired_sec, 2)
+            pr = _probe_metrics(res.y, sr, src)
             metrics["f0_r_pre"] = metrics.get("f0_r")
-            metrics.update(_probe_metrics(res.y, sr, src))
+            metrics["f0_r"] = pr.get("r")
+            metrics.update({k: v for k, v in pr.items() if k != "r"})
             return res, metrics
         metrics["repair_fallback"] = res.reason
     res = world_replace_f0(y, sr, src)
     metrics["mode_used"] = res.mode if res.ok else "fallback"
     if res.ok:
+        pr = _probe_metrics(res.y, sr, src)
         metrics["f0_r_pre"] = metrics.get("f0_r")
-        metrics.update(_probe_metrics(res.y, sr, src))
+        metrics["f0_r"] = pr.get("r")
+        metrics.update({k: v for k, v in pr.items() if k != "r"})
     return res, metrics
 
 

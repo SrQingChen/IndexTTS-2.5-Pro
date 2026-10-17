@@ -566,7 +566,9 @@ def _quality_report(vocal_path: str, ref_path: str, f0_report: Dict,
         q["analyze"] = {k: d.get(k) for k in
                         ("score", "grade", "snr_db", "clip_ratio", "dc_offset",
                          "spectral_centroid_hz", "silence_ratio")}
-        q["analyze"]["issues"] = d.get("issues", [])[:5]
+        issues = [x for x in d.get("issues", [])
+                  if ("15 秒" not in x and "15s" not in x)]
+        q["analyze"]["issues"] = issues[:5]
     except Exception as exc:
         q["analyze_error"] = str(exc)
     if "f0_r" in f0_report:

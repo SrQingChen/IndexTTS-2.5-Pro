@@ -27,7 +27,8 @@ _STATE_TO_KEY = {"原歌曲（含伴奏）": "song",
                  "分离人声（可能有混响/残留）": "separated",
                  "干净人声（干声）": "clean"}
 _KEY_TO_STATE = {v: k for k, v in _STATE_TO_KEY.items()}
-_VARIANT_TO_KEY = {"A 量化重构（默认）": "A", "B 连续特征直通（实验）": "B"}
+_VARIANT_TO_KEY = {"A 量化重构（默认）": "A",
+                    "B 连续特征直通（实验，歌声易嘶哑）": "B"}
 _F0_TO_KEY = {"auto 自动（推荐）": "auto", "force 全曲移植": "force", "off 关闭": "off"}
 _F0_TO_LABEL = {v: k for k, v in _F0_TO_KEY.items()}
 
@@ -118,7 +119,8 @@ def render(ctx: AppContext) -> Dict[str, Any]:
         gr.Markdown("### ③ 转换核心参数")
         with gr.Row():
             variant_dd = make_component("cover_variant",
-                                        value=("B 连续特征直通（实验）" if st.get("variant") == "B"
+                                        value=("B 连续特征直通（实验，歌声易嘶哑）"
+                                               if st.get("variant") == "B"
                                                else "A 量化重构（默认）"))
             steps_sl = make_component("cover_steps", value=int(st.get("steps", 25)))
             cfg_sl = make_component("cover_cfg", value=float(st.get("cfg", 0.7)))
@@ -266,6 +268,18 @@ def render(ctx: AppContext) -> Dict[str, Any]:
 
             if not src:
                 raise gr.Error("请先上传源音频")
+            if str(variant_lbl).startswith("B"):
+                gr.Warning("变体 B 是实验档（连续特征直通，分布外），歌声容易嘶哑；"
+                           "建议切回 A 量化重构。")
+            if sr_on:
+                try:
+                    import librosa
+                    dur = float(librosa.get_duration(path=src))
+                    est = dur * 17.8 / 60.0
+                    gr.Warning(f"超分开启：{dur:.0f}s 音频预计约 {est:.0f} 分钟"
+                               "（AudioSR 17.8× 实时），且可能降低歌声 SS。")
+                except Exception:
+                    pass
             ref_path = ref_audio_value or ""
             if not ref_path:
                 raise gr.Error("请选择音色库音色，或上传参考音频")
