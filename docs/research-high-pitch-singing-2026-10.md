@@ -290,6 +290,74 @@
 
 ---
 
+## 9. 音色/音域外推专题（2026-10-17 补）
+
+**问题**：只给角色的说话音色，模型能否推断“更高音最可能是什么样”？
+
+### 9.1 两条技术路线
+
+1. **信号级外推**：保共振峰移调（WORLD/STRAIGHT/PSOLA/相位声码器）。
+   - 只把已有谱包络搬到新 F0，**不生成新的音色**；高音仍像“被拉上去的说话声”。
+   - 我们实测把参考上移 +8 半音：输出更像“移调参考”（SS 0.654），但不像原角色
+     （SS 0.483）。说明信号级外推会牺牲身份。
+2. **学习式外推（音高→音色先验）**：在歌声数据上训练，让模型学习
+   “F0 变化时，谱包络/声道/声门源应如何变化”；推理时参考音频提供身份，
+   F0 条件选择音高，模型生成该身份在该音高下**最可能的音色**。
+   - 这是用户问的“推测高音样子”的正解；商业级高音多来自这条路线（且通常
+     还有角色真实高音数据）。
+
+### 9.2 关键论文与机制
+
+- **YingMusic-SVC（2025-12）**：F0-aware fine-grained timbre adaptor
+  `hτ(t)=eτ(global)+ατ·MLP([hf(t);eτ])`，把静态歌手嵌入变成**随音高变化的
+  细粒度音色图**；作者称可让高音更亮/头声、低音更胸声，并“避免极端音高的
+  音色失真”（定性，无单独高音指标）。另有 energy-balanced flow matching
+  加权高频、RVC timbre shifter（120 歌手）去源音色、Flow-GRPO 后训练。
+  https://arxiv.org/abs/2512.04793
+- **Everyone-Can-Sing（ICASSP 2025）**：用**说话样本**做零样本 SVS/SVC；
+  混合语音+歌声训练；推理期有 Adjust Pitch 消融处理语音参考与歌曲音域不匹配；
+  diffusion generator。demo 含歌剧风格样例。https://arxiv.org/abs/2501.13870
+  https://everyone-can-sing.github.io/
+- **SPSinger（ICASSP 2025）**：5s 短参考；LPAM（Transformer-decoder）从全局
+  音色+曲谱隐序列**预测需要的移调量**，解决“目标歌手与曲谱音域不匹配”；
+  可作为“自动找最高安全调”的学习式版本。https://ieeexplore.ieee.org/abstract/document/10888907
+- **SPA-SVC（Interspeech 2024）**：cycle pitch-shifting 训练 + SSIM loss；
+  针对源音域远高于目标、输出嘶哑的跨域 SVC，不需要额外数据/参数。
+  https://www.isca-archive.org/interspeech_2024/bai24_interspeech.html
+- **Perrotin et al.（Interspeech 2021）**：神经声码器的**极端音高外推**评测；
+  WaveGlow 外推好，LPCNet/Parallel WaveGAN 会塌回训练集中位 F0；说明声码器
+  必须做“音域受控”验证。https://hal.science/hal-03338483v1/file/Perrotin_IS2021.pdf
+- **SpSiVC（2025）**：自适应 F0 损失（歌声按八度约束、语音按说话人均值），
+  解决单一模型语音/歌声切换的八度偏移。https://www.jstage.jst.go.jp/article/ast/46/1/46_e24.47/_article
+- **Interspeech 2020 语音/歌声条件信号**：只在语音上训练的网络，在显式
+  pitch/loudness/phoneme 条件下可泛化到歌声，且音高可在解码时独立操纵。
+  http://www.interspeech2020.org/uploadfile/pdf/Thu-3-4-8.pdf
+- **AlignSTS（2023）/ Speech-to-Singing encoder-decoder（2020）**：语音转歌声；
+  用参考旋律/节奏适配器做跨模态对齐。https://arxiv.org/abs/2305.04476
+  https://arxiv.org/abs/2002.06595
+
+### 9.3 原生 IndexTTS 的 E1-R 方案（音色外推版）
+
+在 E1（F0 条件）基础上再加**音高条件化音色**，而不只是把 F0 塞进内容：
+
+1. **F0 条件**：log-F0 → 256/512 维嵌入，FiLM 注入 `cond`/DiT 时间嵌入。
+2. **音高感知音色残差**：对 `style`/`prompt_condition` 加
+   `Δe=MLP([F0_emb; e_style])`，`e' = e_style + α·Δe`（YingMusic 式）；
+   让“音色”随当前音高变化，而不是静态参考音色。
+3. **训练数据**：1–5h 公开歌声（E1-R 起步）+ 角色说话（参考身份）；
+   可选 10–30min 角色歌声。用 cycle pitch-shifting（SPA-SVC）+ SSIM/谱损失；
+   加“同歌手不同音高 / 同音高不同歌手”的对比损失，逼模型学分人身份与音高。
+4. **声码器**：BigVGAN 22k 在歌声上微调，或 44.1k NSF-HiFiGAN（E2）；
+   用 Perrotin 式“音域受控”测试验证极端 F0 不塌。
+5. **推理**：目标 F0 + 角色说话参考 → CFM 生成带音高条件音色的 mel →
+   声码器；不再依赖 WORLD 后处理。
+6. **预期**：能生成“该角色在高音下最可能的样子”，但这是**先验猜测**，不是
+   真实高音；有角色高音数据时才会“像本人”。戏腔仍需戏腔数据。
+   E1-R 4–8 周（8GB LoRA / 24GB 全参），E2 44.1k 2–3 个月。
+
+**结论**：有相关技术，而且核心不是“移调”，是“音高条件化的音色生成”；
+IndexTTS 原生可实现，但需要训练与数据，属于 E1-R/E2 的研究线。
+
 ## 8. 参考来源
 
 **本项目一手**
