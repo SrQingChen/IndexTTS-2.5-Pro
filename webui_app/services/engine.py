@@ -264,6 +264,9 @@ class TTSEngine:
         self._svc_leases: List[str] = []
         # VC 会话期间 GPT 临时移到 CPU（VC 绕过 GPT，8GB 卡可让出 ~1.5GB）
         self._gpt_offloaded = False
+        # 连续性模式：低显存下尝试关闭官方的 40 字切段，整段交给模型；
+        # OOM 自动回退到 40 字切段（系统页开关，默认关）。
+        self.continuity_mode = False
 
     # -- 事件回调（供 UI 显示进度）-----------------------------------------
 
@@ -906,7 +909,13 @@ class TTSEngine:
     # -- 推理 --------------------------------------------------------------
 
     def infer(self, progress=None, **kwargs) -> Optional[str]:
-        """执行一次推理。kwargs 直接透传给 IndexTTS2.infer()。"""
+        """执行一次推理。kwargs 直接透传给 IndexTTS2.infer()。
+
+        连续性模式（`self.continuity_mode`）：低显存下临时关闭官方的
+        “>40 字按标点切段”，让模型按 `max_text_tokens_per_segment` 整段
+        合成；若 OOM，自动恢复 40 字切段重试一次。只有切段策略变化，
+        不改模型数学/精度；失败会回退，不会把合成搞坏。
+        """
         with self._lock:
             if self._svc_leases:
                 raise EngineError(
@@ -916,14 +925,41 @@ class TTSEngine:
             tts.gr_progress = progress
             self._refresh_vram()
             t0 = time.perf_counter()
-            try:
-                out = tts.infer(**kwargs)
-            except Exception as e:
-                self.stats.error = f"{type(e).__name__}: {e}"
-                self._emit("infer_error", self.stats.error)
-                raise
-            finally:
-                tts.gr_progress = None
+
+            low = bool(getattr(tts, "low_vram", False))
+            # stream_return 返回生成器，不能在这里提前恢复 low_vram；
+            # WebUI 不使用流式，保守起见连续性模式对流式直接不启用。
+            use_cont = (bool(getattr(self, "continuity_mode", False))
+                        and low and not kwargs.get("stream_return"))
+            attempts = [(True, False), (False, True)] if use_cont else [(False, low)]
+            out = None
+            last_exc = None
+            for idx, (_cont, low_flag) in enumerate(attempts):
+                tts.low_vram = low_flag
+                try:
+                    out = tts.infer(**kwargs)
+                    if idx > 0:
+                        self._emit("continuity_fallback",
+                                   "连续性模式显存不足，已回退到 40 字切段")
+                    break
+                except Exception as e:
+                    last_exc = e
+                    oom = "out of memory" in str(e).lower()
+                    if idx == 0 and use_cont and oom:
+                        self._emit("continuity_fallback",
+                                   "连续性模式 OOM，正在回退到 40 字切段…")
+                        self.clear_reference_cache()
+                        self._empty_cache()
+                        continue
+                    self.stats.error = f"{type(e).__name__}: {e}"
+                    self._emit("infer_error", self.stats.error)
+                    tts.gr_progress = None
+                    raise
+                finally:
+                    tts.low_vram = low
+            if out is None and last_exc is not None:
+                raise last_exc
+            tts.gr_progress = None
 
             dt = time.perf_counter() - t0
             self.stats.infer_count += 1
@@ -932,7 +968,8 @@ class TTSEngine:
             self._refresh_vram()
             self._emit(
                 "inferred",
-                f"推理完成，耗时 {dt:.2f}s，峰值显存 {self.stats.vram_peak_gb:.2f} GB",
+                f"推理完成，耗时 {dt:.2f}s，峰值显存 {self.stats.vram_peak_gb:.2f} GB"
+                + ("（连续性模式）" if use_cont else ""),
             )
             return out
 

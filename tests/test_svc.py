@@ -297,6 +297,59 @@ class TestStreamConverter:
 # cover_pipeline（无 GPU 部分）
 # ---------------------------------------------------------------------------
 
+class TestContinuityMode:
+    def _engine(self, raise_first_oom=True):
+        import threading
+        from webui_app.services.engine import TTSEngine, EngineStats
+
+        class _TTS:
+            low_vram = True
+            gr_progress = None
+            def __init__(self):
+                self.calls = []
+            def infer(self, **kwargs):
+                self.calls.append(self.low_vram)
+                if raise_first_oom and len(self.calls) == 1:
+                    raise RuntimeError("CUDA out of memory. Tried to allocate")
+                return "out.wav"
+
+        eng = TTSEngine.__new__(TTSEngine)
+        eng._lock = threading.RLock()
+        eng._svc_leases = []
+        eng._tts = _TTS()
+        eng.stats = EngineStats()
+        eng.continuity_mode = True
+        eng._refresh_vram = lambda: None
+        eng._emit = lambda *a, **k: None
+        eng._empty_cache = lambda: None
+        eng.clear_reference_cache = lambda: None
+        return eng
+
+    def test_continuity_oom_falls_back(self):
+        eng = self._engine()
+        out = eng.infer(text="x" * 100)
+        assert out == "out.wav"
+        assert eng._tts.calls == [False, True]   # 先整段，再回退 40 字切段
+        assert eng._tts.low_vram is True
+        assert eng._tts.gr_progress is None
+
+    def test_continuity_off_single_attempt(self):
+        eng = self._engine(raise_first_oom=False)
+        eng.continuity_mode = False
+        out = eng.infer(text="x" * 100)
+        assert out == "out.wav"
+        assert eng._tts.calls == [True]
+
+    def test_non_oom_not_retried(self):
+        import pytest as _pytest
+        eng = self._engine()
+        def _bad(**kw):
+            raise ValueError("bad input")
+        eng._tts.infer = _bad
+        with _pytest.raises(ValueError):
+            eng.infer(text="x")
+
+
 class TestKeyShift:
     def test_plan_key_shift(self):
         f0 = np.full(100, 500.0)

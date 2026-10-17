@@ -357,3 +357,59 @@ BS-Roformer 与 UVR-DeEcho-DeReverb 已做加载冒烟（6.0s / 0.1s）。
 本项目 UI 暴露的模型（Roformer/VR）走 PyTorch 路径，**不受影响**；若未来
 启用 MDX(ONNX) 模型，需将 onnxruntime-gpu 固定到 1.22.x（CUDA 12）或升级
 torch 到 cu13 分支。
+
+---
+
+## 11. 阶段46：低显存阶段调度与连续性模式（2026-10-17）
+
+**背景**：本机 8GB 显存 / 16GB 内存。当前精度并非整条链低精度：GPT bf16；
+w2v-BERT、codec、CFM、BigVGAN 均为 fp32。bf16 对扩散 TTS 近无损，
+“升精度”不是音质杠杆。真正可做的是**按阶段把不用的模块让出显存**，
+以及**减少低显存下的 40 字硬切**，让一段话更像“一句话说出来”。
+
+### 11.1 C1（已实现）：连续性模式
+
+- 系统页新增开关「连续性模式（长段合成；OOM 自动回退）」。
+- `TTSEngine.infer` 在 `continuity_mode=True` 且 `tts.low_vram=True` 时：
+  1. 临时 `tts.low_vram=False`，跳过官方 `>40 字按标点切段`，改按
+     `max_text_tokens_per_segment`（默认 120）分句；
+  2. 若 OOM：清参考缓存 + `empty_cache`，恢复 `low_vram=True`
+     （40 字切段）重试一次；事件日志记录回退；
+  3. 结束/异常恢复 `tts.low_vram` 原值。
+- **不改模型数学/精度**，只改切段策略；失败自动回退，不会把合成搞坏。
+- 硬上限仍在：GPT `max_mel_tokens=1815`（25Hz≈72.6s）、CFM 8192 帧
+  （含 15s 参考约 1292 帧）。超长文本仍会按 token/标点切。
+- 默认关闭；建议长文本 A/B：切段次数、段间 200ms 静音、跨句韵律。
+
+### 11.2 C2（规划）：模块级阶段卸载（offload）
+
+目标：参考特征构建后把 w2v-BERT 移到 CPU（约 2.2GB）；GPT 生成完把 GPT
+移到 CPU（bf16≈1.5GB / fp32≈3.1GB），腾出显存给更长段/更大块/E2。
+
+- 实现方式优先 **Diffusers 式 model-level offload**（按阶段搬整个组件），
+  不用 sequential 逐层（GPT 自回归逐 token 搬层会灾难性变慢）。
+- 需要在上游 `infer_v2_5.infer` 的参考/GPT 边界加一个**可选回调**（新增
+  参数，默认 None，不改变原路径），或在 `webui_app` 做旁路；不要直接改
+  上游默认行为。
+- 启用条件：`not accel and not torch_compile`（编译图/缓存与设备绑定）；
+  每次搬 1.5–2.2GB，离线可接受，实时不适用。
+- 收益：容量/上下文（更少切段、更长参考/分块、E2 44.1k 装得下），
+  **不是音质/精度**。
+
+### 11.3 C3（规划）：评测与闸门
+
+- 长文本 A/B：3–5 段 100–300 字文本；比较切段次数、段间静音、跨句韵律、
+  尾段稳定性；同时监控 OOM 与回退率。
+- 通过线：连续性模式无 OOM 或回退率 <10%；主观跨句衔接不劣于 40 字切段；
+  若长段出现韵律漂移/尾部不稳，默认保持关闭。
+- Cover 侧：offload 不解决 O(T²) 激活；30s 分块上限仍以实测 OOM 为准，
+  不因 offload 直接放宽到 60s。
+
+### 11.4 参考技术
+
+- HuggingFace Accelerate big model inference（device_map / CPU offload）
+- Diffusers `enable_model_cpu_offload` / `enable_sequential_cpu_offload`
+- DeepSpeed ZeRO-Inference（CPU/NVMe 权重流式）
+- bf16 近无损：LongCat-AudioDiT bf16 模型卡；IndexTTS2 社区盲听
+  （fp32 4.7 / bf16 4.6 / fp16 3.9，二手来源）
+- MoE 化：dense 模型不适用；事后 MoEfication 需训练/路由，收益低。

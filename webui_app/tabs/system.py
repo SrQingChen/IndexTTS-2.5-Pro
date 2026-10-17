@@ -164,6 +164,11 @@ def render(ctx: AppContext):
                     release_qwen_btn = gr.Button("卸载 QwenEmotion", scale=1, size="sm")
                 unload_btn = gr.Button("⏏ 卸载整个引擎（归还全部显存）",
                                        variant="stop", scale=1)
+                continuity_cb = gr.Checkbox(
+                    value=bool(getattr(eng, "continuity_mode", False)),
+                    label="连续性模式（长段合成；OOM 自动回退）",
+                    info="低显存下临时取消官方 40 字硬切，按 max_text_tokens_per_segment "
+                         "整段合成，减少段间静音/语气断裂；显存不足自动回退")
                 maint_out = gr.HTML("")
 
             with gr.Column(elem_classes=["ix-section"]):
