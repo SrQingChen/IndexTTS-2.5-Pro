@@ -62,6 +62,8 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
+import numpy as np
+
 from webui_app.config import PROJECT_ROOT
 from webui_app.training import dataset as DS
 from webui_app.training.dataset import HARD_MAX_SEC, MAX_TRAIN_SEC
@@ -82,6 +84,21 @@ FEATURE_SCHEMA: Dict[str, str] = {
     "mu_prompt":   "fp16 (Tm, 512)  length_regulator(原始 w2v-bert) —— 当参考音频用",
     "mu_target":   "fp16 (Tm, 512)  length_regulator(decode(codes)) —— 当训练目标用",
 }
+
+# E1-T 歌声条件字段（可选；只有 singing 数据集才写入，缺省视为 control/无 F0）。
+# FEATURE_VERSION 不动：主 schema 不变，旧缓存在 TTS 训练路径下照常可用
+# （ singing 训练时缺字段样本会被降级或剔除，见 CfmTrainOptions.singing）。
+SINGING_SCHEMA: Dict[str, str] = {
+    "f0":       "fp32 (Tm,)   mel 帧率 F0（Hz，清音=0），TimbreConditioner 的音高条件",
+    "f0_mean":  "float        浊音 log2-F0 均值（说话人统计，条件归一化用）",
+    "f0_std":   "float        浊音 log2-F0 标准差",
+    "tech":     "uint8 (Tm,)  mel 帧率 technique 0..6（0=control），条件标签",
+}
+
+# technique id ↔ 名称（与 indextts/s2mel/modules/conditioners.py 的词表一致）
+TECHNIQUE_NAMES = ("control", "mixed", "falsetto", "breathy",
+                   "pharyngeal", "vibrato", "glissando")
+TECHNIQUE_IDS = {n: i for i, n in enumerate(TECHNIQUE_NAMES)}
 
 META_KEYS = ("id", "text", "lang", "lang_token", "duration", "mel_len",
              "n_codes", "n_text_tokens", "feature_version", "extract_seconds",
@@ -159,6 +176,48 @@ def encode_text(tts, text: str, lang: str = "ZH",
 
 
 # ---------------------------------------------------------------------------
+# E1-T 歌声条件工具（F0 网格 / technique 展开）
+# ---------------------------------------------------------------------------
+
+def f0_to_mel_grid(f0_5ms: np.ndarray, mel_len: int,
+                   voiced_bridge_thresh: float = 0.45) -> np.ndarray:
+    """5ms 网格 F0 → mel 帧网格（86.13Hz）。
+
+    归一化 linspace 插值（与 svc_f0._interp_to_grid 同一语义）：
+    - 清音段不被线性插值架桥成假浊音（目标位 voiced 占比 < 阈值 → 0）；
+    - 网格换算只做端点线性映射，与项目既有 50Hz→mel 的处理口径一致。
+    """
+    f0_5ms = np.asarray(f0_5ms, dtype=np.float64)
+    if mel_len <= 0:
+        return np.zeros(0, dtype=np.float32)
+    if len(f0_5ms) == 0:
+        return np.zeros(mel_len, dtype=np.float32)
+    xs = np.linspace(0.0, 1.0, len(f0_5ms))
+    xg = np.linspace(0.0, 1.0, mel_len)
+    v = f0_5ms > 0
+    out = np.interp(xg, xs, f0_5ms)
+    if v.sum() > 2:
+        vv = np.interp(xg, xs, v.astype(np.float64))
+        out[vv < voiced_bridge_thresh] = 0.0
+    return out.astype(np.float32)
+
+
+def expand_technique_segments(segments: Sequence[Tuple[float, float, int]],
+                              mel_len: int,
+                              num_classes: int = len(TECHNIQUE_NAMES)
+                              ) -> np.ndarray:
+    """(start_sec, end_sec, tech_id) 段列表 → mel 帧级 technique（默认 0=control）。"""
+    tech = np.zeros(int(mel_len), dtype=np.uint8)
+    for seg in segments or ():
+        s, e, tid = float(seg[0]), float(seg[1]), int(seg[2])
+        k0 = max(0, int(round(s * MEL_FPS)))
+        k1 = min(mel_len, int(round(e * MEL_FPS)))
+        if k1 > k0:
+            tech[k0:k1] = max(0, min(num_classes - 1, tid))
+    return tech
+
+
+# ---------------------------------------------------------------------------
 # 提取器
 # ---------------------------------------------------------------------------
 
@@ -221,10 +280,20 @@ class FeatureExtractor:
     # ---------------- 单条提取 ----------------
     def extract(self, audio_path: str, text: str, lang: str = "ZH",
                 text_normalization: bool = True,
-                store_w2v_feat: bool = False) -> Dict[str, Any]:
+                store_w2v_feat: bool = False,
+                singing: bool = False,
+                technique_segments: Optional[List[Tuple[float, float, int]]] = None
+                ) -> Dict[str, Any]:
         """提取一条样本的全部特征。返回可直接 torch.save 的 dict。
 
         抛异常表示这条样本没法用（音频损坏、超长等），由调用方决定跳过还是中止。
+
+        singing=True 追加 E1-T 歌声条件字段（SINGING_SCHEMA）：
+          f0: harvest 5ms → mel 帧网格（86.13Hz）线性插值，清音不架桥
+              （复用 svc_f0 的网格语义：voiced 占比 <0.45 的插值位归零）；
+          f0_mean/f0_std: 本条样本浊音 log2-F0 统计（说话人归一化锚点）；
+          tech: technique_segments (start_sec, end_sec, tech_id) 展开，
+              无标签全 control(0)。
         """
         import torch
         import torchaudio
@@ -331,6 +400,31 @@ class FeatureExtractor:
             # 只在调试时开：w2v-bert 特征是最大的一块（100KB/秒），
             # 正常训练用不到 —— emo_vec 和 mu_prompt 都已经从它算出来了
             out["spk_cond_emb"] = spk_cond_emb.squeeze(0).to(torch.float16).cpu()
+
+        if singing:
+            # ---- E1-T 歌声条件（docs/dev-plan-e1t-2026-10.md Step 2）----
+            from webui_app.services import svc_f0
+            f0_5ms = svc_f0.harvest_f0(
+                np.asarray(audio_22k.squeeze(0).cpu().numpy(), dtype=np.float64),
+                22050)
+            f0_mel = f0_to_mel_grid(f0_5ms, mel_len)
+            voiced = f0_mel[f0_mel > 0]
+            if len(voiced) >= 3:
+                lg = np.log2(voiced)
+                out["f0"] = torch.tensor(f0_mel, dtype=torch.float32)
+                out["f0_mean"] = float(lg.mean())
+                out["f0_std"] = float(lg.std())
+            else:
+                # 几乎全清音：字段仍写（形状对齐），统计退化由 collate 兜底
+                out["f0"] = torch.zeros(mel_len, dtype=torch.float32)
+                out["f0_mean"], out["f0_std"] = 0.0, 1.0
+                warns.append("浊音帧过少，F0 统计不可用（已置默认）")
+            tech = expand_technique_segments(
+                technique_segments or [], mel_len)
+            out["tech"] = torch.tensor(tech, dtype=torch.uint8)
+            # 主导非 control 技巧（无则 -1）：写 meta 给 technique 均衡采样用
+            vals, cnts = np.unique(tech[tech > 0], return_counts=True)
+            out["tech_dom"] = int(vals[np.argmax(cnts)]) if len(vals) else -1
         return out
 
     # ---------------- 落盘 ----------------
@@ -340,7 +434,9 @@ class FeatureExtractor:
 
     def extract_to(self, ds_dir: str, uid: str, audio_path: str, text: str,
                    lang: str = "ZH", text_normalization: bool = True,
-                   overwrite: bool = False) -> ExtractResult:
+                   overwrite: bool = False, singing: bool = False,
+                   technique_segments: Optional[List[Tuple[float, float, int]]] = None
+                   ) -> ExtractResult:
         """提取一条并存盘。已存在且版本匹配时跳过（断点续提）。"""
         import torch
         path = self.feature_path(ds_dir, uid)
@@ -349,7 +445,9 @@ class FeatureExtractor:
                                  warnings=["已存在，跳过"], stats={"skipped": True})
         t0 = time.perf_counter()
         try:
-            feat = self.extract(audio_path, text, lang, text_normalization)
+            feat = self.extract(audio_path, text, lang, text_normalization,
+                                singing=singing,
+                                technique_segments=technique_segments)
         except Exception as e:
             return ExtractResult(id=uid, ok=False, error=f"{type(e).__name__}: {e}",
                                  seconds=time.perf_counter() - t0)
@@ -364,6 +462,7 @@ class FeatureExtractor:
                    "n_text_tokens": feat["n_text_tokens"],
                    "lang_token": feat["lang_token"],
                    "duration": feat["duration"],
+                   "tech_dom": int(feat.get("tech_dom", -1)),
                    "bytes": os.path.getsize(path)})
 
 
@@ -421,6 +520,24 @@ def check_feature(feat: Dict[str, Any]) -> List[str]:
             p.append(f"codes {n_codes} 超过 max_mel_tokens=1815")
         if feat["mu_prompt"].shape != feat["mu_target"].shape:
             p.append("mu_prompt 与 mu_target 形状不一致")
+        # E1-T 歌声字段（可选；存在才查，老数据集不误报）
+        def _tmax(x, default=0):
+            return float(x.max()) if getattr(x, "numel", lambda: 0)() else default
+
+        def _tmin(x, default=0):
+            return float(x.min()) if getattr(x, "numel", lambda: 0)() else default
+
+        if "f0" in feat:
+            if tuple(feat["f0"].shape) != (mel_len,):
+                p.append(f"f0 帧数 {tuple(feat['f0'].shape)} ≠ mel_len {mel_len}")
+            if _tmax(feat["f0"]) > 1600.0:
+                p.append("f0 出现 >1600Hz 的值（F0_CEIL=1100 之外的估计错误）")
+        if "tech" in feat:
+            if tuple(feat["tech"].shape) != (mel_len,):
+                p.append(f"tech 帧数 {tuple(feat['tech'].shape)} ≠ mel_len {mel_len}")
+            t = feat["tech"]
+            if _tmax(t) > 6 or _tmin(t) < 0:
+                p.append(f"tech 取值越界 [{_tmin(t)}, {_tmax(t)}]（应 0..6）")
     except Exception as e:
         p.append(f"自检异常：{type(e).__name__}: {e}")
     return p
@@ -445,11 +562,16 @@ def extract_dataset(name: str, overwrite: bool = False, only: str = "ready",
                     progress: Optional[Callable[[float, str], None]] = None,
                     should_stop: Optional[Callable[[], bool]] = None,
                     tts=None, device: Optional[str] = None,
+                    singing: bool = False,
                     ) -> Dict[str, Any]:
     """给整个数据集预提取特征。
 
     only: "ready" = 只处理**音频体检通过**的；"all" = 连有问题的也试（会记录失败）
     支持中断（should_stop）与断点续提（已存在的跳过）。
+
+    singing=True 时追加 E1-T 条件字段（F0/tech）。technique 标签从数据集
+    目录下的 `technique.json`（{uid: [[start,end,id],...]}，秒）读取；
+    没有就全 control——与 GTSinger 无标注帧的语义一致。
 
     注意 `only="ready"` 筛的是 `status in (ready, no_features)`，而不是只看
     `status == "ready"`：数据集页体检时会带 require_features=True，没特征的
@@ -493,6 +615,16 @@ def extract_dataset(name: str, overwrite: bool = False, only: str = "ready",
     touched: Dict[str, Dict[str, Any]] = {}
 
     try:
+        # E1-T technique 标签（可选伴生文件：数据集目录下 technique.json）
+        tech_map: Dict[str, Any] = {}
+        tech_warn = ""
+        if singing:
+            tp = os.path.join(ds_dir, "technique.json")
+            if os.path.isfile(tp):
+                try:
+                    tech_map = json.load(open(tp, encoding="utf-8"))
+                except Exception as e:
+                    tech_warn = f"technique.json 解析失败（{e}），全部按 control 处理"
         for i, u in enumerate(todo):
             if should_stop and should_stop():
                 stopped = True
@@ -502,7 +634,8 @@ def extract_dataset(name: str, overwrite: bool = False, only: str = "ready",
             r = ex.extract_to(ds_dir, u.id, u.audio_abs(ds_dir),
                               u.text or u.asr_text or "",
                               u.lang or lang_default, text_normalization,
-                              overwrite=overwrite)
+                              overwrite=overwrite, singing=singing,
+                              technique_segments=tech_map.get(u.id))
             results.append(r)
             if not r.ok:
                 n_fail += 1
@@ -525,6 +658,7 @@ def extract_dataset(name: str, overwrite: bool = False, only: str = "ready",
                     "n_codes": int(st.get("n_codes") or 0),
                     "n_text_tokens": int(st.get("n_text_tokens") or 0),
                     "lang_token": int(st.get("lang_token") or 1),
+                    "tech_dom": int(st.get("tech_dom", -1)),
                 }
     finally:
         ex.unload()
@@ -535,6 +669,8 @@ def extract_dataset(name: str, overwrite: bool = False, only: str = "ready",
 
     seconds = time.perf_counter() - t0
     warns = sorted({w for r in results for w in r.warnings if w != "已存在，跳过"})
+    if tech_warn:
+        warns.insert(0, tech_warn)
     if vram_warn:
         warns.insert(0, vram_warn)
     return {
@@ -764,6 +900,13 @@ def build_cfm_pair(prompt: Dict[str, Any], target: Dict[str, Any],
     推理时 `vc_target[:, :, ref_mel.size(-1):]` 把 prompt 段切掉，
     训练时 `BASECFM.forward` 把 prompt 段的 y 置 0 且不计 loss —— 同一件事。
 
+    E1-T 条件（存在时同步拼接）：
+        f0  = [prompt 自身 f0 | target 自身 f0]（Hz，清音=0）
+        tech= [prompt 自身 tech | target 自身 tech]
+    prompt 帧区段用**参考自身的 F0**（r1-2）：推理时参考段填的也是参考音频
+    自身 harvest F0，训练/推理同分布；旧的语音数据集无 f0 字段则整对不带
+    条件（None），训练路径退回原样。
+
     prompt 与 target 可以是同一条（自提示），也可以来自同一说话人的不同句子。
     """
     import torch
@@ -775,13 +918,26 @@ def build_cfm_pair(prompt: Dict[str, Any], target: Dict[str, Any],
     mu = torch.cat([prompt["mu_prompt"].float(), target["mu_target"].float()], dim=0)
     if x1.shape[1] != mu.shape[0]:
         return None                      # 理论上不会发生，check_feature 已经保证
-    return {
+    out = {
         "x1": x1,                                    # (80, Tp+Tt)
         "mu": mu,                                    # (Tp+Tt, 512)
         "style": prompt["style"].float(),            # (192,)
         "prompt_len": tp,
         "total_len": tp + tt,
     }
+    # E1-T：两侧都带 f0 才拼条件（f0_stats 用 target 侧还是 prompt 侧？
+    # 条件作用在逐帧 style 上，prompt 帧与 target 帧各自的 F0 都要各自统计。
+    # 这里逐帧存 Hz，归一化统计按「帧归属」在 collate 时分别取——但一条
+    # 训练对跨两个说话人片段（other 配对）时统一统计会互相污染，因此
+    # stats 存 dict：prompt 侧与 target 侧分开（collate 拼 batch 用）。
+    if "f0" in prompt and "f0" in target:
+        out["f0"] = torch.cat([prompt["f0"].float(), target["f0"].float()], dim=0)
+        out["tech"] = torch.cat([prompt["tech"].long(), target["tech"].long()], dim=0)
+        out["f0_stats_prompt"] = (float(prompt.get("f0_mean", 0.0)),
+                                  float(prompt.get("f0_std", 1.0)))
+        out["f0_stats_target"] = (float(target.get("f0_mean", 0.0)),
+                                  float(target.get("f0_std", 1.0)))
+    return out
 
 
 def build_gpt_sample(feat: Dict[str, Any]) -> Dict[str, Any]:
@@ -812,8 +968,11 @@ def build_cfm_sample(feat: Dict[str, Any]) -> Dict[str, Any]:
     故意**不转 fp32**：mu 是 (Tm, 512)，一条 700 帧的样本就 0.7 MB，
     样本池会缓存上百条 —— 缓存里转成 fp32 直接把内存翻倍，
     而 `build_cfm_pair` 在真正拼对时本来就会 `.float()`。
+
+    E1-T 字段（f0/tech/f0_mean/f0_std）只在源样本存在时透传；
+    老数据集（语音 TTS 训练）不带，pair 侧自动退回无条件路径。
     """
-    return {
+    out = {
         "mel": feat["mel"],                    # (80, Tm)  fp16
         "mu_prompt": feat["mu_prompt"],        # (Tm, 512) fp16
         "mu_target": feat["mu_target"],        # (Tm, 512) fp16
@@ -821,3 +980,9 @@ def build_cfm_sample(feat: Dict[str, Any]) -> Dict[str, Any]:
         "mel_len": int(feat["mel_len"]),
         "n_codes": int(feat["n_codes"]),
     }
+    if "f0" in feat:
+        out["f0"] = feat["f0"]                                  # (Tm,) fp32
+        out["tech"] = feat["tech"]                              # (Tm,) uint8
+        out["f0_mean"] = float(feat.get("f0_mean", 0.0) or 0.0)
+        out["f0_std"] = float(feat.get("f0_std", 1.0) or 1.0)
+    return out

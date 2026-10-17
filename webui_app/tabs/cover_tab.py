@@ -38,6 +38,16 @@ _KEY_OUT_TO_KEY = {"整首降调（推荐音质）": "lower_key",
                    "仅人声升回原调（有移调伪影）": "original_key"}
 _KEY_OUT_TO_LABEL = {v: k for k, v in _KEY_OUT_TO_KEY.items()}
 
+# E1-T 技巧条件来源的 label ↔ key
+_TECH_MODE_TO_KEY = {
+    "preserve 保持（control 直通）": "preserve",
+    "auto 分类器自动": "auto",
+    "manual 手动指定": "manual",
+}
+_TECH_MODE_TO_LABEL = {v: k for k, v in _TECH_MODE_TO_KEY.items()}
+_REG_MODE_TO_KEY = {"auto 分数音区映射（推荐）": "auto",
+                    "off 保原调硬唱": "off"}
+
 
 def _lora_cfm_choices() -> List[Any]:
     out: List[Any] = [(LORA_NONE, "")]
@@ -152,6 +162,29 @@ def render(ctx: AppContext) -> Dict[str, Any]:
             key_output_dd = make_component("cover_key_output", value=_st_key_out)
             key_ceiling_sl = make_component("cover_key_ceiling",
                                             value=int(st.get("key_ceiling", 600)))
+
+        gr.Markdown("### ③c 歌声模型（E1-T 实验性，默认关；需先训练 capability）")
+        with gr.Row():
+            sing_ck = make_component("cover_singing_enable",
+                                     value=bool(st.get("singing_enable", False)))
+            tech_mode_dd = make_component(
+                "cover_technique_mode",
+                value=_TECH_MODE_TO_LABEL.get(st.get("technique_mode", "preserve"),
+                                              "preserve 保持（control 直通）"))
+            tech_manual_sl = make_component(
+                "cover_technique_manual", value=int(st.get("technique_manual", 0)))
+        with gr.Row():
+            bon_ck = make_component("cover_bon_high",
+                                    value=bool(st.get("bon_high", False)))
+            hft_ck = make_component("cover_hf_transplant",
+                                    value=bool(st.get("hf_transplant", False)))
+            _reg_lbl = next((k for k, v in _REG_MODE_TO_KEY.items()
+                             if v == st.get("register_mode", "auto")),
+                            "auto 分数音区映射（推荐）")
+            reg_mode_dd = make_component("cover_register_mode",
+                                         value=_reg_lbl)
+            oct_fix_ck = make_component(
+                "cover_octave_fix", value=bool(st.get("octave_fix", True)))
 
         gr.Markdown("### ④ 后处理 / 超分 / 混音")
         with gr.Row():
@@ -284,9 +317,11 @@ def render(ctx: AppContext) -> Dict[str, Any]:
                       variant_dd, steps_sl, cfg_sl, ref_sec_sl, chunk_sl,
                       f0_mode_dd, tr_auto_ck, tr_semis_sl,
                       key_mode_dd, key_semis_sl, key_output_dd, key_ceiling_sl,
+                      sing_ck, tech_mode_dd, tech_manual_sl, bon_ck, hft_ck,
+                      reg_mode_dd, oct_fix_ck,
                       deess_ck, hflim_ck, spec_ck, breath_ck, hp_sl,
                       sr_ck, sr_steps_sl, mix_ck, bgm_upload, vgain_sl, ln_ck]
-        assert len(all_inputs) == 32, f"cover all_inputs 接线数错误: {len(all_inputs)}"
+        assert len(all_inputs) == 39, f"cover all_inputs 接线数错误: {len(all_inputs)}"
 
         @LOG.ui_guard("cover.start")
         def _start(progress=gr.Progress(), *vals):
@@ -295,11 +330,23 @@ def render(ctx: AppContext) -> Dict[str, Any]:
              variant_lbl, steps, cfg_rate, ref_seconds, chunk_sec,
              f0_lbl, tr_auto, tr_semis,
              key_mode_lbl, key_semis, key_output_lbl, key_ceiling,
+             sing_on, tech_mode_lbl, tech_manual, bon_on, hft_on,
+             reg_mode_lbl, oct_fix,
              deess, hflim, spec, breath, hp,
              sr_on, sr_steps, mix_on, bgm_up, vgain, loudnorm) = vals
 
             if not src:
                 raise gr.Error("请先上传源音频")
+            if sing_on:
+                import os as _os
+                from webui_app.config import PROJECT_ROOT as _ROOT
+                if not _os.path.isfile(_os.path.join(_ROOT, "checkpoints",
+                                                     "s2mel_singing.pth")):
+                    raise gr.Error(
+                        "未找到 checkpoints/s2mel_singing.pth：E1-T 需要先完成 "
+                        "capability 训练与合并（见参数手册「歌声模型」详情）")
+                gr.Warning("E1-T 为实验性歌声模型：会话内换装 singing CFM，"
+                           "结束自动恢复；TTS 不受影响。")
             if str(variant_lbl).startswith("B"):
                 gr.Warning("变体 B 是实验档（连续特征直通，分布外），歌声容易嘶哑；"
                            "建议切回 A 量化重构。")
@@ -344,6 +391,12 @@ def render(ctx: AppContext) -> Dict[str, Any]:
                 "sr_steps": sr_steps, "auto_mix": mix_on, "vocal_gain": vgain,
                 "loudnorm": loudnorm, "lora_run": lora_run if lora_run != LORA_NONE else "",
                 "lora_scale": lora_scale, "ref_voice": ref_bank,
+                "singing_enable": sing_on, "technique_mode":
+                _TECH_MODE_TO_KEY.get(tech_mode_lbl, "preserve"),
+                "technique_manual": int(tech_manual),
+                "bon_high": bon_on, "hf_transplant": hft_on,
+                "register_mode": _REG_MODE_TO_KEY.get(reg_mode_lbl, "auto"),
+                "octave_fix": bool(oct_fix),
             })
 
             req = CoverRequest(
@@ -371,6 +424,13 @@ def render(ctx: AppContext) -> Dict[str, Any]:
                 auto_mix=bool(mix_on),
                 mix_bgm_path=bgm_up if mix_on else None,
                 vocal_gain_db=float(vgain), loudness_normalize=bool(loudnorm),
+                singing_enable=bool(sing_on),
+                technique_mode=_TECH_MODE_TO_KEY.get(tech_mode_lbl, "preserve"),
+                technique_manual=int(tech_manual),
+                bon_high_pitch=bool(bon_on),
+                hf_transplant=bool(hft_on),
+                register_mode=_REG_MODE_TO_KEY.get(reg_mode_lbl, "auto"),
+                octave_fix=bool(oct_fix),
             )
 
             log_sink.clear()
@@ -412,7 +472,7 @@ def render(ctx: AppContext) -> Dict[str, Any]:
             if f0:
                 lines.append(f"- F0：模式 {f0.get('mode_used', '-')}，轮廓相关 "
                              f"r={f0.get('f0_r', '-')}，八度错误 {f0.get('octave_err', '-')}，"
-                             f"移调 {f0.get('transpose_semis', 0):+d}st")
+                             f"移调 {f0.get('transpose_semis', 0):+.2f}st")
             if "ss" in q:
                 lines.append(f"- 音色相似度 SS = **{q['ss']}**（参考线 ≥0.75）")
             key = report.get("key") or {}

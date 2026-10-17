@@ -505,7 +505,16 @@ class IndexTTS2:
     def infer(self, spk_audio_prompt, text, output_path, lang,
               emo_audio_prompt=None, emo_alpha=1.0,
               emo_vector=None, use_emo_text=False, emo_text=None, use_random=False, interval_silence=200,
-              verbose=False, max_text_tokens_per_segment=120, stream_return=False, more_segment_before=0, duration_factor=1.0, text_normalization=True, **generation_kwargs):
+              verbose=False, max_text_tokens_per_segment=120, stream_return=False, more_segment_before=0, duration_factor=1.0, text_normalization=True,
+              stage_hooks=None, **generation_kwargs):
+        """stage_hooks：可选的阶段边界回调（默认 None=原路径零改动）。
+
+        E1-T 会话规划 WP7（阶段46 C2 模块级阶段卸载）：引擎在
+        「参考特征构建后」「GPT 生成后（每个文本段）」两个边界调用
+        stage_hooks(stage, seg_idx=…, segments_count=…)——webui 侧用它把
+        w2v-BERT / GPT 按阶段搬 CPU 腾显存。上游 CLI 不传时行为与
+        官方版本完全一致（调用点全部 None 守卫）。
+        """
         if self.low_vram and not stream_return and len(text) > 40:
             segments = self.split_text_by_punctuation(text, max_chars=40)
             if verbose:
@@ -517,7 +526,7 @@ class IndexTTS2:
                     spk_audio_prompt, seg_text, None, lang,
                     emo_audio_prompt, emo_alpha, emo_vector,
                     use_emo_text, emo_text, use_random, 0,
-                    verbose, max_text_tokens_per_segment, False, 0, duration_factor=duration_factor, text_normalization=text_normalization, **generation_kwargs
+                    verbose, max_text_tokens_per_segment, False, 0, duration_factor=duration_factor, text_normalization=text_normalization, stage_hooks=stage_hooks, **generation_kwargs
                 )
                 result = None
                 for result in gen:
@@ -551,7 +560,7 @@ class IndexTTS2:
                 emo_audio_prompt, emo_alpha,
                 emo_vector,
                 use_emo_text, emo_text, use_random, interval_silence,
-                verbose, max_text_tokens_per_segment, stream_return, more_segment_before, duration_factor=duration_factor, text_normalization=text_normalization, **generation_kwargs
+                verbose, max_text_tokens_per_segment, stream_return, more_segment_before, duration_factor=duration_factor, text_normalization=text_normalization, stage_hooks=stage_hooks, **generation_kwargs
             )
         else:
             try:
@@ -569,7 +578,8 @@ class IndexTTS2:
     def infer_generator(self, spk_audio_prompt, text, output_path, lang,
               emo_audio_prompt=None, emo_alpha=1.0, emo_vector=None,
               use_emo_text=False, emo_text=None, use_random=False, interval_silence=200,
-              verbose=False, max_text_tokens_per_segment=120, stream_return=False, quick_streaming_tokens=0, duration_factor=1.0, text_normalization=True, **generation_kwargs):
+              verbose=False, max_text_tokens_per_segment=120, stream_return=False, quick_streaming_tokens=0, duration_factor=1.0, text_normalization=True,
+              stage_hooks=None, **generation_kwargs):
         print(">> starting inference...")
         self._set_gr_progress(0, "starting inference...")
         if verbose:
@@ -664,6 +674,11 @@ class IndexTTS2:
             prompt_condition = self.cache_s2mel_prompt
             spk_cond_emb = self.cache_spk_cond
             ref_mel = self.cache_mel
+
+        if stage_hooks is not None:
+            # 参考特征已缓存：w2v-BERT 在本次调用的剩余阶段（GPT/CFM/声码）
+            # 不再被需要——引擎可在此把它搬 CPU 腾显存（阶段46 C2）
+            stage_hooks("after_reference")
 
         if emo_vector is not None:
             weight_vector = torch.tensor(emo_vector, device=self.device)
@@ -790,6 +805,12 @@ class IndexTTS2:
                     )
 
                 gpt_gen_time += time.perf_counter() - m_start_time
+                if stage_hooks is not None:
+                    # 本段 codes 已生成：GPT 在 CFM/声码阶段空闲。
+                    # 多段场景只有最后一段值得下移（前面的段还要用 GPT），
+                    # 判断交给钩子自己（引擎持有段计数）。
+                    stage_hooks("after_gpt", seg_idx=seg_idx,
+                                segments_count=segments_count)
                 if not has_warned and (codes[:, -1] != self.stop_mel_token).any():
                     warnings.warn(
                         f"WARN: generation stopped due to exceeding `max_mel_tokens` ({max_mel_tokens}). "

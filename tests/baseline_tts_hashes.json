@@ -1,0 +1,6 @@
+{
+ "checkpoints/config.yaml": "5902f4f7126a5f4927c16418f5cb0ef4",
+ "checkpoints/hf_cache/bigvgan/bigvgan_generator.pt": "ac8a425c522c18f24154d23b23e5ab0e",
+ "checkpoints/hf_cache/bigvgan/config.json": "d35b4f90004c074eab01d704de5591a0",
+ "checkpoints/s2mel.pth": "ca923bd52acdd113338bc4f76ded91c0"
+}

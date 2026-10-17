@@ -155,6 +155,21 @@ class CfmTrainOptions:
     log_every: int = 10
     save_optimizer_state: bool = True
 
+    # ---- E1-T 歌声条件（默认全关；关=与旧训练完全一致）----
+    # singing=True：底座必须是 config_singing.yaml + s2mel_singing.pth（或
+    # capability merge 前的原始 s2mel.pth + 新建 conditioner），样本必须带
+    # f0/tech 字段；_train_micro_batch 会把条件喂进 CFM。
+    # 注意：**不做**条件侧移调增广（只改 F0 标签不改 mel 会教模型忽略条件，
+    # 与「条件不能是死参数」的红线冲突）；音高增广在导入期做音频域移调
+    # （tools/gtsinger_import.py --pitch-aug，SPA-SVC 思想的离线版）。
+    singing: bool = False
+    # technique 均衡采样：按样本主导非 control 技巧的出现频率上调稀有类
+    # （falsetto/mixed 不被 control 淹没）。tech_dom 由特征提取写进 meta。
+    singing_tech_balance: bool = False
+    # 可选辅助损失开关（第一版默认 0=关，只留接口；见 WP3 规划说明）
+    tech_ce_weight: float = 0.0
+    f0_aux_weight: float = 0.0
+
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
 
@@ -217,6 +232,17 @@ class CfmTrainOptions:
                  "inference_cfg_rate=0.7 会真的走「条件全为 0」那条分支，"
                  "而 LoRA 从没见过这种输入，CFG 修正项可能漂。建议保持 -1")
 
+        if self.singing and not 0.0 <= float(self.tech_ce_weight) <= 1.0:
+            err(f"tech_ce_weight={self.tech_ce_weight} 超出 0~1")
+        if self.singing and not 0.0 <= float(self.f0_aux_weight) <= 1.0:
+            err(f"f0_aux_weight={self.f0_aux_weight} 超出 0~1")
+        if not self.singing and (self.tech_ce_weight or self.f0_aux_weight
+                                 or self.singing_tech_balance):
+            info("singing=False：technique 均衡/辅助损失开关不生效")
+        if self.tech_ce_weight or self.f0_aux_weight:
+            warn("tech_ce_weight/f0_aux_weight 目前是**预留接口**：训练循环"
+                 "尚未消费这两个损失（第一版只保条件透传，见会话规划 WP3）。"
+                 "设置非 0 值不会有任何效果——防止「以为加了辅助损失」的误判。")
         if not 1 <= int(self.val_repeats) <= 8:
             err(f"val_repeats={self.val_repeats} 超出 1~8")
         elif int(self.val_repeats) > 1:
@@ -295,6 +321,9 @@ def truncate_prompt(sample: Dict[str, Any], max_frames: int) -> Dict[str, Any]:
     `prompt["mel"].shape[1]` 当 Tp，然后拼 `prompt["mu_prompt"]`。
     两者长度不一致时它会返回 None（x1 与 mu 帧数对不上），
     整个 batch 就少一条 —— 不报错，只是数据悄悄变少。
+
+    E1-T 的 f0/tech 同理（帧级条件，与 mel 同步截，否则错位一帧
+    就是一次「音高条件 ↔ 频谱」的错配训练）。
     """
     T = int(sample["mel"].shape[1])
     if max_frames <= 0 or T <= max_frames:
@@ -302,6 +331,9 @@ def truncate_prompt(sample: Dict[str, Any], max_frames: int) -> Dict[str, Any]:
     out = dict(sample)
     out["mel"] = sample["mel"][:, :max_frames]
     out["mu_prompt"] = sample["mu_prompt"][:max_frames]
+    for k in ("f0", "tech"):
+        if k in sample:
+            out[k] = sample[k][:max_frames]
     out["mel_len"] = max_frames
     return out
 
@@ -314,6 +346,9 @@ def truncate_target(sample: Dict[str, Any], max_frames: int) -> Dict[str, Any]:
     out = dict(sample)
     out["mel"] = sample["mel"][:, :max_frames]
     out["mu_target"] = sample["mu_target"][:max_frames]
+    for k in ("f0", "tech"):
+        if k in sample:
+            out[k] = sample[k][:max_frames]
     out["mel_len"] = max_frames
     return out
 
@@ -365,6 +400,12 @@ def collate_cfm(pairs: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
       · loss：`BASECFM.forward:156` 只切 `[prompt_lens[b]:x_lens[b]]`，
         填充位在区间之外。
     所以唯一必须传对的是 **x_lens 与 prompt_lens** 这两个真实长度。
+
+    E1-T（pairs 带条件时追加，老数据集自动退回原 dict）：
+      f0 (B,Tmax) Hz 清音=0；technique (B,Tmax) long；
+      f0_mean/f0_std (B,Tmax)：**逐帧**统计——prompt 帧区段用 prompt 侧
+      说话人统计、target 区段用 target 侧（other 配对跨说话人时不互相
+      污染）；归一化本身在 conditioner 内做，collate 只搬统计量。
     """
     import torch
 
@@ -378,7 +419,7 @@ def collate_cfm(pairs: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
         T = int(p["total_len"])
         x1[i, :, :T] = p["x1"]
         mu[i, :T, :] = p["mu"]
-    return {
+    batch = {
         "x1": x1, "mu": mu,
         "style": torch.stack([p["style"] for p in pairs]),
         "x_lens": torch.LongTensor([int(p["total_len"]) for p in pairs]),
@@ -386,6 +427,25 @@ def collate_cfm(pairs: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
         "target_frames": torch.LongTensor(
             [int(p["total_len"]) - int(p["prompt_len"]) for p in pairs]),
     }
+    if all("f0" in p for p in pairs):
+        f0 = torch.zeros(B, Tmax, dtype=torch.float32)
+        tech = torch.zeros(B, Tmax, dtype=torch.long)
+        mean = torch.zeros(B, Tmax, dtype=torch.float32)
+        std = torch.ones(B, Tmax, dtype=torch.float32)
+        for i, p in enumerate(pairs):
+            T = int(p["total_len"])
+            pl = int(p["prompt_len"])
+            f0[i, :T] = p["f0"]
+            tech[i, :T] = p["tech"]
+            pm, ps = p.get("f0_stats_prompt", (0.0, 1.0))
+            tm, ts = p.get("f0_stats_target", (0.0, 1.0))
+            mean[i, :pl] = float(pm)
+            std[i, :pl] = max(float(ps), 0.1)
+            mean[i, pl:T] = float(tm)
+            std[i, pl:T] = max(float(ts), 0.1)
+        batch.update({"f0": f0, "technique": tech,
+                      "f0_mean": mean, "f0_std": std})
+    return batch
 
 
 def plan_batches(order: Sequence[Tuple[str, int, int]],
@@ -518,7 +578,9 @@ def rng_guard(seed: int):
 # ===========================================================================
 
 def load_base_cfm(device: str = "cuda", model_dir: Optional[str] = None,
-                  verify_keys: bool = True):
+                  verify_keys: bool = True,
+                  cfg_path: Optional[str] = None,
+                  pth_name: Optional[str] = None):
     """加载一份**独立于推理引擎**的 CFM。
 
     不复用引擎里那份的三个理由（与 GPT 那边一致）：
@@ -540,16 +602,22 @@ def load_base_cfm(device: str = "cuda", model_dir: Optional[str] = None,
     from indextts.s2mel.modules.commons import MyModel
 
     model_dir = model_dir or os.path.join(PROJECT_ROOT, GD.MODEL_DIR_NAME)
-    cfg_path = os.path.join(model_dir, "config.yaml")
+    cfg_path = cfg_path or os.path.join(model_dir, "config.yaml")
     if not os.path.isfile(cfg_path):
         raise FileNotFoundError(f"找不到 {cfg_path}")
     cfg = OmegaConf.load(cfg_path)
+    # E1-T：singing config 必须显式开条件，且权重名必须区别于 TTS 底座——
+    # 两个守卫都在这里拦，别等训练跑了半天才发现喂的是语音底座。
+    is_singing_cfg = bool(getattr(cfg.s2mel.DiT, "technique_condition", False))
+    if cfg_path.endswith("config_singing.yaml") and not is_singing_cfg:
+        raise RuntimeError("config_singing.yaml 缺少 DiT.technique_condition: true")
 
     holder = MyModel(cfg.s2mel)
     cfm = holder.models["cfm"]
     del holder                              # length_regulator 用不到，早点释放
 
-    pth = os.path.join(model_dir, str(cfg.s2mel_checkpoint))
+    ckpt_name = pth_name or str(cfg.s2mel_checkpoint)
+    pth = ckpt_name if os.path.isabs(ckpt_name) else os.path.join(model_dir, ckpt_name)
     if not os.path.isfile(pth):
         raise FileNotFoundError(f"找不到底座权重 {pth}")
 
@@ -580,7 +648,9 @@ def load_base_cfm(device: str = "cuda", model_dir: Optional[str] = None,
                 "继续训会得到一个与推理不一致的模型。")
     cfm = cfm.to(device)
     return cfm, {"missing": len(missing), "unexpected": len(unexpected),
-                 "path": pth, "model_dir": model_dir}
+                 "path": pth, "model_dir": model_dir,
+                 "cfg_path": cfg_path, "singing_cfg": is_singing_cfg,
+                 "has_conditioner": hasattr(cfm.estimator, "timbre_conditioner")}
 
 
 def estimate_vram_gb(base_params: int, adapter_params: int, bf16: bool,
@@ -623,11 +693,14 @@ class CfmTrainer(TB.BaseTrainer):
                  run_name: Optional[str] = None, device: Optional[str] = None,
                  model_dir: Optional[str] = None, val_ratio: float = 0.05,
                  resume_from: Optional[str] = None,
-                 train_root: Optional[str] = None):
+                 train_root: Optional[str] = None,
+                 cfg_path: Optional[str] = None):
         super().__init__(dataset, cfg=cfg, run_name=run_name, device=device,
                          model_dir=model_dir, val_ratio=val_ratio,
                          resume_from=resume_from, train_root=train_root)
         self.options = options or CfmTrainOptions()
+        # E1-T：singing 底座的 config（config_singing.yaml）；None=默认 TTS 底座
+        self.singing_cfg_path = cfg_path
         self.pools: Dict[str, CfmSamplePool] = {}
         self.val_pool: Optional[CfmSamplePool] = None
         # val 单独一套 pools，理由与 GPT 那边完全相同（那里踩过一次）：
@@ -691,6 +764,13 @@ class CfmTrainer(TB.BaseTrainer):
             "frame_caps": {"prompt": int(self.options.max_prompt_frames),
                            "target": int(self.options.max_target_frames),
                            "total": int(self.options.max_total_frames)},
+            "singing": {
+                "enabled": bool(self.options.singing),
+                "cfg_path": str(self.singing_cfg_path or ""),
+                "tech_balance": bool(self.options.singing_tech_balance),
+                "tech_ce_weight": float(self.options.tech_ce_weight),
+                "f0_aux_weight": float(self.options.f0_aux_weight),
+            },
         }
 
     # =======================================================================
@@ -813,6 +893,20 @@ class CfmTrainer(TB.BaseTrainer):
             self.pools["replay"].restrict(self.replay_ids)
         n_replay_pool = len(self.replay_ids)
 
+        # ---- E1-T：singing 样本字段预检（早失败，别等第一个 batch 才发现）----
+        if opt.singing:
+            probe = tgt.load(tgt.ids[0]) if len(tgt.ids) else None
+            if probe is not None and "f0" not in probe:
+                _add(GD.Notice(
+                    "error",
+                    "singing=True 但数据集特征缺 f0/tech 字段：请用"
+                    "「singing 模式」重新提取（tools/gtsinger_import.py 导入的"
+                    "数据集已带；旧语音数据集本来就不该开 singing）。"))
+            elif probe is not None:
+                _add(GD.Notice(
+                    "info", f"歌声条件字段检查通过（f0 {tuple(probe['f0'].shape)}，"
+                    f"tech {tuple(probe['tech'].shape)}）。"))
+
         # ---- 配置体检 ----
         all_notes = self.cfg.validate(n_train) + opt.validate()
         if bool(self.cfg.grad_checkpointing):
@@ -884,6 +978,23 @@ class CfmTrainer(TB.BaseTrainer):
         self._pf = out
         return out
 
+    def _cond_kwargs(self, b: Dict[str, Any]) -> Dict[str, Any]:
+        """singing 训练时把 batch 里的条件递给 cfm_training_forward。
+
+        老数据集（无 f0 字段）→ 空 kwargs → 原路径，即使 singing=True 也
+        只是无声降级；第一次遇到时在报告里记一笔，别让用户白跑。
+        """
+        if not self.options.singing or "f0" not in b:
+            if self.options.singing and not getattr(self, "_warned_no_f0", False):
+                self._warned_no_f0 = True
+                self.report.note("warn",
+                                 "singing=True 但样本没有 f0/tech 字段"
+                                 "（数据集需用 singing 模式重新提取特征）；"
+                                 "本 run 的条件未生效。")
+            return {}
+        return {"f0": b["f0"], "technique": b["technique"],
+                "f0_stats": (b["f0_mean"], b["f0_std"])}
+
     def _select_replay(self, name: str, ready_ids: Sequence[str]) -> List[str]:
         pool = CfmSamplePool(name, ready_ids, kind="replay")
         ok, _bad = pool.usable_ids(int(self.options.min_target_frames))
@@ -905,7 +1016,20 @@ class CfmTrainer(TB.BaseTrainer):
                      progress: Optional[Callable[[float, str], None]]
                      ) -> Dict[str, Any]:
         self._progress(progress, 0.18, "加载 s2mel.pth（CFM 98M 参数）")
-        base, base_info = load_base_cfm(self.device, self.model_dir)
+        base, base_info = load_base_cfm(self.device, self.model_dir,
+                                        cfg_path=self.singing_cfg_path)
+        if self.options.singing:
+            if not base_info.get("has_conditioner"):
+                raise RuntimeError(
+                    "singing=True 但底座没有 TimbreConditioner：请用 "
+                    "config_singing.yaml（cfg_path）加载，或先用 merge 生成 "
+                    "s2mel_singing.pth。拿语音底座训歌声条件是白跑。")
+            if not base_info.get("singing_cfg"):
+                self.report.note("warn",
+                                 "singing=True 但使用的是默认 config.yaml"
+                                 "（无 technique_condition）——这只有在"
+                                 "「原始 s2mel.pth 上新建 conditioner 预训练」"
+                                 "的场景才合理，请确认是有意的。")
 
         self._progress(progress, 0.58,
                        f"注入 LoRA（{self.cfg.target_preset}, r={self.cfg.rank}）")
@@ -1015,6 +1139,8 @@ class CfmTrainer(TB.BaseTrainer):
         # 而不是学会「按 style/mu 渲染」。
         rnd = random.Random(int(self.cfg.seed) * 1000 + epoch * 17 + 3)
         items = [(k, ti, self._pick_prompt(k, ti, rnd)) for k, ti in plan]
+        if self.options.singing and self.options.singing_tech_balance:
+            items = self._balance_by_technique(items)
         info = {"source": self.replay_src, "dataset": self.replay_dataset,
                 "pool": len(self.replay_ids), "ratio": float(rplan.ratio),
                 "n_replay": int(rplan.n_replay),
@@ -1027,6 +1153,40 @@ class CfmTrainer(TB.BaseTrainer):
                                seed=int(self.cfg.seed) + epoch,
                                max_prompt_frames=int(self.options.max_prompt_frames))
         return batches, info
+
+    def _balance_by_technique(
+            self, items: Sequence[Tuple[str, int, int]]
+    ) -> List[Tuple[str, int, int]]:
+        """technique 均衡：稀有技巧类的样本按频率倒数上采样（复制条目）。
+
+        tech_dom（主导非 control 技巧 id，-1=纯 control）由特征提取写进
+        数据集 meta；这里只读 meta 不碰 .pt。falsetto/mixed 在 GTSinger
+        里本来就是少数派，不上采样会被 control 帧淹没——条件embedding 学
+        不到技巧区分（母规划 Step 1 的 technique-balanced sampling）。
+        epoch 尺寸会变大（复制的是引用，不是数据），步数预估仍按原始
+        samples_per_epoch 报告——上采样只影响实际内容分布，max_steps
+        是硬刹车不受影响。
+        """
+        pool = self.pools.get("target")
+        if pool is None:
+            return list(items)
+        doms = []
+        for kind, ti, _pi in items:
+            m = pool.meta.get(pool.ids[ti]) or {}
+            doms.append(int(m.get("tech_dom", -1)))
+        from collections import Counter
+        counts = Counter(d for d in doms if d >= 0)
+        if not counts:
+            return list(items)
+        med = sorted(counts.values())[len(counts) // 2]
+        out: List[Tuple[str, int, int]] = []
+        for item, d in zip(items, doms):
+            out.append(item)
+            if d >= 0:
+                # 稀有类复制到中位数量级（封顶 4 倍，防极小类撑爆 epoch）
+                rep = min(3, max(0, int(round(med / max(1, counts[d]))) - 1))
+                out.extend([item] * rep)
+        return out
 
     # =======================================================================
     # 5.4 前向与评估
@@ -1045,9 +1205,10 @@ class CfmTrainer(TB.BaseTrainer):
         if not pairs:
             return None
         b = self._to_device(collate_cfm(pairs))
+        kw = self._cond_kwargs(b)
         loss, _y = FW.cfm_training_forward(
             self.model, b["x1"], b["x_lens"], b["prompt_lens"],
-            b["mu"], b["style"], deterministic=False)
+            b["mu"], b["style"], deterministic=False, **kw)
         loss.backward()
         self._accum += 1
         # 先读完标量再返回：backward 之后计算图已释放，但张量值还在。
@@ -1122,7 +1283,8 @@ class CfmTrainer(TB.BaseTrainer):
                         b = self._to_device(collate_cfm(pairs))
                         loss, _y = FW.cfm_training_forward(
                             self.model, b["x1"], b["x_lens"], b["prompt_lens"],
-                            b["mu"], b["style"], deterministic=deterministic)
+                            b["mu"], b["style"], deterministic=deterministic,
+                            **self._cond_kwargs(b))
                         w = float(b["target_frames"].clamp(min=1).sum())
                         num += float(loss) * w
                         den += w

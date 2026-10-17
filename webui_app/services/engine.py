@@ -267,6 +267,11 @@ class TTSEngine:
         # 连续性模式：低显存下尝试关闭官方的 40 字切段，整段交给模型；
         # OOM 自动回退到 40 字切段（系统页开关，默认关）。
         self.continuity_mode = False
+        # 阶段卸载（阶段46 C2，实验性，默认关）：推理期按阶段把 w2v-BERT /
+        # GPT 搬 CPU 腾显存给 CFM/BigVGAN——收益是「更少切段/更长块」，
+        # 不是音质；搬动有秒级 PCIe 代价，只适合离线。
+        self.stage_offload = False
+        self._stage_moved = {"w2v": False, "gpt": False}
 
     # -- 事件回调（供 UI 显示进度）-----------------------------------------
 
@@ -431,6 +436,64 @@ class TTSEngine:
     # ------------------------------------------------------------------
     # VC 显存调度：GPT 在转换路径完全用不到，临时让出显存
     # ------------------------------------------------------------------
+    def _stage_offload_hooks(self):
+        """阶段卸载钩子（C2）：after_reference 搬 w2v-BERT、after_gpt(末段) 搬 GPT。
+
+        只在未启用 accel/torch_compile 时生效（编译图/缓存与设备绑定，
+        搬动会失效——与 offload_gpt_for_svc 同一判据）。搬动失败静默跳过
+        （钩子里任何异常都不能打断合成主线）；恢复由 _restore_stage_offload
+        在 infer 的 finally 里统一做。
+        """
+        log = LOG.get_logger("engine")
+        if getattr(self.cfg, "accel", False) or                 getattr(self.cfg, "torch_compile", False):
+            return None
+        tts = self._tts
+
+        def _hooks(stage: str, **info):
+            try:
+                import torch
+                if stage == "after_reference" and not self._stage_moved["w2v"]:
+                    m = getattr(tts, "semantic_model", None)
+                    if m is not None and str(next(m.parameters()).device).startswith("cuda"):
+                        m.to("cpu")
+                        self._stage_moved["w2v"] = True
+                        torch.cuda.empty_cache()
+                        log.info("阶段卸载：w2v-BERT → CPU（参考特征已缓存）")
+                elif stage == "after_gpt" and not self._stage_moved["gpt"]:
+                    # 只在最后一段搬：前面的段还要用 GPT（搬了又搬回会抖死）
+                    if int(info.get("seg_idx", -1)) == int(info.get("segments_count", -2)) - 1:
+                        g = getattr(tts, "gpt", None)
+                        if g is not None and str(next(g.parameters()).device).startswith("cuda"):
+                            g.to("cpu")
+                            self._stage_moved["gpt"] = True
+                            torch.cuda.empty_cache()
+                            log.info("阶段卸载：GPT → CPU（末段 codes 已生成）")
+            except Exception as exc:
+                log.warning("阶段卸载钩子失败（忽略，继续合成）: %s", exc)
+        return _hooks
+
+    def _restore_stage_offload(self) -> None:
+        """推理结束（含异常）把阶段卸载搬走的模块搬回推理设备。"""
+        if not any(self._stage_moved.values()) or self._tts is None:
+            return
+        log = LOG.get_logger("engine")
+        try:
+            dev = self._tts.device
+            if self._stage_moved["w2v"]:
+                m = getattr(self._tts, "semantic_model", None)
+                if m is not None:
+                    m.to(dev)
+            if self._stage_moved["gpt"]:
+                g = getattr(self._tts, "gpt", None)
+                if g is not None:
+                    g.to(dev)
+            log.info("阶段卸载：模块已回推理设备")
+        except Exception as exc:
+            log.warning("阶段卸载恢复失败（下次加载引擎可恢复）: %s", exc)
+        finally:
+            self._stage_moved = {"w2v": False, "gpt": False}
+            self._empty_cache()
+
     def offload_gpt_for_svc(self) -> bool:
         """把 GPT 移到 CPU，返回是否成功（8GB 卡约让出 1.5GB）。
 
@@ -770,12 +833,16 @@ class TTSEngine:
         return (f"{type(mod).__name__}(wrapped="
                 f"{TTSEngine._is_wrapped(mod)}, lora_layers={n})")
 
-    def attach_lora(self, adapter_dir: str, target: str = "gpt") -> str:
+    def attach_lora(self, adapter_dir: str, target: str = "gpt",
+                    bypass_lease: Optional[str] = None) -> str:
         """把 LoRA adapter 挂到当前引擎上（已挂着就先卸掉，替换语义）。
 
         target: gpt | cfm。不先卸载的话 PEFT 会把已包装的模块再包一层，
         而 detach 只解一层 —— UI 显示「纯底座」但内层 LoRA 仍在生效，
         这比挂不上严重得多。
+
+        bypass_lease：SVC 会话（翻唱/变声）自己的挂载凭据——租约持有者
+        传自己的 token 可越过 cfm 通道的会话防护（与 load/unload 同款语义）。
 
         判断「是否已挂着」用**模块真实状态 ∪ 标签**：任何一方与实际脱节
         都不会造成二次包装（打包后失败的残留也能被清掉）。
@@ -787,6 +854,15 @@ class TTSEngine:
         log.info("挂载请求 target=%s dir=%s（引擎已加载=%s）",
                  target, adapter_dir, self.loaded)
         with self._lock:
+            # E1-T（r1-3）：SVC 会话期间 cfm 通道可能在换装 singing CFM，
+            # 推理页这时挂载会挂到换装对象上、恢复时被孤儿化——拒绝。
+            # 会话自己（持租约 token）可以越过。防护放在最前：SVC 期间
+            # 引擎状态特殊，「会话进行中」比「引擎未加载」是更真实的报因。
+            if (self._svc_leases and target == "cfm"
+                    and bypass_lease not in self._svc_leases):
+                raise EngineError(
+                    "AI 翻唱/变声会话进行中，暂不能挂载 cfm 通道的 LoRA"
+                    "（会话内可能已换装歌声模型）。请等会话结束再操作。")
             tts = self.tts
             from peft import PeftModel
 
@@ -843,12 +919,33 @@ class TTSEngine:
             self._emit("lora_attached", f"已挂载 LoRA {tag}")
             return tag
 
-    def detach_lora(self, target: str = "gpt"):
-        """卸载 LoRA，恢复 base 模型。"""
+    def detach_lora(self, target: str = "gpt", bypass_lease: Optional[str] = None):
+        """卸载 LoRA，恢复 base 模型。bypass_lease 语义同 attach_lora。"""
         log = LOG.get_logger("engine.lora")
         t0 = time.perf_counter()
         log.info("卸载请求 target=%s（引擎已加载=%s）", target, self.loaded)
         with self._lock:
+            # E1-T（r1-3）：SVC 会话的 singing CFM 换装期间，cfm 通道的
+            # detach 由会话自己按「先卸后恢复」的顺序负责；外部 detach 会
+            # 打乱该顺序（摘掉翻唱 identity LoRA / 卸到换装对象）。
+            if (self._svc_leases and target == "cfm"
+                    and bypass_lease not in self._svc_leases):
+                raise EngineError(
+                    "AI 翻唱/变声会话进行中，暂不能卸载 cfm 通道的 LoRA"
+                    "（会话自己会按序清理）。请等会话结束再操作。")
+            if self._tts is None:
+                # 引擎已卸载（超分/分离段中途 unload）：旧实例连同 LoRA
+                # 一起释放了，标签却留在 stats 里——重载后 UI 会显示假挂载。
+                # 这里把标签清掉（验收 P2-6：幻影标签）。
+                stale = [t for t in self.stats.lora_adapters
+                         if t.startswith(target + ":")]
+                if stale:
+                    self.stats.lora_adapters = [
+                        t for t in self.stats.lora_adapters
+                        if not t.startswith(target + ":")]
+                    log.warning("引擎已卸载，清除 %s 通道的失效 LoRA 标签: %s",
+                                target, stale)
+                return
             tts = self.tts
             mod = self._lora_module(target)
             before = self._lora_hint(mod)
@@ -927,17 +1024,20 @@ class TTSEngine:
             t0 = time.perf_counter()
 
             low = bool(getattr(tts, "low_vram", False))
-            # stream_return 返回生成器，不能在这里提前恢复 low_vram；
-            # WebUI 不使用流式，保守起见连续性模式对流式直接不启用。
+            # stream_return 返回生成器，不能在这里提前恢复 low_vram/阶段卸载；
+            # WebUI 不使用流式，保守起见连续性模式与阶段卸载对流式都不启用。
             use_cont = (bool(getattr(self, "continuity_mode", False))
                         and low and not kwargs.get("stream_return"))
+            use_offload = (bool(getattr(self, "stage_offload", False))
+                           and not kwargs.get("stream_return"))
             attempts = [(True, False), (False, True)] if use_cont else [(False, low)]
             out = None
             last_exc = None
             for idx, (_cont, low_flag) in enumerate(attempts):
                 tts.low_vram = low_flag
+                hooks = self._stage_offload_hooks() if use_offload else None
                 try:
-                    out = tts.infer(**kwargs)
+                    out = tts.infer(stage_hooks=hooks, **kwargs) if hooks                         else tts.infer(**kwargs)
                     if idx > 0:
                         self._emit("continuity_fallback",
                                    "连续性模式显存不足，已回退到 40 字切段")
@@ -957,6 +1057,8 @@ class TTSEngine:
                     raise
                 finally:
                     tts.low_vram = low
+                    if use_offload:
+                        self._restore_stage_offload()
             if out is None and last_exc is not None:
                 raise last_exc
             tts.gr_progress = None

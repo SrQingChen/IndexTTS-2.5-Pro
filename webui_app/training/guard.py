@@ -615,12 +615,20 @@ class BaseGuard:
     size+mtime（足以发现「文件被重写过」），深度校验要显式开。
     """
 
+    # E1-T 歌声第二曲线在 checkpoints/ 里的**新名字**白名单：只允许这两个
+    # 文件名落在底座目录（capability merge 产物），绝不包含 s2mel.pth /
+    # config.yaml 本尊。用 Guard 参数开口子而不是调用侧绕过——绕过的口子
+    # 下一个人找不到，参数是显式可审计的（规划 r1-10）。
+    SINGING_WHITELIST = ("s2mel_singing.pth", "config_singing.yaml")
+
     def __init__(self, model_dir: Optional[str] = None,
-                 train_root: Optional[str] = None):
+                 train_root: Optional[str] = None,
+                 allow_singing_names: bool = False):
         self.model_dir = os.path.abspath(model_dir or
                                          os.path.join(PROJECT_ROOT, MODEL_DIR_NAME))
         self.train_root = os.path.abspath(train_root or TRAINING_ROOT)
         self.manifest_path = os.path.join(self.train_root, MANIFEST_NAME)
+        self.allow_singing_names = bool(allow_singing_names)
 
     # ---------------- 快照 ----------------
     def protected_paths(self) -> List[str]:
@@ -766,12 +774,23 @@ class BaseGuard:
         """
         ap = os.path.abspath(path or "")
         md = self.model_dir.rstrip("\\/") + os.sep
-        if ap.startswith(md) or ap == self.model_dir.rstrip("\\/"):
+        base = os.path.basename(ap)
+        in_model_dir = ap.startswith(md) or ap == self.model_dir.rstrip("\\/")
+        # E1-T 例外：显式开 allow_singing_names 时，底座目录**顶层**只放行
+        # 歌声新名字（白名单本身不含任何 PROTECTED_FILES，同名防线仍在下面
+        # 兜底；子目录一律不放——用户可能整目录拷走，混进子目录说不清）。
+        at_top = in_model_dir and \
+            os.path.dirname(ap) == self.model_dir.rstrip("\\/")
+        singing_ok = (self.allow_singing_names and at_top
+                      and base in self.SINGING_WHITELIST)
+        if in_model_dir and not singing_ok:
+            extra = ("（歌声 capability 产物只允许 s2mel_singing.pth / "
+                     "config_singing.yaml 这两个新名字）"
+                     if self.allow_singing_names else "")
             raise PermissionError(
                 f"拒绝写入底座目录：{ap}\n"
                 f"训练产物必须放在 {self.train_root} 下。"
-                "原始 gpt.pth / s2mel.pth 一旦覆盖就再也回不去了。")
-        base = os.path.basename(ap)
+                "原始 gpt.pth / s2mel.pth 一旦覆盖就再也回不去了。" + extra)
         if base in PROTECTED_FILES:
             raise PermissionError(
                 f"拒绝生成名为 `{base}` 的文件 —— 它与底座文件同名，"

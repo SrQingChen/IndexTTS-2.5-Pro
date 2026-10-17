@@ -161,10 +161,84 @@ def octave_shift_semis(src_f0: np.ndarray, ref_f0: np.ndarray,
     return int(round(cents / 1200.0) * 12)
 
 
+def register_shift_semis(src_f0: np.ndarray, ref_f0: np.ndarray,
+                         max_abs: float = 12.0) -> float:
+    """E1-T 歌声条件的音区映射（**分数**半音，常数移调保旋律）。
+
+    与 octave_shift_semis 的区别：那是给 WORLD 移植用的八度粒度；这里
+    条件化 CFM 要的是「把源 F0 连续地拉进目标音区分布」（Everyone-Can-Sing
+    的『参考音区一个八度内』原则 + YingMusic 的 ±12st 先例——调研 Q4：
+    2025 SOTA 都不信任裸外推，先把 F0 映射进目标音区再喂条件）。
+
+    取源/参考浊音中位数的 log2 比值（连续值，不取整），钳 ±max_abs。
+    常数移调不改变旋律形状（音程保持），与分位数映射（会扭曲音程）不同。
+    """
+    ms, mr = f0_median(src_f0), f0_median(ref_f0)
+    if ms <= 0 or mr <= 0:
+        return 0.0
+    semis = 12.0 * math.log2(mr / ms)
+    return float(np.clip(semis, -max_abs, max_abs))
+
+
 def shift_f0(f0: np.ndarray, semis: float) -> np.ndarray:
     out = f0.copy()
     v = out > 0
     out[v] = out[v] * (2.0 ** (semis / 12.0))
+    return out
+
+
+def correct_octave_jumps(f0: np.ndarray, tol: float = 0.08,
+                         max_excursion_sec: float = 0.4,
+                         frame_sec: float = FRAME_PERIOD_MS / 1000.0) -> np.ndarray:
+    """SHC 式八度/次谐波跳变修正（VibE-SVC2, arXiv 2606.17126 算法骨架 + 回跳窗口）。
+
+    E1-T 歌声条件把 F0 直接喂给模型，源干声 harvest 的八度错误（实测约 2%，
+    常见于气声/高音/缺基频帧）会原样变成「音色条件错位」——模型按 220Hz
+    的音色先验渲染实际 440Hz 的帧，输出直接破音。条件化之前先修：
+
+    1. log2 域逐帧差分；|Δ|≈1（容差 tol）判为疑似八度错误；
+    2. **回跳窗口**：只有后续 max_excursion_sec 内出现反向 ≈∓1 跳变
+       （轮廓跳回原音区）的才确认为估计错误，把两次跳变一起清零——
+       跨度更长的持续换声区是真实的八度大跳（戏腔/歌剧跳进），保留；
+    3. 清零后自回归重累加，整条轮廓按差分**众数**（对孤立错误段比均值稳）
+       对齐回主体音区，消除修正常数偏移。
+    """
+    f0 = np.asarray(f0, dtype=np.float64)
+    v = f0 > 0
+    if v.sum() < 5:
+        return f0
+    out = f0.copy()
+    lg = np.where(v, np.log2(np.where(v, f0, 1.0)), 0.0)
+    idx = np.where(v)[0]
+    d = np.diff(lg[idx])                        # 浊音段内逐帧 log2 差
+    if len(d) == 0:
+        return out
+    max_gap = max(2, int(round(max_excursion_sec / frame_sec)))
+    d_fix = d.copy()
+    i = 0
+    while i < len(d):
+        if abs(abs(d[i]) - 1.0) <= tol:
+            # 找同段内反向回跳（清音断开不算——idx 已只含浊音帧）
+            j_end = min(len(d), i + 1 + max_gap)
+            for j in range(i + 1, j_end):
+                if abs(d[j] + d[i]) <= 2.0 * tol:      # 反向 ≈∓1
+                    d_fix[i] = 0.0
+                    d_fix[j] = 0.0
+                    i = j
+                    break
+        i += 1
+    if np.array_equal(d_fix, d):
+        return out                                # 没有可修的错误
+    lg_fix = np.concatenate([[lg[idx[0]]], lg[idx[0]] + np.cumsum(d_fix)])
+
+    def _mode(x):
+        bins = np.round(x * 10) / 10
+        vals, counts = np.unique(bins, return_counts=True)
+        return float(vals[np.argmax(counts)])
+
+    lg_fix = lg_fix + (_mode(d) - _mode(d_fix))
+    out[idx] = 2.0 ** lg_fix
+    out[~v] = 0.0
     return out
 
 

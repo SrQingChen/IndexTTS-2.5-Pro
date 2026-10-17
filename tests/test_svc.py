@@ -187,18 +187,30 @@ class TestSvcCore:
 
     def test_plan_chunks_single(self):
         y = np.zeros(int(30 * SR), dtype=np.float32)
-        assert svc_core.plan_chunks(y, SR, 60.0) == [(0, len(y))]
+        assert svc_core.plan_chunks(y, SR, 60.0) == [(0, len(y), 0)]
 
     def test_plan_chunks_overlap(self):
-        """多块时相邻块输入必须重叠 ≥ 交叉淡化时长（对拍红线）。"""
+        """多块时相邻块输入必须重叠 ≥ 该切点的重叠时长（对拍红线）。"""
         rng = np.random.default_rng(0)
         y = rng.normal(0, 0.1, int(150 * SR)).astype(np.float32)
         chunks = svc_core.plan_chunks(y, SR, 60.0, overlap_ms=40.0)
         assert len(chunks) >= 2
-        ov_samples = int(0.040 * SR)
-        for (a1, b1), (a2, b2) in zip(chunks, chunks[1:]):
+        for (a1, b1, ov1), (a2, b2, ov2) in zip(chunks, chunks[1:]):
             assert a2 < b1, "相邻块必须重叠"
-            assert b1 - a2 >= ov_samples - 1, f"重叠 {b1-a2} < {ov_samples}"
+            assert b1 - a2 >= ov2 - 1, f"重叠 {b1-a2} < 声明的 {ov2}"
+
+    def test_plan_chunks_hard_cut_bigger_overlap(self):
+        """硬切点（无气口）重叠应加大（90ms），且切点吸附 mel 栅格。"""
+        rng = np.random.default_rng(1)
+        y = rng.normal(0, 0.2, int(200 * SR)).astype(np.float32)  # 持续响，无谷
+        chunks = svc_core.plan_chunks(y, SR, 60.0, overlap_ms=40.0)
+        assert len(chunks) >= 2
+        ov40 = int(0.040 * SR)
+        ov90 = int(0.090 * SR)
+        for c in chunks[1:]:
+            assert c[2] in (ov40, ov90), f"重叠 {c[2]} 不是 40/90ms 档"
+        # 白噪声无谷 → 至少有一个硬切点用了大重叠
+        assert any(c[2] >= ov90 - 2 for c in chunks[1:]),             "白噪声应判为硬切（90ms 重叠）"
 
     def test_plan_chunks_prefers_valley(self):
         """有气口时应切在气口（低能量处）而不是硬切。"""
@@ -208,8 +220,15 @@ class TestSvcCore:
         y[a:b] = 0.0
         chunks = svc_core.plan_chunks(y, SR, 60.0)
         assert len(chunks) >= 2
-        cut = chunks[1][0] + int(0.040 * SR)  # 下一块起点 + 重叠 ≈ 实际切点
+        cut = chunks[1][0] + chunks[1][2]  # 下一块起点 + 重叠 ≈ 实际切点
         assert abs(cut - a) < int(1.5 * SR), f"切点 {cut} 未落在气口 {a}"
+
+    def test_silent_chunk_detected(self):
+        """纯静音块应被 _is_silent 判出（间奏跳过转换）。"""
+        loud = _harmonic(220.0, 2.0)
+        silent = np.zeros(int(2.0 * SR), dtype=np.float32)
+        assert svc_core._is_silent(silent)
+        assert not svc_core._is_silent(loud)
 
     def test_crossfade_length_conserved(self):
         """交叉淡化拼接后总长 = Σ块长 − Σ重叠（时长守恒）。"""

@@ -24,6 +24,7 @@ from dataclasses import asdict, dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from webui_app.config import PROJECT_ROOT
+from webui_app.training import forward as FW
 from webui_app.training import guard as GD
 from webui_app import logging_setup as LOG
 from webui_app.training import runs as RN
@@ -640,6 +641,21 @@ class BaseTrainer:
                 f"missing={lack[:4]}）。\n续训必须用与原训练完全相同的 "
                 "rank / target_modules，否则低秩矩阵的形状对不上。")
         self._promote_fp32()
+        # E1-T 续训：conditioner 权重与 LoRA 同目录成对保存/加载
+        tc = os.path.join(ckpt_dir, "timbre_conditioner.pt")
+        if os.path.isfile(tc):
+            import torch
+            est = getattr(FW.unwrap(self.model), "estimator", None)
+            cond = getattr(est, "timbre_conditioner", None)
+            if cond is None:
+                raise RuntimeError(
+                    f"{ckpt_dir} 里有 timbre_conditioner.pt，但当前模型未构造"
+                    " conditioner（需要 config_singing.yaml）。singing 续训必须"
+                    "用与原训练相同的底座 config。")
+            ck = torch.load(tc, map_location="cpu", weights_only=False)
+            cond.load_state_dict(ck["timbre_conditioner"])
+            cond.cond_drop_prob = float(ck.get("cond_drop_prob", 0.1))
+            self._log("已加载 TimbreConditioner 权重（与 adapter 成对）")
         self._log(f"已加载 adapter 权重：{len(sd)} 个张量 ← {ckpt_dir}")
         return len(sd)
 
@@ -702,6 +718,15 @@ class BaseTrainer:
     def _write_adapter(self, dest: str, epoch: int, val: Optional[float]) -> None:
         os.makedirs(dest, exist_ok=True)
         self.model.save_pretrained(dest)
+        # E1-T：TimbreConditioner 是全训模块，PEFT 不会存它——漏存的话
+        # merge/续训时条件模块回到零初始化，能力训练等于白跑（静默失效）。
+        est = getattr(FW.unwrap(self.model), "estimator", None)
+        cond = getattr(est, "timbre_conditioner", None) if est is not None else None
+        if cond is not None:
+            import torch
+            torch.save({"timbre_conditioner": cond.state_dict(),
+                        "cond_drop_prob": float(cond.cond_drop_prob)},
+                       os.path.join(dest, "timbre_conditioner.pt"))
         if self.save_optimizer_state() and self.opt is not None:
             self._save_train_state(dest, epoch, val)
 

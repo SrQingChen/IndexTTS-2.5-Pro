@@ -394,7 +394,9 @@ def invalidate_cfm_caches(cfm) -> int:
 
 
 def cfm_training_forward(cfm, x1, x_lens, prompt_lens, mu, style,
-                         deterministic: bool = False) -> Tuple[Any, Any]:
+                         deterministic: bool = False,
+                         f0=None, technique=None, f0_stats=None
+                         ) -> Tuple[Any, Any]:
     """CFM 的训练前向，返回 `(loss, y)`。
 
     x1          : (B, 80, T)   [prompt_mel | target_mel]
@@ -405,6 +407,10 @@ def cfm_training_forward(cfm, x1, x_lens, prompt_lens, mu, style,
     deterministic: True = 临时把 `class_dropout_prob` 置 0。
                    **算 val loss 时必须开**，否则每条样本有 10% 概率
                    被整体丢掉条件，val 曲线会随机跳动，早停会误判。
+    f0 / technique / f0_stats：E1-T 歌声条件（None=原路径，老数据集零改动）。
+                   训练期 conditioner 的条件丢弃（cond_drop_prob）在
+                   DiT.forward 内按 self.training 采样——评 val 时它依然
+                   随机，要固定由调用方包 rng_guard（现有 evaluate 已这么做）。
 
     `BASECFM.forward` 内部会随机采一个 t 和一份噪声，所以同一条样本
     每次 loss 都不同（实测单 seed 区间宽 0.27）。这就是为什么
@@ -429,6 +435,7 @@ def cfm_training_forward(cfm, x1, x_lens, prompt_lens, mu, style,
         # zero_prompt_speech_token=False（config.yaml）时 BASECFM 不会原地改 mu；
         # 万一将来配置改了，clone 能保证缓存里的特征不被污染。
         mu_in = mu.clone() if bool(getattr(core, "zero_prompt_speech_token", False)) else mu
-        return core.forward(x1, x_lens, prompt_lens, mu_in, style)
+        return core.forward(x1, x_lens, prompt_lens, mu_in, style,
+                            f0=f0, technique=technique, f0_stats=f0_stats)
     finally:
         est.class_dropout_prob = saved

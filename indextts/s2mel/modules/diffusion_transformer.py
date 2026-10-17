@@ -2,6 +2,7 @@ import torch
 from torch import nn
 import math
 
+from indextts.s2mel.modules.conditioners import TimbreConditioner
 from indextts.s2mel.modules.gpt_fast.model import ModelArgs, Transformer
 from indextts.s2mel.modules.wavenet import WN
 from indextts.s2mel.modules.commons import sequence_mask
@@ -180,23 +181,38 @@ class DiT(torch.nn.Module):
         if self.style_as_token:
             self.style_in = nn.Linear(args.style_encoder.dim, args.DiT.hidden_dim)
 
+        # E1-T：音高/技巧条件化（singing config 门控）。默认 config 不含
+        # technique_condition → 不构造任何新模块，state_dict 与上游完全一致
+        # （TTS 隔离红线：新键=0 由 tests/test_tts_regression.py 断言）。
+        self.technique_condition = bool(getattr(args.DiT, "technique_condition", False))
+        if self.technique_condition:
+            self.timbre_conditioner = TimbreConditioner(
+                style_dim=int(args.style_encoder.dim),
+                dim=int(getattr(args.DiT, "timbre_dim", 256)),
+                num_techniques=int(getattr(args.DiT, "num_techniques", 7)))
+
     def setup_caches(self, max_batch_size, max_seq_length):
         self.transformer.setup_caches(max_batch_size, max_seq_length, use_kv_cache=False)
         
-    def forward(self, x, prompt_x, x_lens, t, style, cond, mask_content=False):
+    def forward(self, x, prompt_x, x_lens, t, style, cond, mask_content=False,
+                f0=None, technique=None, f0_stats=None, cond_mask=None):
         """
             x (torch.Tensor): random noise
             prompt_x (torch.Tensor): reference mel + zero mel
                 shape: (batch_size, 80, 795+1068)
             x_lens (torch.Tensor): mel frames output
                 shape: (batch_size, mel_timesteps)
-            t (torch.Tensor): radshape: 
-                shape: (batch_size)    
+            t (torch.Tensor): radshape:
+                shape: (batch_size)
             style (torch.Tensor): reference global style
                 shape: (batch_size, 192)
             cond (torch.Tensor): semantic info of reference audio and altered audio
                 shape: (batch_size, mel_timesteps(795+1069), 512)
-        
+            f0 / technique / f0_stats / cond_mask：E1-T 歌声条件（默认全 None）。
+                None 时走与上游完全相同的语句路径（逐位一致由测试固化）；
+                非 None 且未开 technique_condition 属于配置错配，直接报错而不是
+                静默丢条件——丢条件的模型照样出声，只是学不到音高映射。
+
         """
         class_dropout = False
         if self.training and torch.rand(1) < self.class_dropout_prob:
@@ -208,6 +224,14 @@ class DiT(torch.nn.Module):
 
         B, _, T = x.size()
 
+        # E1-T 条件丢弃（训练期，CosyVoice 式只丢 {f0,tech}）：旁路 conditioner，
+        # 与 class_dropout（整段清零）互不冲突；预训练 class_dropout 会把
+        # x_in[..., 80:] 整段置零，style_t 落在该区间，自动被覆盖，无需重复处理。
+        if f0 is not None and self.training and cond_mask is None \
+                and self.technique_condition:
+            drop = torch.rand(B, device=f0.device) \
+                < self.timbre_conditioner.cond_drop_prob
+            cond_mask = ~drop
 
         t1 = self.t_embedder(t)  # (N, D) # t1 [2, 512]
         cond = cond_in_module(cond) # cond [2,1863,512]->[2,1863,512]
@@ -216,9 +240,21 @@ class DiT(torch.nn.Module):
         prompt_x = prompt_x.transpose(1, 2) # [2,1863,80]
 
         x_in = torch.cat([x, prompt_x, cond], dim=-1) # 80+80+512=672 [2, 1863, 672]
-        
+
         if self.transformer_style_condition and not self.style_as_token: # True and True
-            x_in = torch.cat([x_in, style[:, None, :].repeat(1, T, 1)], dim=-1) #[2, 1863, 864]
+            if f0 is None and technique is None:
+                # 原路径：全局 style 逐帧复制（默认 TTS/无条件 VC 都走这里）
+                x_in = torch.cat([x_in, style[:, None, :].repeat(1, T, 1)], dim=-1) #[2, 1863, 864]
+            else:
+                if not self.technique_condition:
+                    raise RuntimeError(
+                        "传入了 f0/technique 条件，但 DiT 未开 technique_condition"
+                        "（singing config 才构造 TimbreConditioner）。请在"
+                        "config_singing.yaml 下运行，或不要传条件——静默丢条件"
+                        "会让训练学到与推理不一致的映射。")
+                style_t = self.timbre_conditioner(
+                    style, f0, technique, f0_stats, cond_mask)
+                x_in = torch.cat([x_in, style_t], dim=-1)  # (B, T, 864)，merge 维度不变
             
         if class_dropout: #False
             x_in[..., self.in_channels:] = x_in[..., self.in_channels:] * 0 # 80维后全置为0

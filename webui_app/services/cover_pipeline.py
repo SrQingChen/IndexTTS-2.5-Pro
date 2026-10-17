@@ -20,7 +20,7 @@ import json
 import os
 import time
 from dataclasses import asdict, dataclass, field
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -80,6 +80,14 @@ class CoverRequest:
     mix_bgm_path: Optional[str] = None   # 状态≠song 时的伴奏上传
     vocal_gain_db: float = 3.0
     loudness_normalize: bool = False
+    # ---- E1-T 歌声模型（实验性；默认全关=原链路原样）----
+    singing_enable: bool = False         # 换装 singing CFM + F0/technique 条件
+    technique_mode: str = "preserve"     # preserve(源标签直通) / auto(分类器) / manual
+    technique_manual: int = 0            # manual 时的技巧 id（0..6）
+    bon_high_pitch: bool = False         # 高音块 BoN 择优（E1-T Step 14）
+    hf_transplant: bool = False          # SYKI 式源高频移植（零训练应急，默认关）
+    register_mode: str = "auto"          # auto(分数音区映射) / off(保原调硬唱)
+    octave_fix: bool = True              # SHC 八度跳变修正（戏腔快跳内容可关）
 
 
 # ---------------------------------------------------------------------------
@@ -265,6 +273,7 @@ def run_cover(ctx, req: CoverRequest, progress: Optional[Callable] = None,
     engine = ctx.engine
     was_loaded = bool(getattr(engine.stats, "loaded", False))
     mounted_by_us = False
+    sing_session = None          # E1-T：提前初始化——异常早于第 3 节时 finally 也要能引用
     # 引擎租约：与实时变声/其他长会话互斥（并发共享引擎会显存叠加）。
     # 内部卸载（分离/SR 段）用 bypass_lease=自己的 token，只绕自己的租约。
     svc_lease = engine.begin_svc("AI翻唱")
@@ -365,16 +374,35 @@ def run_cover(ctx, req: CoverRequest, progress: Optional[Callable] = None,
         engine.load(bypass_lease=svc_lease)
         # VC 绕过 GPT：低显存卡把它移到 CPU，让出 ~1.5GB 给分块推理
         gpt_offloaded = engine.offload_gpt_for_svc()
+        # E1-T：singing 会话（换装 singing CFM；异常也恢复）。租约 token
+        # 传给会话——cfm 通道的 LoRA 挂/卸都走 bypass（r1-3 防护的会话侧豁免）。
+        if req.singing_enable:
+            from webui_app.config import PROJECT_ROOT
+            from webui_app.services.svc_core import SingingCfmSession
+            _p(0.225, "加载歌声模型（E1-T，singing CFM 98M）")
+            sing_session = SingingCfmSession(
+                engine,
+                cfg_path=os.path.join(PROJECT_ROOT, "checkpoints",
+                                      "config_singing.yaml"),
+                pth_name="s2mel_singing.pth",
+                lease=svc_lease)
+            sing_session.__enter__()
+            _log("[E1-T] 已换装 singing CFM（结束自动恢复引擎原 CFM）")
         # LoRA 挂载（替换语义：已挂先卸——attach_lora 内建）。结束时卸掉
         # 我们挂的；进入前若有别的挂载，报告中提示需重挂。
+        # singing 路径：挂在换装对象上，detach 由 SingingCfmSession 按序负责。
         pre_mounted = any(it.get("target") == "cfm" and it.get("wrapped")
                           for it in engine.lora_status()) \
             if isinstance(engine.lora_status(), list) else False
         mounted_by_us = False
         if req.lora_cfm_dir:
             try:
-                tag = engine.attach_lora(req.lora_cfm_dir, target="cfm")
+                tag = engine.attach_lora(req.lora_cfm_dir, target="cfm",
+                                         bypass_lease=svc_lease)
                 mounted_by_us = True
+                if sing_session is not None:
+                    sing_session.mark_lora()
+                    mounted_by_us = False          # detach 归会话，管线 finally 不重复
                 if abs(req.lora_cfm_scale - 1.0) > 1e-6:
                     from webui_app.training import merge as MG
                     MG.set_scale(engine, req.lora_cfm_scale, target="cfm")
@@ -385,12 +413,94 @@ def run_cover(ctx, req: CoverRequest, progress: Optional[Callable] = None,
         ref = svc_core.build_reference(engine, req.ref_path, req.ref_seconds)
         _p(0.25, "参考特征构建完成")
 
+        # ---------- 3b) E1-T 歌声条件（F0/technique）----------
+        f0_cond = None
+        singing_report: Dict[str, Any] = {"enabled": bool(req.singing_enable)}
+        if req.singing_enable:
+            from webui_app.config import PROJECT_ROOT
+            from webui_app.services import svc_singing  # noqa: F401
+            from webui_app.training.features import f0_to_mel_grid
+            ckpt_dir = os.path.join(PROJECT_ROOT, "checkpoints")
+            _p(0.255, "E1-T：源 F0 提取（整曲）")
+            src_f0_full = (src_f0_key if (src_f0_key is not None
+                                          and key_semis == 0)
+                           else svc_f0.harvest_f0(y, ENGINE_SR))
+            # SHC 八度修正：harvest 的八度错误会变成「音色条件错位」（2% 帧
+            # 也够把高音块打崩）；VibE-SVC2 式回跳窗口修正，真八度大跳保留
+            src_f0_fix = (svc_f0.correct_octave_jumps(src_f0_full)
+                          if req.octave_fix else src_f0_full)
+            _p(0.26, "E1-T：参考音区统计")
+            ref_y_, ref_sr_ = AL.load_audio(req.ref_path)
+            # 与 build_reference 的 ref_seconds 截断同口径（验收 P2-1）：
+            # 参考条件只喂前 ref_seconds 秒，F0/统计也必须在同一段上提取，
+            # 否则 >15s 的参考会把整条轮廓压缩进前 15s 的帧（时间轴错位）
+            max_ref_n = int(req.ref_seconds * ref_sr_)
+            if len(ref_y_) > max_ref_n:
+                ref_y_ = ref_y_[:max_ref_n]
+            ref_f0_ = svc_f0.harvest_f0(
+                resample(ref_y_, ref_sr_, ENGINE_SR), ENGINE_SR)
+            if req.register_mode == "off":
+                semis_reg = 0.0            # 保原调硬唱（音色条件仍生效）
+            else:
+                semis_reg = svc_f0.register_shift_semis(src_f0_fix, ref_f0_)
+            mapped = svc_f0.shift_f0(src_f0_fix, semis_reg)
+            singing_report.update({
+                "register_shift_semis": round(semis_reg, 2),
+                "octave_corrected": bool(
+                    not np.array_equal(src_f0_full, src_f0_fix)),
+            })
+            # technique：preserve=0（control 直通，第一版保守）；auto=分类器；
+            # manual=用户选。分类器文件在 checkpoints/technique_cls.pt。
+            T_mel = svc_core.mel_frames(len(y))
+            tech = np.zeros(T_mel, dtype=np.uint8)
+            if req.technique_mode == "manual":
+                tech[:] = int(np.clip(req.technique_manual, 0, 6))
+                singing_report["technique"] = f"manual:{req.technique_manual}"
+            elif req.technique_mode == "auto":
+                cls_pt = os.path.join(ckpt_dir, "technique_cls.pt")
+                try:
+                    from webui_app.training.technique_cls import TechniqueClassifier
+                    clf = TechniqueClassifier.get(cls_pt, device="cpu")
+                    tech, conf = clf.predict(y, total_frames=T_mel)
+                    clf.release()
+                    singing_report["technique"] = f"auto(conf={conf:.2f})"
+                except Exception as exc:
+                    singing_report["technique"] = f"auto 回退 control: {exc}"
+            else:
+                singing_report["technique"] = "preserve(control)"
+            # 参考侧统计/参考帧 F0（r1-2：参考段用参考自身 F0 + 参考统计）
+            rv = ref_f0_[ref_f0_ > 0]
+            ref_stats = (float(np.mean(np.log2(rv))) if len(rv) >= 3 else 0.0,
+                         float(np.std(np.log2(rv))) if len(rv) >= 3 else 1.0)
+            sv = mapped[mapped > 0]
+            src_mean_log = (float(np.mean(np.log2(sv))) if len(sv) >= 3
+                            else 0.0)
+            # σ 用**参考侧**的旋律幅度重标定（评审 #2 建议）：z 的尺度以
+            # 目标音色为基准，训推分布更贴（中位数已对齐，这里对齐幅度）
+            src_stats = (src_mean_log, max(ref_stats[1], 0.1))
+            f0_cond = svc_core.SingingCond(
+                ref_f0=f0_to_mel_grid(ref_f0_, ref.ref_frames),
+                ref_mean=ref_stats[0], ref_std=ref_stats[1],
+                src_f0=f0_to_mel_grid(mapped, T_mel),
+                src_mean=src_stats[0], src_std=src_stats[1],
+                tech=tech,
+                src_f0_5ms=mapped)
+            singing_report["f0_src_median"] = round(
+                svc_f0.f0_median(src_f0_fix), 1)
+            singing_report["f0_mapped_median"] = round(
+                svc_f0.f0_median(mapped), 1)
+            _log(f"[E1-T] 音区映射 {semis_reg:+.2f}st，"
+                 f"technique={singing_report.get('technique')}")
+
         # ---------- 4) VC 转换 ----------
         conv = svc_core.convert_file(engine, dry_path, ref,
                                      variant=req.variant, steps=req.steps,
                                      cfg_rate=req.cfg_rate, chunk_sec=req.chunk_sec,
                                      progress=lambda f, m: _p(0.25 + 0.45 * f, m),
-                                     should_stop=should_stop)
+                                     should_stop=should_stop,
+                                     f0_cond=f0_cond,
+                                     bon_high=req.bon_high_pitch
+                                     and f0_cond is not None)
         if not conv.ok:
             if conv.reason == "用户停止":
                 raise _Stop()
@@ -400,12 +510,18 @@ def run_cover(ctx, req: CoverRequest, progress: Optional[Callable] = None,
         report["vc"] = {"chunks": conv.chunks,
                         "chunk_sec_used": getattr(conv, "chunk_sec_used", None),
                         "retried_smaller_chunk": getattr(conv, "retried", False),
+                        "silent_skipped": getattr(conv, "silent_skipped", 0),
                         **conv.timing}
+        if getattr(conv, "bon", None):
+            report["vc"]["bon"] = conv.bon
+        if singing_report:
+            report["singing"] = singing_report
         timings["vc_convert"] = round(conv.timing.get("elapsed", 0.0), 1)
         _log(f"[VC] {conv.chunks} 块 / {conv.timing.get('rtf', 0)}×实时")
         _check_stop(should_stop)
 
-        # LoRA 卸载统一走 finally（VC 后任一阶段异常也不残留挂载）
+        # LoRA 卸载统一走 finally（VC 后任一阶段异常也不残留挂载）；
+        # singing 会话的 LoRA 由会话自己按序 detach（上面 mounted_by_us 已移交）
 
         # ---------- 5) F0 移植 ----------
         t0 = time.perf_counter()
@@ -413,28 +529,53 @@ def run_cover(ctx, req: CoverRequest, progress: Optional[Callable] = None,
         f0_report: Dict[str, Any] = {"mode": "off"}
         if req.f0_mode != "off":
             _p(0.72, "F0 提取（源）")
-            src_f0 = (src_f0_key if (src_f0_key is not None and key_semis == 0)
-                      else svc_f0.harvest_f0(y, ENGINE_SR))
+            if f0_cond is not None:
+                # E1-T：条件已把映射后 F0 喂进模型，重用 3b 的提取结果
+                # （octave 修正 + 音区映射语义一致），不重跑整曲 harvest
+                src_f0 = None       # 占位，下面直接用 3b 的 mapped
+            else:
+                src_f0 = (src_f0_key if (src_f0_key is not None
+                                         and key_semis == 0)
+                          else svc_f0.harvest_f0(y, ENGINE_SR))
             _p(0.75, "F0 提取（参考音区）")
-            ref_y, ref_sr = AL.load_audio(req.ref_path)
-            ref_f0 = svc_f0.harvest_f0(resample(ref_y, ref_sr, ENGINE_SR), ENGINE_SR)
-            semis = svc_f0.octave_shift_semis(src_f0, ref_f0, req.transpose_manual)
-            mapped = svc_f0.shift_f0(src_f0, semis)
-            mapped = svc_f0.smooth_ratio_curve(mapped)
-            _p(0.78, f"F0 移植（{req.f0_mode} 模式，移调 {semis:+d} 半音）")
+            if f0_cond is not None:
+                # 移植目标就是条件用的分数移调轮廓（同口径）；报告里也如实
+                # 记分数值，不再取整（评审 #5：force/条件口径劈叉）
+                mapped = f0_cond.src_f0_5ms
+                semis = float(singing_report.get("register_shift_semis", 0.0))
+                semis = int(semis) if float(semis).is_integer() else semis
+            else:
+                ref_y, ref_sr = AL.load_audio(req.ref_path)
+                ref_f0 = svc_f0.harvest_f0(
+                    resample(ref_y, ref_sr, ENGINE_SR), ENGINE_SR)
+                semis = svc_f0.octave_shift_semis(src_f0, ref_f0,
+                                                  req.transpose_manual)
+                mapped = svc_f0.shift_f0(src_f0, semis)
+                mapped = svc_f0.smooth_ratio_curve(mapped)
+            # E1-T：模型条件已承担 F0 时，auto 模式降级为「不移植只测量」
+            # （WORLD 全曲移植会重写音色——母规划 5.7「WORLD 退居兜底」）；
+            # force 仍是用户显式要 WORLD 移植，保持原行为。
+            mode = req.f0_mode
+            if f0_cond is not None and req.f0_mode == "auto":
+                mode = "off"
+            _semis_fmt = f"{semis:+d}" if isinstance(semis, int) else f"{semis:+.2f}"
+            _p(0.78, f"F0 移植（{mode} 模式，移调 {_semis_fmt} 半音）")
             res, metrics = svc_f0.transplant_f0(vocal, ENGINE_SR, mapped,
-                                                out_f0=None, mode=req.f0_mode)
+                                                out_f0=None, mode=mode)
             f0_report = {**metrics, "transpose_semis": semis,
                          "key_shift_semis": key_semis,
                          "transplant_ok": res.ok, "transplant_reason": res.reason}
+            if f0_cond is not None:
+                f0_report["note"] = ("E1-T 条件化已承担 F0；auto 模式仅测量"
+                                     "不移植（force 可强制 WORLD）")
             if res.ok:
                 vocal = res.y
             _log(f"[F0] r={metrics.get('f0_r', '-')} → {metrics.get('mode_used', '-')}，"
-                 f"移调 {semis:+d}st"
+                 f"移调 {_semis_fmt}st"
                  + (f"（50 音分内 {metrics.get('within_50c', 0):.0%}）"
                     if metrics.get("within_50c") is not None else ""))
             _p(0.82, f"F0 完成（{metrics.get('mode_used', '-')}，"
-                     f"移调 {semis:+d} 半音），进入后处理")
+                     f"移调 {_semis_fmt} 半音），进入后处理")
         f0_path = os.path.join(out_dir, "04_f0_vocal.wav")
         AL.save_audio(f0_path, vocal, ENGINE_SR)
         report["f0"] = f0_report
@@ -463,6 +604,17 @@ def run_cover(ctx, req: CoverRequest, progress: Optional[Callable] = None,
         if req.breath_soften:
             vocal = AL.soften_breath_hiss(vocal, ENGINE_SR)[0]
             applied.append("气声软化")
+        if req.hf_transplant:
+            # SYKI-SVC 式源高频移植（E1-T 调研采纳#6）：零训练的高频应急，
+            # 22k 引擎下收益带宽有限（>9kHz），默认关、报告如实记录
+            from webui_app.services import svc_singing
+            try:
+                vocal, hft_info = svc_singing.transplant_highs(
+                    vocal, y, ENGINE_SR)
+                applied.append(f"源高频移植({hft_info['cutoff_hz']:.0f}Hz)")
+                report["hf_transplant"] = hft_info
+            except Exception as exc:
+                _log(f"[后处理] 高频移植跳过: {exc}")
         peak = float(np.max(np.abs(vocal))) if len(vocal) else 0.0
         if peak > 0.98:
             vocal = vocal * (0.98 / peak)
@@ -551,6 +703,28 @@ def run_cover(ctx, req: CoverRequest, progress: Optional[Callable] = None,
         _p(0.96, "质量评估（campplus SS / F0 / 体检）")
         report["quality"] = _quality_report(final_path, req.ref_path,
                                             f0_report, vocal, vocal_sr)
+        # E1-T：歌声指标（HNR 代理 / 高音子集 / 逐句）——「整首平均会掩盖
+        # 高音塌陷」是母规划 §7.2 的报告红线，singing 路径必出这些口径
+        if req.singing_enable:
+            try:
+                from webui_app.services import svc_singing
+                v_y, v_sr = AL.load_audio(final_path)
+                v_y = resample(v_y, v_sr, ENGINE_SR)
+                est_f0 = svc_f0.harvest_f0(v_y, ENGINE_SR)
+                sing_m = {
+                    "hnr_db_voiced": svc_singing.voiced_hnr(v_y, ENGINE_SR, est_f0),
+                    "high_subset": svc_singing.high_subset_stats(
+                        v_y, ENGINE_SR, est_f0, threshold_hz=500.0),
+                    "segments": svc_singing.segment_metrics(
+                        v_y, ENGINE_SR, est_f0)[:12],
+                }
+                report.setdefault("singing", {}).update(
+                    {"metrics": {k: v for k, v in sing_m.items()
+                                 if v is not None}})
+                _log(f"[E1-T] HNR(浊音)={sing_m['hnr_db_voiced']}dB，"
+                     f"高音占比={sing_m['high_subset'].get('high_ratio')}")
+            except Exception as exc:
+                report.setdefault("singing", {})["metrics_error"] = str(exc)
         timings["quality"] = round(time.perf_counter() - t0, 1)
 
         # 产物清单
@@ -578,15 +752,28 @@ def run_cover(ctx, req: CoverRequest, progress: Optional[Callable] = None,
         import traceback
         report["traceback"] = traceback.format_exc()
     finally:
+        # E1-T：singing 会话退出——先 detach 会话内挂的 LoRA，再恢复引擎
+        # 原 CFM、释放 singing 副本（顺序在 SingingCfmSession.__exit__ 内）
+        if sing_session is not None:
+            try:
+                sing_session.__exit__(None, None, None)
+            except Exception:
+                pass
+            sing_session = None
         if gpt_offloaded:
             try:
                 engine.restore_gpt_after_svc()
             except Exception:
                 pass
-        # LoRA 卸载（我们挂的才卸；异常路径也不残留——验收建议#6）
+        # LoRA 卸载（我们挂的才卸；异常路径也不残留——验收建议#6）。
+        # singing 路径的挂载已移交会话处理（mounted_by_us 被置回 False），
+        # 这里只清非 singing 路径；bypass 自己的租约（r1-3 防护的会话侧豁免）。
         if mounted_by_us:
             try:
-                engine.detach_lora(target="cfm")
+                try:
+                    engine.detach_lora(target="cfm", bypass_lease=svc_lease)
+                except TypeError:
+                    engine.detach_lora(target="cfm")
             except Exception:
                 pass
             if pre_mounted:

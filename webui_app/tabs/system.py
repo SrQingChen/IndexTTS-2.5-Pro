@@ -169,7 +169,27 @@ def render(ctx: AppContext):
                     label="连续性模式（长段合成；OOM 自动回退）",
                     info="低显存下临时取消官方 40 字硬切，按 max_text_tokens_per_segment "
                          "整段合成，减少段间静音/语气断裂；显存不足自动回退")
+                stage_offload_cb = gr.Checkbox(
+                    value=bool(getattr(eng, "stage_offload", False)),
+                    label="阶段卸载（C2 实验；推理期按阶段腾显存）",
+                    info="参考特征构建后把 w2v-BERT 搬 CPU、末段 GPT 生成完搬 CPU，"
+                         "给 CFM/BigVGAN 让显存（更少切段/更长块）；有秒级搬动代价，"
+                         "只适合离线合成；结束/异常自动搬回")
                 maint_out = gr.HTML("")
+
+                def _set_continuity(on: bool):
+                    eng.continuity_mode = bool(on)
+                    return "连续性模式已" + ("开启" if on else "关闭")
+
+                def _set_stage_offload(on: bool):
+                    eng.stage_offload = bool(on)
+                    return "阶段卸载已" + ("开启" if on else "关闭")
+
+                continuity_cb.change(_set_continuity, inputs=[continuity_cb],
+                                     outputs=[maint_out])
+                stage_offload_cb.change(_set_stage_offload,
+                                        inputs=[stage_offload_cb],
+                                        outputs=[maint_out])
 
             with gr.Column(elem_classes=["ix-section"]):
                 gr.HTML(T.section("磁盘清理", "🗑",

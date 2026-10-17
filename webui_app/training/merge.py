@@ -126,11 +126,16 @@ def set_scale(engine, factor: float, target: str = "gpt") -> int:
 class MergeOptions:
     """合并的输入与去向。"""
     adapter_dir: str = ""          # PEFT 的 adapter 目录（含 adapter_model.*）
-    arch: str = "gpt"              # gpt | cfm —— 决定合并进哪份底座
-    out_path: str = ""             # 输出 pth（必须在 checkpoints/ 之外）
+    arch: str = "gpt"              # gpt | cfm | cfm_singing —— 决定合并进哪份底座
+    out_path: str = ""             # 输出 pth（cfm_singing 允许 checkpoints/
+                                   # 顶层的两个歌声新名字，其余必须在之外）
     scale: float = 1.0             # 合并强度（一般与评测确认过的旋钮一致）
     device: str = "cpu"            # 合并在 CPU 上做就够（一次性矩阵加法）
     keep_backup: bool = True       # 输出已存在时先备份成 .bak（不覆盖历史）
+    # E1-T：adapter 目录里的 timbre_conditioner.pt 一并写入产物
+    # （conditioner 是全训模块，PEFT 的 merge_and_unload 不会带它）
+    singing_cfg_src: str = ""      # config_singing.yaml 的来源（空=checkpoints/
+                                   # config_singing.yaml 已有，复制即可）
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -190,19 +195,31 @@ def merge_lora_to_checkpoint(opts: MergeOptions,
     if not opts.adapter_dir or not os.path.isdir(opts.adapter_dir):
         rep.notes.append(f"adapter 目录不存在：{opts.adapter_dir}")
         return rep
-    if opts.arch not in ("gpt", "cfm"):
-        rep.notes.append(f"arch={opts.arch!r} 不合法（gpt | cfm）")
+    if opts.arch not in ("gpt", "cfm", "cfm_singing"):
+        rep.notes.append(f"arch={opts.arch!r} 不合法（gpt | cfm | cfm_singing）")
         return rep
     if not opts.out_path:
         rep.notes.append("out_path 不能为空")
         return rep
     # 红线：输出不准落在底座目录里（哪怕子目录也不行 ——
-    # 用户可能把 checkpoints/ 整个拷走，混进去就说不清了）
+    # 用户可能把 checkpoints/ 整个拷走，混进去就说不清了）。
+    # E1-T 唯一例外：cfm_singing 的 capability 产物 = checkpoints/ 顶层的
+    # s2mel_singing.pth / config_singing.yaml 两个**新名字**（Guard 白名单）。
+    if opts.arch == "cfm_singing" and guard.allow_singing_names is not True:
+        guard = GD.BaseGuard(model_dir=guard.model_dir,
+                             train_root=guard.train_root,
+                             allow_singing_names=True)
     try:
         safe = guard.assert_safe_output(opts.out_path, must_not_exist=False)
         opts.out_path = safe
     except Exception as e:
         rep.notes.append(f"输出路径被防线拦下：{e}")
+        return rep
+    if opts.arch == "cfm_singing" and (
+            os.path.basename(opts.out_path)
+            not in GD.BaseGuard.SINGING_WHITELIST):
+        rep.notes.append(
+            "cfm_singing 合并产物必须是 s2mel_singing.pth / config_singing.yaml")
         return rep
 
     # ---- 备份 ----
@@ -216,6 +233,33 @@ def merge_lora_to_checkpoint(opts: MergeOptions,
     if opts.arch == "gpt":
         base, info = GL.load_base_gpt(opts.device, model_dir)
         src_ckpt = info["path"]
+    elif opts.arch == "cfm_singing":
+        # 歌声 capability：优先用已有 s2mel_singing.pth（继续叠加），
+        # 没有则从原始 s2mel.pth + config_singing.yaml 起步（conditioner
+        # 从 adapter 目录的 timbre_conditioner.pt 回灌）
+        singing_cfg = os.path.join(model_dir, "config_singing.yaml")
+        singing_pth = os.path.join(model_dir, "s2mel_singing.pth")
+        if not os.path.isfile(singing_cfg):
+            rep.notes.append("缺少 checkpoints/config_singing.yaml（E1-T 底座配置）")
+            return rep
+        pth_in = "s2mel_singing.pth" if os.path.isfile(singing_pth) else None
+        base, info = CL.load_base_cfm(opts.device, model_dir,
+                                      cfg_path=singing_cfg, pth_name=pth_in)
+        if not info.get("has_conditioner"):
+            rep.notes.append("config_singing.yaml 未构造出 TimbreConditioner")
+            return rep
+        src_ckpt = info["path"]
+        # 回灌 conditioner（新建时是零初始化；adapter 目录里有训练过的）
+        tc = os.path.join(opts.adapter_dir, "timbre_conditioner.pt")
+        if os.path.isfile(tc):
+            ck = torch.load(tc, map_location="cpu", weights_only=False)
+            base.estimator.timbre_conditioner.load_state_dict(
+                ck["timbre_conditioner"])
+            rep.notes.append("已并入 TimbreConditioner 权重"
+                             f"（{len(ck['timbre_conditioner'])} 张量）")
+        else:
+            rep.notes.append("⚠ adapter 目录缺 timbre_conditioner.pt，"
+                             "conditioner 保持零初始化（条件不生效）")
     else:
         base, info = CL.load_base_cfm(opts.device, model_dir)
         src_ckpt = info["path"]
@@ -240,6 +284,14 @@ def merge_lora_to_checkpoint(opts: MergeOptions,
             payload = {"model": sd_new}
         else:
             payload = sd_new
+    elif opts.arch == "cfm_singing":
+        net = (sd_old or {}).get("net") if isinstance(sd_old, dict) else None
+        if not isinstance(net, dict) or "cfm" not in net:
+            rep.notes.append(f"源歌声底座结构不是预期的 net.cfm：{src_ckpt}")
+            return rep
+        import copy
+        payload = copy.deepcopy(sd_old)
+        payload["net"]["cfm"] = sd_new
     else:
         net = (sd_old or {}).get("net") if isinstance(sd_old, dict) else None
         if not isinstance(net, dict) or "cfm" not in net:
@@ -252,12 +304,18 @@ def merge_lora_to_checkpoint(opts: MergeOptions,
     # ---- 校验：合并结果必须能被一个全新底座**完整**吃下 ----
     if opts.arch == "gpt":
         checker, _ = GL.load_base_gpt("cpu", model_dir)
+    elif opts.arch == "cfm_singing":
+        checker, _ = CL.load_base_cfm(
+            "cpu", model_dir,
+            cfg_path=os.path.join(model_dir, "config_singing.yaml"),
+            pth_name=None)
     else:
         checker, _ = CL.load_base_cfm("cpu", model_dir)
     target = payload["model"] if (opts.arch == "gpt"
                                   and isinstance(payload, dict)
                                   and "model" in payload) else (
-        payload["net"]["cfm"] if opts.arch == "cfm" else payload)
+        payload["net"]["cfm"] if opts.arch in ("cfm", "cfm_singing")
+        else payload)
     missing, unexpected = checker.load_state_dict(target, strict=False)
     rep.missing, rep.unexpected = len(missing), len(unexpected)
     del checker
@@ -270,6 +328,13 @@ def merge_lora_to_checkpoint(opts: MergeOptions,
     os.makedirs(os.path.dirname(os.path.abspath(opts.out_path)) or ".",
                 exist_ok=True)
     torch.save(payload, opts.out_path)
+    if opts.arch == "cfm_singing" and (
+            os.path.basename(opts.out_path) == "s2mel_singing.pth"):
+        cfg_dst = os.path.join(model_dir, "config_singing.yaml")
+        cfg_src = opts.singing_cfg_src or cfg_dst
+        if cfg_src != cfg_dst and os.path.isfile(cfg_src):
+            shutil.copy2(cfg_src, cfg_dst)
+            rep.notes.append(f"已同步歌声配置 → {cfg_dst}")
     rep.ok = True
     rep.n_merged = n_layers
     rep.seconds = round(time.perf_counter() - t0, 1)

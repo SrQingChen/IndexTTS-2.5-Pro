@@ -121,3 +121,41 @@ distribution is required to carry.
 
   This NOTICE is a factual record of attribution and changes. It is not legal
   advice; consult a qualified professional for licensing questions.
+
+--------------------------------------------------------------------------------
+6. Record of model-code modifications (E1-T, 2026-10)
+--------------------------------------------------------------------------------
+
+  To add optional singing-voice conditioning (pitch/technique -> timbre) as a
+  second model track ("E1-T", see docs/dev-plan-e1t-2026-10.md), the following
+  UPSTREAM MODEL CODE files were modified with backward-compatible, gated
+  changes only:
+
+    - indextts/s2mel/modules/flow_matching.py
+        BASECFM.inference / solve_euler / forward gain optional
+        `technique` / `f0_stats` keyword arguments (appended at the end of the
+        signatures; f0 already existed and is passed through). With
+        f0=None and technique=None the code path is bit-identical to upstream
+        (frozen-reference unit test in tests/test_e1t_wiring.py).
+    - indextts/s2mel/modules/diffusion_transformer.py
+        DiT.__init__ constructs a TimbreConditioner only when the model config
+        sets DiT.technique_condition=true (the default TTS config does not, so
+        the default state_dict has no new keys). DiT.forward gains optional
+        f0/technique/f0_stats/cond_mask keyword arguments (None = original
+        path).
+    - indextts/s2mel/modules/conditioners.py (NEW)
+        TimbreConditioner: per-frame pitch/technique residual on the global
+        style vector (zero-initialized residual, learnable alpha).
+    - indextts/infer_v2_5.py
+        infer / infer_generator gain an optional `stage_hooks=None` callback
+        invoked at stage boundaries; with None the behavior is unchanged.
+    - checkpoints/config_singing.yaml (NEW, separate from config.yaml)
+        Singing-track config; the default checkpoints/config.yaml and the
+        original upstream weights (s2mel.pth, gpt.pth, BigVGAN) are NOT
+        modified (hash-guarded by tests/baseline_tts_hashes.json).
+
+  The original upstream WEIGHTS remain unmodified. Derived singing weights
+  (e.g. checkpoints/s2mel_singing.pth, if trained by the user) are governed by
+  the bilibili Model Use License Agreement like the rest of this derivative
+  work, and training data licensing (e.g. GTSinger CC BY-NC-SA 4.0) applies
+  independently to whatever data the user chooses to train on.

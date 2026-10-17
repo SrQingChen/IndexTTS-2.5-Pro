@@ -8,9 +8,73 @@ def build(reg, P):
     _vc(reg, P)
     _f0(reg, P)
     _key(reg, P)
+    _singing(reg, P)
     _post(reg, P)
     _mix(reg, P)
     _realtime(reg, P)
+
+
+def _singing(reg, P):
+    reg(P(
+        key="cover_singing_enable", group="cover_sing", label="歌声模型（E1-T 实验性）",
+        kind="checkbox", default=False,
+        summary="换装歌声 CFM（s2mel_singing.pth）并把音高/技巧条件喂进模型。",
+        info="需要先完成 capability 训练与合并；关闭时走原链路（默认）",
+        affects="高音区音色（HNR）、转换耗时",
+        detail_md="""
+**E1-T（docs/dev-plan-e1t-2026-10.md）**：把「音高/技巧 → 音色」的映射
+学进 CFM（TimbreConditioner 逐帧残差），高音不再靠 WORLD 后处理拉上去。
+
+前置（一次）：
+1. `tools/gtsinger_import.py` 导入公开歌声数据集；
+2. singing 模式提取特征 → CfmTrainer(singing=True) 训练 capability；
+3. `merge`（arch=cfm_singing）产出 `checkpoints/s2mel_singing.pth`；
+4. 本开关即可启用（会话内换装、结束自动恢复，TTS 不受影响）。
+
+关闭本开关时翻唱链路与旧版逐字节一致（回归测试固化）。
+""",
+        pitfall_md="未训练 capability 就开启会在加载处直接报错（这是故意的——拿语音底座跑条件等于白跑）。",
+    ))
+    reg(P(
+        key="cover_technique_mode", group="cover_sing", label="技巧条件来源",
+        kind="dropdown",
+        choices=["preserve 保持（control 直通）", "auto 分类器自动", "manual 手动指定"],
+        default="preserve 保持（control 直通）",
+        summary="technique 条件的来源；auto 需要 checkpoints/technique_cls.pt。",
+        info="preserve=全 control（保守）；auto=分类器逐帧；manual=整曲一个技巧",
+    ))
+    reg(P(
+        key="cover_technique_manual", group="cover_sing", label="手动技巧 id",
+        kind="slider", minimum=0, maximum=6, step=1, default=0,
+        summary="0=control 1=mixed 2=falsetto 3=breathy 4=pharyngeal 5=vibrato 6=glissando。",
+        info="只在技巧来源=manual 时生效",
+    ))
+    reg(P(
+        key="cover_bon_high", group="cover_sing", label="高音块 BoN 择优",
+        kind="checkbox", default=False,
+        summary="对高音块（浊音 p75≥350Hz）生成 3 候选按 HNR/音准/SS 择优。",
+        info="只作用于高音块，中低音不受影响；转换耗时约 ×3（仅高音块）",
+    ))
+    reg(P(
+        key="cover_hf_transplant", group="cover_sing", label="源高频移植（SYKI）",
+        kind="checkbox", default=False,
+        summary="转换结果低通 + 源干声 >9kHz 直接加回（零训练应急）。",
+        info="22k 引擎下收益带宽有限；依赖源干声质量",
+    ))
+    reg(P(
+        key="cover_register_mode", group="cover_sing", label="音区映射",
+        kind="dropdown",
+        choices=["auto 分数音区映射（推荐）", "off 保原调硬唱"],
+        default="auto 分数音区映射（推荐）",
+        summary="auto=把源 F0 连续拉进参考音区（保旋律，Everyone-Can-Sing 单八度原则）。",
+        info="off=不移调，条件按源音高原样喂（唱得高但音色外推压力最大）",
+    ))
+    reg(P(
+        key="cover_octave_fix", group="cover_sing", label="八度跳变修正（SHC）",
+        kind="checkbox", default=True,
+        summary="修正源 F0 的八度估计错误（短促回返跳变）。",
+        info="颤音安全；但 <0.4s 的真实快速换声区（yodel/戏腔闪跳）会被抹平——做这类内容时关闭",
+    ))
 
 
 def _input(reg, P):
