@@ -446,6 +446,12 @@ class TTSEngine:
         """
         log = LOG.get_logger("engine")
         if getattr(self.cfg, "accel", False) or                 getattr(self.cfg, "torch_compile", False):
+            # 2026-10-17 实锤：开关开了但零日志留痕，用户无从判断是否生效
+            # ——被跳过也要说一声（只记一次，防 72 次推理刷屏）
+            if not getattr(self, "_offload_skip_logged", False):
+                self._offload_skip_logged = True
+                log.info("阶段卸载：开关已开但被跳过（accel/torch_compile "
+                         "与设备绑定，搬动会使编译图失效）")
             return None
         tts = self._tts
 

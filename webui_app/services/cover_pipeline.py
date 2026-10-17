@@ -652,18 +652,30 @@ def run_cover(ctx, req: CoverRequest, progress: Optional[Callable] = None,
                 # 这一步可能长达几十分钟：进度必须停在“超分中”，
                 # 否则心跳会一直显示上一条 F0 文案，看起来像卡死。
                 _p(0.86, f"超分中（AudioSR → 48k，预计约 {est_min:.0f} 分钟）")
-                r = SR.enhance_file(base, ddim_steps=int(req.sr_steps))
-                SR.release_all()
-                if r.get("ok"):
-                    sr_path = r["path"]
-                    vocal, _ = AL.load_audio(sr_path)
-                    vocal_sr = r.get("sr", 48000)
-                    report["sr"] = {"ok": True, "seconds": r.get("seconds"),
-                                    "sr": vocal_sr, "steps": req.sr_steps}
-                    _p(0.92, f"超分完成（{r.get('seconds', 0):.0f}s）")
-                else:
-                    report["sr"] = {"ok": False, "error": r.get("error")}
+                # 2026-10-17 失败路径补丁：异常也要 release_all（否则
+                # AudioSR 常驻 ~5.5GB，引擎恢复时 WDDM 溢出），且超分失败
+                # 只降级回 22k 成品——不再把整次翻唱标成失败（当天 11:30
+                # 的 OOM 就把好端端的 05 成品一起误判了）。
+                try:
+                    r = SR.enhance_file(base, ddim_steps=int(req.sr_steps))
+                except Exception as exc:
+                    SR.release_all()
+                    report["sr"] = {"ok": False,
+                                    "error": f"{type(exc).__name__}: {exc}"}
+                    _log(f"[超分] 失败（回退 22k 人声）: {exc}")
                     _p(0.92, "超分失败（回退 22k 人声）")
+                else:
+                    SR.release_all()
+                    if r.get("ok"):
+                        sr_path = r["path"]
+                        vocal, _ = AL.load_audio(sr_path)
+                        vocal_sr = r.get("sr", 48000)
+                        report["sr"] = {"ok": True, "seconds": r.get("seconds"),
+                                        "sr": vocal_sr, "steps": req.sr_steps}
+                        _p(0.92, f"超分完成（{r.get('seconds', 0):.0f}s）")
+                    else:
+                        report["sr"] = {"ok": False, "error": r.get("error")}
+                        _p(0.92, "超分失败（回退 22k 人声）")
                 timings["superres"] = round(time.perf_counter() - t0, 1)
 
         final_path = sr_path or os.path.join(out_dir, "05_vocal_final_22k.wav")

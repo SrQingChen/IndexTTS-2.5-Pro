@@ -162,10 +162,16 @@ def _flatten(wav) -> "np.ndarray":
 
 
 def _enhance_chunk(model, y: "np.ndarray", in_sr: int, tmp_path: str,
-                   ddim_steps: int, guidance_scale: float, seed: int
-                   ) -> "np.ndarray":
-    """一段（≤5s）→ 48kHz 超分波形；按输入时长精确裁剪（AudioSR 会补零
-    到块边界——真机实测 16.37s 进 20.48s 出）。"""
+                   ddim_steps: int, guidance_scale: float, seed: int,
+                   orig_n: "int | None" = None) -> "np.ndarray":
+    """一段（≤5s）→ 48kHz 超分波形；按**原始**时长精确裁剪（AudioSR 会
+    补零到块边界——真机实测 16.37s 进 20.48s 出）。
+
+    orig_n：输入里真实音频的样本数（补零到此长度之前的值）。真机实锤
+    （2026-10-17 复现）：43.8s 合成成品的 1.02s 尾块触发 AudioSR 内部
+    "Expected size 64 but got size 63" 形状错配——短输入经内部下采样
+    取整后 skip 连接对不上。对策见 enhance_file 的补零说明。
+    """
     import numpy as np
     import soundfile as sf
     from audiosr import pipeline as P
@@ -174,7 +180,7 @@ def _enhance_chunk(model, y: "np.ndarray", in_sr: int, tmp_path: str,
                              guidance_scale=guidance_scale,
                              ddim_steps=int(ddim_steps))
     out = _flatten(wav)
-    expect = int(len(y) * 48000 / in_sr)
+    expect = int((orig_n if orig_n is not None else len(y)) * 48000 / in_sr)
     if len(out) >= expect:
         out = out[:expect]
     else:                       # 理论不该短；防御性补零保持对齐
@@ -244,11 +250,19 @@ def enhance_file(path: str, out_path: Optional[str] = None,
                         pieces.pop()
                     if len(seg) < int(0.2 * in_sr):
                         continue
+                # 尾块补零到整块形状：与所有正常块完全同形（已被验证的
+                # 代码路径），杜绝短输入的内部形状错配；补零部分按 orig_n
+                # 精确裁掉，代价只是尾块多算一点（每文件一次）。
+                orig_n = len(seg)
+                if orig_n < chunk_n:
+                    seg = np.concatenate(
+                        [seg, np.zeros(chunk_n - orig_n, dtype=np.float32)])
                 try:
                     out = _enhance_chunk(
                         model, seg, in_sr,
                         os.path.join(tmpdir, f"c{ci:03d}.wav"),
-                        ddim_steps, guidance_scale, seed + ci)
+                        ddim_steps, guidance_scale, seed + ci,
+                        orig_n=orig_n)
                     _STATE["infers"] += 1
                     pieces.append(out)
                 except Exception as e:

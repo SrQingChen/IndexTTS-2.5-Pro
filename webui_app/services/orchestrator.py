@@ -1109,7 +1109,10 @@ def perform(
         final = AL.shape_edges(final, SR, pad_ms=80.0, fade_ms=12.0)
 
         try:
-            import soundfile as sf
+            # 注意不要再局部 import soundfile——模块级已有（:26）；函数内
+            # 任何位置的 import 都会让 sf 在整个 perform() 里变成局部名，
+            # 前面 822 行的回写就会 UnboundLocalError（2026-10-17 每块
+            # 「湿高频抑制失败」的真因，滚动参考链因此一直拿脏音频）。
             sf.write(out_base, final, SR, subtype="PCM_16")
         except Exception as e:
             raise EngineError(f"写拼接结果失败：{e}")

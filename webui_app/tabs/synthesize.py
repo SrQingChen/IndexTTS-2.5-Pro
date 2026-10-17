@@ -1022,7 +1022,18 @@ def render(ctx: AppContext):
               f"{os.path.basename(str(path))}")
         try:
             r = SR.enhance_file(str(path), ddim_steps=int(steps or 35))
-        except Exception:
+        except Exception as e:
+            # 两件事必须做（2026-10-17 真机实锤的失败路径缺陷）：
+            # 1) 异常落日志——之前只进 UI，排查全靠用户复述；
+            # 2) 先释放 AudioSR 再重载引擎——之前失败路径不 release，
+            #    ~5.5GB 留在卡上，引擎重载直接 WDDM 溢出（实测 10.75GB
+            #    占用 / 空闲 0.42GB），整机变慢。
+            LOG.get_logger("audio_sr").error(
+                "超分失败（输入 %s）：%s: %s", path, type(e).__name__, e)
+            try:
+                SR.release_all()
+            except Exception:
+                pass
             if was_loaded and not eng.loaded:
                 try:
                     eng.load()
