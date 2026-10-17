@@ -256,8 +256,10 @@ def run_cover(ctx, req: CoverRequest, progress: Optional[Callable] = None,
                 engine.unload(bypass_svc=True)
             _p(0.02, "人声分离中（Roformer，首跑需下载权重）")
             sep_res = SEP.separate_vocals(req.src_path, out_dir, req.separate_model,
-                                          progress=_p)
+                                          progress=_p, should_stop=should_stop)
             SEP.release_all()
+            if sep_res.get("cancelled"):
+                raise _Stop()
             _check_stop(should_stop)
             if not sep_res.get("ok"):
                 return {**report, "error": f"分离失败: {sep_res.get('error')}"}
@@ -274,8 +276,11 @@ def run_cover(ctx, req: CoverRequest, progress: Optional[Callable] = None,
                 if bool(getattr(engine.stats, "loaded", False)):
                     engine.unload(bypass_svc=True)
                 _p(0.10, "去混响中（DeEcho-DeReverb）")
-                dr = SEP.dereverb(vocal_path, out_dir, req.dereverb_model, progress=_p)
+                dr = SEP.dereverb(vocal_path, out_dir, req.dereverb_model,
+                                   progress=_p, should_stop=should_stop)
                 SEP.release_all()
+                if dr.get("cancelled"):
+                    raise _Stop()
                 _check_stop(should_stop)
                 if dr.get("ok"):
                     vocal_path = dr["dry"]

@@ -81,7 +81,10 @@ def render(ctx: AppContext) -> Dict[str, Any]:
                 sep_model_dd = gr.Dropdown(
                     label="人声分离模型", choices=list(SEP.VOCALS_MODELS.keys()),
                     value=st.get("separate_model") or list(SEP.VOCALS_MODELS.keys())[0],
-                    info="BS-Roformer ViperX 社区默认；首跑自动下载权重（~1GB）")
+                    info="BS-Roformer ViperX 社区默认；缺失时首次推理自动经镜像下载")
+                with gr.Row():
+                    sep_dl_btn = gr.Button("⬇ 预下载/补全分离模型（镜像）", size="sm")
+                    sep_list_btn = gr.Button("🔄 模型状态", size="sm")
                 dereverb_ck = make_component("cover_dereverb", value=bool(st.get("dereverb", True)))
                 denoise_sl = make_component("cover_denoise", value=float(st.get("denoise", 0.0)))
                 sep_status = gr.Markdown()
@@ -151,16 +154,51 @@ def render(ctx: AppContext) -> Dict[str, Any]:
         result_files = gr.Files(label="产物文件（干声/BGM/成品/报告）")
 
         # ---------------- 回调 ----------------
+        def _models_line() -> str:
+            try:
+                rows = SEP.installed_models()
+                ready = sum(1 for r in rows if r["ready"])
+                missing = [r["file"] for r in rows if not r["ready"]]
+                line = f"分离/去混响模型：**{ready}/{len(rows)} 就绪**"
+                if missing:
+                    line += f"（缺失 {len(missing)} 个，首次推理自动镜像下载）"
+                return line
+            except Exception as exc:
+                return f"模型状态读取失败: {exc}"
+
         def _sep_hint(state_label: str) -> str:
             if not SEP.available() and _STATE_TO_KEY.get(state_label) == "song":
-                return "⚠️ audio-separator 未安装（pip install \"audio-separator[gpu]\"）；请改选『干净人声』或先装依赖"
+                return ("⚠️ audio-separator 未安装；请改选『干净人声』或先装依赖：\n"
+                        "`uv pip install \"audio-separator[gpu]\" "
+                        "--default-index https://pypi.tuna.tsinghua.edu.cn/simple`")
+            head = _models_line()
             if _STATE_TO_KEY.get(state_label) == "song":
-                return "链路：**人声分离 → 去混响 → 预处理 → VC → F0 → 后处理**（分离约 1-3 分钟/首，首跑需下权重）"
+                return (head + "\n\n链路：**人声分离 → 去混响 → 预处理 → VC → F0 → 后处理**"
+                        "（分离约 1-3 分钟/首；权重缺失会自动下载，可用左侧按钮手动预下载）")
             if _STATE_TO_KEY.get(state_label) == "separated":
-                return "链路：**去混响 → 预处理 → VC → F0 → 后处理**"
-            return "链路：**预处理 → VC → F0 → 后处理**（直通，最快）"
+                return head + "\n\n链路：**去混响 → 预处理 → VC → F0 → 后处理**"
+            return head + "\n\n链路：**预处理 → VC → F0 → 后处理**（直通，最快）"
 
         state_dd.change(_sep_hint, inputs=[state_dd], outputs=[sep_status])
+
+        @LOG.ui_guard("cover.sep_status")
+        def _sep_status_click(state_label):
+            return _sep_hint(state_label)
+
+        sep_list_btn.click(_sep_status_click, inputs=[state_dd], outputs=[sep_status])
+
+        @LOG.ui_guard("cover.sep_prefetch")
+        def _sep_prefetch(model_label, progress=gr.Progress()):
+            name = SEP.VOCALS_MODELS.get(model_label, SEP.DEFAULT_VOCALS)
+            log_sink.append(f"[模型] 检查 {name}（缺失则经镜像下载，支持续传）")
+            r = SEP.ensure_model(
+                name, lambda f, m: progress(min(0.98, 0.02 + 0.96 * f), desc=m))
+            if not r.get("ok"):
+                raise gr.Error(r.get("error", "下载失败"))
+            log_sink.append(f"[模型] {name} 就绪")
+            return _models_line()
+
+        sep_dl_btn.click(_sep_prefetch, inputs=[sep_model_dd], outputs=[sep_status])
 
         mix_ck.change(lambda on: gr.update(visible=bool(on)),
                       inputs=[mix_ck], outputs=[bgm_upload])

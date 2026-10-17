@@ -241,3 +241,48 @@ def convert_file(engine, src_path, ref_path, *, lora_cfm=None, lora_scale=1.0,
 - "连续 10 分钟流式无显存增长"验收线（需声卡环境）
 
 **遗留风险（如实告知，见交付说明）**：分离链路（audio-separator 未安装，降级文案安全）、实时变声真跑（延迟数为纸面估计）、超分真跑（17.8× 耗时）、auto_mix 全曲对拍（head_pad 已修+单测，未真机全曲验证）。
+
+## 10. 模型部署与国内镜像（2026-10-17 补）
+
+**依赖安装（清华源）**：
+
+```bash
+uv pip install --python .venv/Scripts/python.exe "audio-separator[gpu]" \
+  --default-index https://pypi.tuna.tsinghua.edu.cn/simple
+```
+
+`audio-separator` 自身只认 GitHub 直连（元数据 `download_checks.json` +
+Releases 权重），国内不可达。本项目在 `services/separation.py` 里做了**前置
+镜像预取**，推理时缺模型会**自动下载并部署**（无需手动步骤）：
+
+- 镜像链默认 `ghproxy.net → gh-proxy.com → 直连`；可用环境变量覆盖：
+  `INDEXTTS_GH_MIRRORS=https://ghproxy.net/,`（末尾空项=再试直连；海外可设 `,` 仅直连）。
+- 支持 `.part` + HTTP Range **断点续传**、多镜像自动回退、Content-Length/
+  Content-Range **大小校验**、HTML 错误页防污染。
+- 权重落在 `checkpoints/separators/`（模型资源区，不进清理页产物盘点）；
+  同时预置 `download_checks.json`（audio-separator 的模型清单）。
+- 手动预下载：`python tools/fetch_separator_models.py --all`（`--list` 看状态）。
+  翻唱页也有「⬇ 预下载/补全分离模型（镜像）」按钮与模型就绪计数。
+
+**已部署模型（2026-10-17）**：BS-Roformer ViperX-1297（639MB）、Mel-Band
+Roformer 1143（1008MB）、vocals_mel_band_roformer（913MB）、UVR-DeEcho-DeReverb
+（224MB）、UVR-DeEcho-Normal（127MB），合计约 2.3GB。`--list` 全部 ✓；
+BS-Roformer 与 UVR-DeEcho-DeReverb 已做加载冒烟（6.0s / 0.1s）。
+
+**部署期踩坑（均已在代码里兜住）**：
+1. `Separator.__init__` 0.47 **没有 `output_bitdepth` 参数**（传了 TypeError）——
+   WAV 默认 16bit，改用 `output_format="WAV"`。
+2. VR 模型加载时 `load_model_data_using_hash` 还要拉
+   `vr_model_data.json` / `mdx_model_data.json`（远端名 `model_data_new.json`），
+   否则 VR 去混响在加载阶段就网络失败。`ensure_metadata` 现在一并预置三件。
+3. `UVR-DeEcho-Normal.pth` 的 Release 资产实名是 `UVR-De-Echo-Normal.pth`
+   （带连字符）——URL 直拼 404。`FILE_URL_ALIASES` 做映射。
+4. 镜像冷缓存偶发 404（重试即 206）；YAML 只有 944 字节，旧的 1024B
+   “就绪阈值”会把它判缺失导致每次推理重下——现按类型阈值（YAML 200B /
+   权重 1MiB），且探到的体重<1MiB 视为探测失败。
+
+**已知环境告警**：`onnxruntime-gpu 1.31`（CUDA 13 编译）与项目 torch
+`2.8+cu128`（CUDA 12.8）不匹配，启动时打印 cublasLt/cudart 加载失败。
+本项目 UI 暴露的模型（Roformer/VR）走 PyTorch 路径，**不受影响**；若未来
+启用 MDX(ONNX) 模型，需将 onnxruntime-gpu 固定到 1.22.x（CUDA 12）或升级
+torch 到 cu13 分支。
