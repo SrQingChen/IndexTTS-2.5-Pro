@@ -23,7 +23,6 @@ from webui_app import logging_setup as LOG
 from webui_app.context import AppContext
 from webui_app.services import e1t_wizard as WZ
 from webui_app.services import gts_fetch as GF
-from webui_app.training.dataset import list_datasets
 from webui_app.training.runner import get_runner
 from webui_app.widgets import make_component
 
@@ -193,14 +192,16 @@ def render(ctx: AppContext) -> Dict[str, Any]:
     # ---------------- ⑥ 角色身份 ----------------
     with gr.Accordion("⑥ 角色歌声身份 LoRA（每个角色一次）", open=False):
         gr.Markdown(
-            "在歌声底座上、用**角色说话数据集**（现成的即可，特征直接复用）练身份锚点。"
-            "**只练 CFM、不练 GPT**（翻唱绕过 GPT）；条件不参与 → capability 的"
-            "conditioner 自动冻结，不会遗忘高音能力。唱得不像可以加素材重训。")
+            "在歌声底座上、用**角色说话数据集**练身份锚点——**一键三连切好、"
+            "降噪/响度锚定、ASR 对齐、特征已提好的那批音频就是它**，直接选"
+            "（下拉按当时填的模型名称/角色名显示）。**只练 CFM、不练 GPT**"
+            "（翻唱绕过 GPT）；条件不参与 → capability 的 conditioner 自动冻结，"
+            "不会遗忘高音能力。唱得不像可以加素材重训。")
         with gr.Row():
-            id_ds_dd = gr.Dropdown(choices=list_datasets(),
-                                    label="角色说话数据集（现有任意数据集）",
+            id_ds_dd = gr.Dropdown(choices=WZ.identity_dataset_choices(),
+                                    label="角色说话数据集（一键三连产物会显示角色名）",
                                     interactive=True, scale=2)
-            id_run_tb = gr.Textbox(label="run 名（建议 <角色>_singing_identity）",
+            id_run_tb = gr.Textbox(label="run 名（选数据集后自动填）",
                                    value="", scale=1)
         with gr.Row():
             id_preset_dd = make_component("e1t_id_preset")
@@ -243,13 +244,30 @@ def render(ctx: AppContext) -> Dict[str, Any]:
                 gr.update(choices=WZ.singing_datasets()),
                 gr.update(choices=WZ.singing_datasets()),
                 gr.update(choices=WZ.capability_runs()),
-                gr.update(choices=list_datasets()))
+                gr.update(choices=WZ.identity_dataset_choices()))
 
     refresh_btn.click(on_refresh, outputs=[status_md, feat_ds_dd, cap_ds_dd,
                                            merge_run_dd, id_ds_dd])
     feat_refresh_btn.click(
         lambda: gr.update(choices=WZ.singing_datasets()),
         outputs=[feat_ds_dd])
+
+    @LOG.ui_guard("e1t.id_ds")
+    def on_id_dataset(ds, current_run):
+        """选了角色数据集 → 自动填默认 run 名（角色名 + 后缀）。
+
+        只在 run 名为空、或仍是上一次自动填充值时覆盖——用户手改过就不动。
+        """
+        if not (ds or "").strip():
+            return gr.update()
+        new = WZ.identity_run_default(ds)
+        cur = (current_run or "").strip()
+        if not cur or cur.endswith("_singing_identity"):
+            return gr.update(value=new)
+        return gr.update()
+
+    id_ds_dd.change(on_id_dataset, inputs=[id_ds_dd, id_run_tb],
+                    outputs=[id_run_tb])
 
     @LOG.ui_guard("e1t.bootstrap")
     def on_bootstrap():
@@ -287,8 +305,8 @@ def render(ctx: AppContext) -> Dict[str, Any]:
     def on_identity(ds, run, preset_label, epochs):
         if not (ds or "").strip():
             raise gr.Error("先选择角色说话数据集（现有的即可）")
-        if not (run or "").strip():
-            raise gr.Error("先填 run 名（建议 <角色>_singing_identity）")
+        # 兜底：change 事件没触发时也保证有可区分的 run 名
+        run = (run or "").strip() or WZ.identity_run_default(ds)
         preset = _PRESET_OF.get(preset_label, "conservative")
         fn = WZ.identity_train_fn(ds, run, preset, 0, int(epochs or 0))
         return _submit("e1t_train", f"E1-T ⑥ 身份 · {ds}",
@@ -327,12 +345,15 @@ def render(ctx: AppContext) -> Dict[str, Any]:
             # 租约会在这里抛出——保护语义正确，原因会显示给用户）
             if getattr(eng, "loaded", False):
                 eng.unload()
+            id_run_eff = (id_run or "").strip()
+            if not id_run_eff and identity and (id_ds or "").strip():
+                id_run_eff = WZ.identity_run_default(id_ds)
             inner = WZ.pipeline_fn(
                 src, name.strip(), langs, aug, int(max_items or 0),
                 cap_run.strip(),
                 _PRESET_OF.get(cap_preset_label, "conservative"),
                 int(cap_frames or 1800), int(cap_epochs or 0),
-                bool(identity), id_ds or "", id_run or "",
+                bool(identity), id_ds or "", id_run_eff,
                 _PRESET_OF.get(id_preset_label, "conservative"),
                 int(id_epochs or 0), bool(autofetch))
             return inner(progress, should_stop)

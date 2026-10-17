@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import sys
 from types import SimpleNamespace
@@ -286,3 +287,113 @@ class TestCoverStateWhitelist:
         for k in ("singing_enable", "technique_mode", "technique_manual",
                   "bon_high", "hf_transplant", "register_mode", "octave_fix"):
             assert k in svc_state._COVER_KEYS, k
+
+
+# ---------------------------------------------------------------------------
+# 47d：⑥ 角色数据集友好显示 + 默认 run 名
+# ---------------------------------------------------------------------------
+
+class TestCharNameOfRun:
+    def test_strips_arch_suffixes(self):
+        assert WZ._char_name_of_run("达妮娅_cfm") == "达妮娅"
+        assert WZ._char_name_of_run("达妮娅_gpt") == "达妮娅"
+        assert WZ._char_name_of_run("达妮娅_dpo") == "达妮娅"
+        assert WZ._char_name_of_run("单目标名") == "单目标名"
+        assert WZ._char_name_of_run("x_cfm_v2") == "x_cfm_v2"  # 只剥已知后缀
+
+
+class TestDatasetLabels:
+    """oneclick_<时间戳> → 角色名标签（⑥ 下拉的可用性核心）。"""
+
+    def _setup(self, monkeypatch, tmp_path, datasets, runs, singing=()):
+        for name, note in datasets:
+            d = tmp_path / name
+            d.mkdir()
+            (d / "dataset.json").write_text(
+                json.dumps({"name": name, "note": note}), encoding="utf-8")
+            if name in singing:
+                (d / "technique.json").write_text("{}", encoding="utf-8")
+
+        class _FakeDS:
+            @staticmethod
+            def list_datasets():
+                return [n for n, _ in datasets]
+
+            @staticmethod
+            def dir_of(name):
+                return str(tmp_path / name)
+
+        class _FakeRN:
+            @staticmethod
+            def list_runs(arch=None):
+                return [SimpleNamespace(name=n, has_adapter=True)
+                        for n in runs]
+
+            @staticmethod
+            def read_run(n):
+                return runs[n]
+
+            @staticmethod
+            def safe_run_name(x):
+                return x.replace(" ", "_")
+
+        class _FakeFT:
+            @staticmethod
+            def stats(name):
+                return {"ready_with_features": 12, "audio_seconds": 300.0}
+
+        monkeypatch.setattr(WZ, "DS", _FakeDS)
+        monkeypatch.setattr(WZ, "RN", _FakeRN)
+        monkeypatch.setattr(WZ, "FT", _FakeFT)
+        monkeypatch.setattr(WZ, "singing_datasets", lambda: list(singing))
+
+    def test_oneclick_with_char_name(self, monkeypatch, tmp_path):
+        self._setup(monkeypatch, tmp_path,
+                    datasets=[("oneclick_20261011-1556", "一键三连")],
+                    runs={"新锁暝_cfm": {"dataset": "oneclick_20261011-1556"},
+                          "新锁暝_gpt": {"dataset": "oneclick_20261011-1556"}})
+        labels = WZ.dataset_display_labels()
+        assert labels["oneclick_20261011-1556"] == \
+            "新锁暝 · 一键三连（oneclick_20261011-1556）"
+
+    def test_oneclick_without_runs_falls_back(self, monkeypatch, tmp_path):
+        self._setup(monkeypatch, tmp_path,
+                    datasets=[("oneclick_x", "一键三连")], runs={})
+        labels = WZ.dataset_display_labels()
+        assert "一键三连" in labels["oneclick_x"]
+
+    def test_plain_dataset_gets_stats(self, monkeypatch, tmp_path):
+        # 无 run 映射（角色名无从反推）→ 兜底统计摘要
+        self._setup(monkeypatch, tmp_path,
+                    datasets=[("手动集", "")], runs={})
+        labels = WZ.dataset_display_labels()
+        assert "手动集（" in labels["手动集"] and "12条" in labels["手动集"]
+
+    def test_char_named_without_oneclick_note(self, monkeypatch, tmp_path):
+        # 有 run 映射但不是一键三连产物（手建数据集 + 手动训练）→ 角色名+数据集名
+        self._setup(monkeypatch, tmp_path,
+                    datasets=[("my_ds", "")],
+                    runs={"某角色_cfm": {"dataset": "my_ds"}})
+        labels = WZ.dataset_display_labels()
+        assert labels["my_ds"] == "某角色（my_ds）"
+
+    def test_identity_choices_order_and_filter(self, monkeypatch, tmp_path):
+        self._setup(monkeypatch, tmp_path,
+                    datasets=[("plain_a", ""), ("oneclick_b", "一键三连"),
+                              ("gts_ds", "")],
+                    runs={"角色B_cfm": {"dataset": "oneclick_b"}},
+                    singing=("gts_ds",))
+        choices = WZ.identity_dataset_choices()
+        values = [v for _l, v in choices]
+        assert "gts_ds" not in values            # 歌声数据不进身份下拉
+        assert values[0] == "oneclick_b"          # 角色名命名的排前面
+        assert values[1] == "plain_a"
+
+    def test_identity_run_default(self, monkeypatch, tmp_path):
+        self._setup(monkeypatch, tmp_path,
+                    datasets=[("oneclick_1", "一键三连")],
+                    runs={"达妮娅_cfm": {"dataset": "oneclick_1"}})
+        assert WZ.identity_run_default("oneclick_1") == "达妮娅_singing_identity"
+        # 无角色名 → 用数据集名兜底
+        assert WZ.identity_run_default("随便集") == "随便集_singing_identity"
+        assert WZ.identity_run_default("") .endswith("_singing_identity")

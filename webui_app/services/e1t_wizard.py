@@ -17,9 +17,10 @@ capability 训练 → 合并 → 角色身份 LoRA）接到 UI；本模块提供
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from webui_app.config import PROJECT_ROOT
 from webui_app.services import gts_fetch as GF
@@ -461,3 +462,98 @@ def pipeline_fn(src: str, dataset: str, langs: List[str], pitch_aug: str,
         return {"ok": True, "stages": stages, "wire": wire,
                 "capability_run": r["run"], "merged_to": SINGING_PTH}
     return fn
+
+
+# ---------------------------------------------------------------------------
+# 4) 数据集友好显示（⑥ 角色数据集下拉：oneclick_<时间戳> 完全无法区分）
+# ---------------------------------------------------------------------------
+
+_ARCH_SUFFIXES = ("_gpt", "_cfm", "_dpo")
+
+
+def _char_name_of_run(run_name: str) -> str:
+    """run 名 → 角色名（一键三连的「模型名称」）：剥掉双目标后缀。"""
+    for suf in _ARCH_SUFFIXES:
+        if run_name.endswith(suf):
+            return run_name[: -len(suf)]
+    return run_name
+
+
+def dataset_char_names() -> Dict[str, str]:
+    """数据集 → 角色名（经 run.json 的 dataset 字段反推）。
+
+    一键三连的数据集名是 oneclick_<时间戳>（用户不填时自动生成），
+    角色名只存在 run 名里——run.json 恰好双向都有，够用。多个 run 指向
+    同一数据集时取列表里第一个（list_runs 按时间倒序，即最近一次）。
+    """
+    out: Dict[str, str] = {}
+    try:
+        for r in RN.list_runs():
+            name = getattr(r, "name", "")
+            if not name:
+                continue
+            rj = RN.read_run(name) or {}
+            ds = str(rj.get("dataset") or "")
+            if ds:
+                out.setdefault(ds, _char_name_of_run(name))
+    except Exception:
+        pass
+    return out
+
+
+def dataset_display_labels() -> Dict[str, str]:
+    """每个数据集的显示标签：角色名优先，一键三连产物标记来源，
+    兜底给样本数/时长摘要（标签只用于显示，值仍是数据集名）。"""
+    chars = dataset_char_names()
+    singing = set(singing_datasets())
+    labels: Dict[str, str] = {}
+    for name in DS.list_datasets():
+        if name in singing:
+            labels[name] = f"{name} · 歌声数据（capability 用）"
+            continue
+        info: Dict[str, Any] = {}
+        try:
+            ip = os.path.join(DS.dir_of(name), "dataset.json")
+            if os.path.isfile(ip):
+                info = json.load(open(ip, encoding="utf-8"))
+        except Exception:
+            pass
+        is_oc = bool(info.get("note") == "一键三连")
+        ch = chars.get(name, "")
+        if ch and is_oc:
+            labels[name] = f"{ch} · 一键三连（{name}）"
+        elif ch:
+            labels[name] = f"{ch}（{name}）"
+        elif is_oc:
+            labels[name] = f"{name}（一键三连 · 角色名见训练记录）"
+        else:
+            try:
+                st = FT.stats(name)
+                mins = int(st.get("audio_seconds", 0) // 60)
+                labels[name] = (f"{name}（{st.get('ready_with_features', 0)}条"
+                                f" · {mins}分钟）")
+            except Exception:
+                labels[name] = name
+    return labels
+
+
+def identity_dataset_choices() -> List[Tuple[str, str]]:
+    """⑥ 下拉的 (显示标签, 数据集名) 列表：角色名命名的排前面，
+    歌声数据集（GTSinger 导入物）不进身份下拉——选它练身份基本是误操作。"""
+    labels = dataset_display_labels()
+    char_named: List[Tuple[str, str]] = []
+    others: List[Tuple[str, str]] = []
+    chars = dataset_char_names()
+    for name in DS.list_datasets():
+        if name in set(singing_datasets()):
+            continue
+        item = (labels.get(name, name), name)
+        (char_named if chars.get(name) else others).append(item)
+    return char_named + others
+
+
+def identity_run_default(dataset: str) -> str:
+    """⑥ 的默认 run 名：角色名（或数据集名）+ 后缀。"""
+    base = dataset_char_names().get((dataset or "").strip()) \
+        or (dataset or "").strip() or "role"
+    return RN.safe_run_name(f"{base}_singing_identity")
