@@ -56,6 +56,12 @@ def render(ctx: AppContext) -> Dict[str, Any]:
     _st_voice = st.get("ref_voice") if st.get("ref_voice") in bank_names else ""
     _lora_vals = [v for _l, v in _lora_cfm_choices()]
     _st_lora = st.get("lora_run") if st.get("lora_run") in _lora_vals else ""
+    # 音色库选中项 → 参考音频初值（与合成页一致：选择即填入音频组件）
+    _initial_ref_audio = None
+    if _st_voice:
+        _e = voice_bank.get(_st_voice)
+        if _e is not None:
+            _initial_ref_audio = _e.audio_path
 
     with gr.Column():
         gr.Markdown("## 🎤 AI 翻唱（原生管线：IndexTTS-2.5 + CFM LoRA）")
@@ -91,16 +97,20 @@ def render(ctx: AppContext) -> Dict[str, Any]:
 
             with gr.Column(scale=1):
                 gr.Markdown("### ② 音色目标")
-                ref_bank_dd = gr.Dropdown(
+                ref_voice_dd = gr.Dropdown(
                     label="音色库参考", choices=[""] + bank_names,
                     value=_st_voice,
-                    info="与上传参考二选一；上传优先")
-                ref_upload = gr.Audio(label="上传参考音频（优先）", type="filepath",
-                                      sources=["upload"])
+                    info="选择后自动填入下方参考音频；也可直接上传覆盖")
+                ref_reload_btn = gr.Button("🔄 刷新音色库", size="sm")
+                ref_audio = gr.Audio(
+                    label="参考音频（音色库选择或直接上传）", type="filepath",
+                    sources=["upload"], value=_initial_ref_audio)
+                ref_info = gr.Markdown()
                 lora_run_dd = gr.Dropdown(
-                    label="CFM LoRA（音色增强）", choices=_lora_cfm_choices(),
+                    label="CFM LoRA（音色增强，可与参考音频叠加）",
+                    choices=_lora_cfm_choices(),
                     value=_st_lora or "",
-                    info="VC 路径绕过 GPT——GPT(语气) LoRA 不生效，音色主锚=参考音频")
+                    info="参考音频 + CFM LoRA 同时生效；GPT(语气) LoRA 在转换路径不生效")
                 lora_scale_sl = gr.Slider(
                     minimum=0.0, maximum=1.5, step=0.05,
                     value=float(st.get("lora_scale", 1.0)), label="LoRA 强度")
@@ -181,6 +191,28 @@ def render(ctx: AppContext) -> Dict[str, Any]:
 
         state_dd.change(_sep_hint, inputs=[state_dd], outputs=[sep_status])
 
+        # ---------- 音色库联动（与合成页同款：选音色自动填入参考音频）----------
+        def _on_voice_select(name):
+            if not name:
+                return gr.update(), ""
+            e = voice_bank.get(name)
+            if e is None:
+                return gr.update(), f"音色 `{name}` 不存在"
+            badge = {"优秀": "🟢", "良好": "🟢", "可用": "🟡",
+                     "勉强": "🟠", "不建议使用": "🔴"}.get(e.grade, "·")
+            html = (f"{badge} **{e.name}** · 评分 {e.score}/100（{e.grade}）"
+                    f" · {e.duration:.2f}s · {e.sample_rate}Hz"
+                    f" · SNR {e.snr_db:.1f}dB")
+            return gr.update(value=e.audio_path), html
+
+        ref_voice_dd.change(_on_voice_select, inputs=[ref_voice_dd],
+                            outputs=[ref_audio, ref_info])
+
+        def _reload_voices():
+            return gr.update(choices=[""] + voice_bank.names())
+
+        ref_reload_btn.click(_reload_voices, outputs=[ref_voice_dd])
+
         @LOG.ui_guard("cover.sep_status")
         def _sep_status_click(state_label):
             return _sep_hint(state_label)
@@ -216,7 +248,7 @@ def render(ctx: AppContext) -> Dict[str, Any]:
         stop_btn.click(_stop, outputs=[log_box])
 
         all_inputs = [src_audio, state_dd, sep_model_dd, dereverb_ck, denoise_sl,
-                      ref_bank_dd, ref_upload, lora_run_dd, lora_scale_sl,
+                      ref_voice_dd, ref_audio, lora_run_dd, lora_scale_sl,
                       variant_dd, steps_sl, cfg_sl, ref_sec_sl, chunk_sl,
                       f0_mode_dd, tr_auto_ck, tr_semis_sl,
                       deess_ck, hflim_ck, spec_ck, breath_ck, hp_sl,
@@ -226,7 +258,7 @@ def render(ctx: AppContext) -> Dict[str, Any]:
         @LOG.ui_guard("cover.start")
         def _start(progress=gr.Progress(), *vals):
             (src, state_lbl, sep_model, dereverb, denoise,
-             ref_bank, ref_up, lora_run, lora_scale,
+             ref_bank, ref_audio_value, lora_run, lora_scale,
              variant_lbl, steps, cfg_rate, ref_seconds, chunk_sec,
              f0_lbl, tr_auto, tr_semis,
              deess, hflim, spec, breath, hp,
@@ -234,10 +266,9 @@ def render(ctx: AppContext) -> Dict[str, Any]:
 
             if not src:
                 raise gr.Error("请先上传源音频")
-            ref_path = ref_up or (voice_bank.get(ref_bank).audio_path
-                                  if ref_bank and voice_bank.get(ref_bank) else "")
+            ref_path = ref_audio_value or ""
             if not ref_path:
-                raise gr.Error("请选择音色库参考或上传参考音频")
+                raise gr.Error("请选择音色库音色，或上传参考音频")
 
             lora_dir: Optional[str] = None
             if lora_run and lora_run != LORA_NONE:
