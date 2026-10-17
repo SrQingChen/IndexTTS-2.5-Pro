@@ -420,6 +420,13 @@ def release_all():
     """显式释放分离模型显存（镜像 audio_sr.release_all）。"""
     global _active
     with _LOCK:
+        for inst in _active:
+            # audio-separator 把权重挂在实例的 model_instance 上；只清列表
+            # 仍可能被内部引用拖住，显式置空再 GC。
+            try:
+                inst.model_instance = None
+            except Exception:
+                pass
         _active.clear()
     import gc
     import torch
@@ -541,6 +548,11 @@ def _run_sep(src_path: str, out_dir: str, model_name: str,
             sep = _make_separator(out_dir)
             _active.append(sep)
             sep.load_model(model_filename=model_name)
+            if progress is not None:
+                try:
+                    progress(0.08, "分离推理中（模型已加载；不改时长）")
+                except Exception:
+                    pass
             files = sep.separate(src_path)
     except Exception as exc:
         release_all()

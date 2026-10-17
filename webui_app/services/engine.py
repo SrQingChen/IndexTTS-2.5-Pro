@@ -262,6 +262,8 @@ class TTSEngine:
         # 变声/翻唱实时会话租约：会话进行中 unload() 被拒绝，防止推理线程
         # 手里的 tts 引擎被别的页面卸掉（引用还在但显存被动过）。
         self._svc_leases: List[str] = []
+        # VC 会话期间 GPT 临时移到 CPU（VC 绕过 GPT，8GB 卡可让出 ~1.5GB）
+        self._gpt_offloaded = False
 
     # -- 事件回调（供 UI 显示进度）-----------------------------------------
 
@@ -295,9 +297,19 @@ class TTSEngine:
 
     # -- 加载 / 卸载 -------------------------------------------------------
 
-    def load(self, force: bool = False) -> EngineStats:
-        """加载主模型。已加载时直接返回（除非 force）。"""
+    def load(self, force: bool = False, bypass_lease: Optional[str] = None) -> EngineStats:
+        """加载主模型。已加载时直接返回（除非 force）。
+
+        bypass_lease 只允许**租约持有者自己**加载/重载；其他会话（翻唱把
+        引擎卸下来跑分离时、实时变声）的租约存在时，外部加载会被拒绝——
+        否则 4.94GB 的第二份引擎会和分离模型/VC 峰值撞在一起。
+        """
         with self._lock:
+            others = [t for t in self._svc_leases if t != bypass_lease]
+            if others:
+                raise EngineError(
+                    f"AI 翻唱/变声会话进行中（{'、'.join(others)}），"
+                    "暂不能加载或重载引擎。")
             req = _busy_runner_engine_req()
             if req == "unloaded":
                 raise EngineError(
@@ -351,6 +363,7 @@ class TTSEngine:
                 raise
 
             self.stats.load_seconds = time.perf_counter() - t0
+            self._gpt_offloaded = False
             self.stats.loaded = True
             self.stats.loaded_at = time.time()
             self._refresh_vram()
@@ -367,16 +380,19 @@ class TTSEngine:
             )
             return self.stats
 
-    def unload(self, bypass_svc: bool = False) -> EngineStats:
+    def unload(self, bypass_lease: Optional[str] = None) -> EngineStats:
         """卸载主模型，归还显存。
 
-        bypass_svc=True 仅供**持有 svc 租约的管线自身**临时卸载（翻唱链的
-        分离/超分段）——外部调用一律走拦截。
+        bypass_lease **只允许绕过自己的那一张租约**（翻唱链在分离/超分段
+        临时卸载自己的引擎占用）；其他会话（实时变声/另一条翻唱）的租约
+        一律仍然拦截。早期版本的 bypass_svc=True 会连别人的租约一起绕过，
+        两个页面并发时会把对方正在用的引擎卸掉。
         """
         with self._lock:
-            if self._svc_leases and not bypass_svc:
+            others = [t for t in self._svc_leases if t != bypass_lease]
+            if others:
                 raise EngineError(
-                    f"实时会话进行中（{'、'.join(self._svc_leases)}），"
+                    f"实时会话进行中（{'、'.join(others)}），"
                     "请先在对应页面停止会话再卸载引擎。")
             if _busy_runner_engine_req() == "loaded":
                 # 任务线程手里还攥着 tts 的引用，这里删自己的引用并不会
@@ -392,15 +408,95 @@ class TTSEngine:
     # ------------------------------------------------------------------
     # SVC 会话租约（AI 变声实时 / 长翻唱转换期间引擎常驻保护）
     # ------------------------------------------------------------------
-    def begin_svc(self, label: str) -> None:
-        """登记一个占用引擎的实时会话；期间 unload() 被拒绝。"""
-        with self._lock:
-            self._svc_leases.append(label)
+    def begin_svc(self, label: str) -> str:
+        """登记一个占用引擎的会话，返回**唯一租约 token**。
 
-    def end_svc(self, label: str) -> None:
+        token 用于 unload(bypass_lease=token) 只绕过自己；按 label 文本
+        释放会误伤同名的第二个会话。
+        """
+        import uuid
+        token = f"{label}#{uuid.uuid4().hex[:8]}"
         with self._lock:
-            if label in self._svc_leases:
-                self._svc_leases.remove(label)
+            self._svc_leases.append(token)
+        return token
+
+    def end_svc(self, lease: str) -> None:
+        with self._lock:
+            if lease in self._svc_leases:
+                self._svc_leases.remove(lease)
+
+    # ------------------------------------------------------------------
+    # VC 显存调度：GPT 在转换路径完全用不到，临时让出显存
+    # ------------------------------------------------------------------
+    def offload_gpt_for_svc(self) -> bool:
+        """把 GPT 移到 CPU，返回是否成功（8GB 卡约让出 1.5GB）。
+
+        VC 路径（w2v-BERT→码本→CFM→BigVGAN）不经过 GPT；但 TTS 引擎
+        是一个整体，GPT 常驻会挤占分块推理的峰值余量。仅在低显存/未启用
+        加速编译时执行（torch.compile/CUDA Graph 的图与设备绑定，搬动会失效）。
+        """
+        with self._lock:
+            if self._tts is None or self._gpt_offloaded:
+                return self._gpt_offloaded
+            try:
+                if getattr(self.cfg, "accel", False) or                         getattr(self.cfg, "torch_compile", False):
+                    LOG.get_logger("engine").info(
+                        "VC 显存调度：启用 accel/torch_compile，跳过 GPT 下移")
+                    return False
+                low = bool(getattr(self.cfg.device, "low_vram", False))
+                total = 0.0
+                try:
+                    import torch
+                    if torch.cuda.is_available():
+                        total = torch.cuda.get_device_properties(0).total_memory / 1024**3
+                except Exception:
+                    pass
+                if not low and (total <= 0 or total > 10.0):
+                    return False
+                gpt = getattr(self._tts, "gpt", None)
+                if gpt is None:
+                    return False
+                before = 0.0
+                try:
+                    import torch
+                    before = torch.cuda.memory_allocated(0) / 1024**3
+                except Exception:
+                    pass
+                gpt.to("cpu")
+                self._gpt_offloaded = True
+                self._empty_cache()
+                after = 0.0
+                try:
+                    import torch
+                    after = torch.cuda.memory_allocated(0) / 1024**3
+                except Exception:
+                    pass
+                LOG.get_logger("engine").info(
+                    "VC 显存调度：GPT 已移至 CPU（%.2f → %.2f GB，释放 %.2f GB）",
+                    before, after, max(0.0, before - after))
+                return True
+            except Exception as exc:
+                LOG.get_logger("engine").warning("GPT 下移失败（继续全量加载）: %s", exc)
+                return False
+
+    def restore_gpt_after_svc(self) -> None:
+        """恢复 GPT 到推理设备（VC 会话结束/异常时都必须调用）。"""
+        with self._lock:
+            if not self._gpt_offloaded:
+                return
+            try:
+                if self._tts is not None:
+                    gpt = getattr(self._tts, "gpt", None)
+                    if gpt is not None:
+                        gpt.to(self._tts.device)
+                LOG.get_logger("engine").info("VC 显存调度：GPT 已回到推理设备")
+            except Exception as exc:
+                LOG.get_logger("engine").warning(
+                    "GPT 恢复失败（下次加载引擎可恢复）: %s", exc)
+                raise
+            finally:
+                self._gpt_offloaded = False
+                self._empty_cache()
 
     def _unload_locked(self):
         self.release_qwen_locked()
@@ -411,6 +507,7 @@ class TTSEngine:
         self._empty_cache()
         self.stats.loaded = False
         self.stats.lora_adapters = []
+        self._gpt_offloaded = False
         self._refresh_vram()
 
     def _empty_cache(self):
@@ -500,6 +597,9 @@ class TTSEngine:
             cpu  → 强制 CPU
         """
         with self._lock:
+            if self._svc_leases:
+                raise EngineError(
+                    "AI 翻唱/变声会话进行中，暂不能挂载 QwenEmotion。")
             if self._qwen is not None:
                 return self._qwen
             if not self.qwen_available():
@@ -808,6 +908,10 @@ class TTSEngine:
     def infer(self, progress=None, **kwargs) -> Optional[str]:
         """执行一次推理。kwargs 直接透传给 IndexTTS2.infer()。"""
         with self._lock:
+            if self._svc_leases:
+                raise EngineError(
+                    "AI 翻唱/变声会话进行中（GPT 已临时让出显存），"
+                    "请等会话结束后再合成。")
             tts = self.tts
             tts.gr_progress = progress
             self._refresh_vram()

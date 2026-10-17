@@ -40,7 +40,7 @@ _VC_KEYS: Dict[str, str] = {
 
 _CLAMP = {
     "denoise": (0.0, 1.0), "cfg": (0.0, 1.0), "ref_seconds": (5.0, 15.0),
-    "chunk_sec": (20.0, 90.0), "transpose_semis": (-24, 24),
+    "chunk_sec": (10.0, 60.0), "transpose_semis": (-24, 24),
     "highpass": (0, 150), "sr_steps": (10, 100), "vocal_gain": (-6.0, 9.0),
     "steps": (5, 50), "lora_scale": (0.0, 2.0),
 }

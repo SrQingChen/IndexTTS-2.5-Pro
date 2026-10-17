@@ -143,6 +143,7 @@ class RealtimeVC:
         self._dev_sr = 22050
         self._last_out_tail: Optional[np.ndarray] = None
         self.record_enabled = False
+        self._lease = ""
 
     # ------------------------------------------------------------------
     def start(self, in_dev: Optional[int], out_dev: Optional[int], preset_label: str,
@@ -164,7 +165,13 @@ class RealtimeVC:
         if not getattr(self.engine, "loaded", False):
             self._status.error = "推理引擎未加载——请先在合成页加载模型"
             return self._status
-        self.engine.begin_svc("AI变声实时")
+        self._lease = self.engine.begin_svc("AI变声实时")
+        # VC 绕过 GPT：低显存卡让出 GPT 的显存给分块推理
+        self._gpt_offloaded = False
+        try:
+            self._gpt_offloaded = self.engine.offload_gpt_for_svc()
+        except Exception:
+            self._gpt_offloaded = False
 
         wasapi = None
         try:
@@ -253,7 +260,15 @@ class RealtimeVC:
             pass
         self._stream = None
         try:
-            self.engine.end_svc("AI变声实时")
+            if getattr(self, "_gpt_offloaded", False):
+                try:
+                    self.engine.restore_gpt_after_svc()
+                except Exception:
+                    pass
+                self._gpt_offloaded = False
+            if self._lease:
+                self.engine.end_svc(self._lease)
+                self._lease = ""
         except Exception:
             pass
 

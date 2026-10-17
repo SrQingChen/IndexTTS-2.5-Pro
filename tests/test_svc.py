@@ -282,6 +282,118 @@ class TestStreamConverter:
 # cover_pipeline（无 GPU 部分）
 # ---------------------------------------------------------------------------
 
+class TestVramScheduling:
+    def test_cap_chunk_sec(self, monkeypatch):
+        monkeypatch.setattr(svc_core, "_total_vram_gib", lambda: 8.0)
+        assert svc_core.cap_chunk_sec(60) == 30.0
+        assert svc_core.cap_chunk_sec(20) == 20.0
+        monkeypatch.setattr(svc_core, "_total_vram_gib", lambda: 12.0)
+        assert svc_core.cap_chunk_sec(60) == 45.0
+        monkeypatch.setattr(svc_core, "_total_vram_gib", lambda: 24.0)
+        assert svc_core.cap_chunk_sec(60) == 60.0
+
+    def test_extract_feats_windowed(self):
+        """60s 输入必须分窗提取且总帧数≈50Hz 全段（w2v-BERT OOM 回归）。"""
+        import torch
+
+        class _TTS:
+            device = "cpu"
+            low_vram = True
+            def extract_features(self, seg, sampling_rate, return_tensors):
+                n = int(seg.shape[-1])
+                t = max(1, (n - 400) // 320 + 1)
+                return {"input_features": torch.zeros(1, t, 4),
+                        "attention_mask": torch.ones(1, t)}
+            def get_emb(self, feats, mask):
+                return feats
+
+        class _Eng:
+            tts = _TTS()
+
+        wav = torch.zeros(1, 60 * svc_core.FEAT_SR)
+        feats = svc_core._extract_feats(_Eng(), wav)
+        assert 2900 <= feats.size(1) <= 3100, feats.shape
+
+    def test_oom_retry_halves_chunk(self, monkeypatch):
+        calls = []
+
+        def fake_once(engine, src, ref, **kw):
+            calls.append(kw.get("chunk_sec"))
+            if len(calls) == 1:
+                raise RuntimeError("CUDA out of memory. Tried to allocate ...")
+            return svc_core.ConvertResult(True, wav=np.zeros(10, dtype=np.float32))
+
+        monkeypatch.setattr(svc_core, "_convert_file_once", fake_once)
+        monkeypatch.setattr(svc_core, "cap_chunk_sec", lambda x: float(x))
+        res = svc_core.convert_file(None, "x.wav", None, chunk_sec=30)
+        assert res.ok and res.retried
+        assert calls == [30.0, 15.0]
+        assert res.chunk_sec_used == 15.0
+
+    def test_load_blocked_by_foreign_lease(self):
+        import threading
+        from types import SimpleNamespace
+        from webui_app.services.engine import TTSEngine, EngineStats, EngineError
+        eng = TTSEngine.__new__(TTSEngine)
+        eng._lock = threading.RLock()
+        eng._svc_leases = ["翻唱#abc"]
+        eng.stats = EngineStats()
+        eng._tts = None
+        import pytest as _pytest
+        with _pytest.raises(EngineError):
+            eng.load()
+        # 自己持有租约时可加载（只绕自己的）
+        eng.load  # noqa: B018  (守卫在 _busy_runner/实体加载之前)
+
+    def test_gpt_offload_roundtrip(self, monkeypatch):
+        import threading
+        from types import SimpleNamespace
+        from webui_app.services.engine import TTSEngine, EngineStats
+
+        class _GPT:
+            def __init__(self): self.place = "cuda:0"
+            def to(self, where): self.place = where
+
+        class _TTS:
+            device = "cuda:0"
+            def __init__(self): self.gpt = _GPT()
+
+        eng = TTSEngine.__new__(TTSEngine)
+        eng._lock = threading.RLock()
+        eng._svc_leases = []
+        eng.stats = EngineStats()
+        eng._tts = _TTS()
+        eng._gpt_offloaded = False
+        eng.cfg = SimpleNamespace(accel=False, torch_compile=False,
+                                  device=SimpleNamespace(low_vram=True))
+        eng._empty_cache = lambda: None
+        assert eng.offload_gpt_for_svc() is True
+        assert eng._tts.gpt.place == "cpu"
+        assert eng.offload_gpt_for_svc() is True   # 幂等
+        eng.restore_gpt_after_svc()
+        assert eng._tts.gpt.place == "cuda:0"
+        assert eng._gpt_offloaded is False
+
+    def test_lease_bypass_only_own(self):
+        import threading
+        from webui_app.services.engine import TTSEngine, EngineStats, EngineError
+        eng = TTSEngine.__new__(TTSEngine)
+        eng._lock = threading.RLock()
+        eng._svc_leases = []
+        eng.stats = EngineStats()
+        eng._unload_locked = lambda: None
+        eng._emit = lambda *a, **k: None
+        a = eng.begin_svc("翻唱")
+        b = eng.begin_svc("变声")
+        import pytest as _pytest
+        with _pytest.raises(EngineError):
+            eng.unload(bypass_lease=a)          # 另一个会话仍在
+        eng.end_svc(b)
+        eng.unload(bypass_lease=a)              # 只剩自己 → 放行
+        eng.end_svc(a)
+        assert eng._svc_leases == []
+
+
 class TestCoverPipeline:
     def test_preprocess_removes_dc_and_keeps_length(self):
         y = (_harmonic(220.0, 1.0) + 0.2).astype(np.float32)
@@ -334,13 +446,15 @@ class TestCoverPipeline:
             loaded = False
         class _Eng:
             stats = _Stats()
-            def load(self): _Stats.loaded = True
+            def load(self, bypass_lease=None): _Stats.loaded = True
             def unload(self, bypass_svc=False): _Stats.loaded = False
             def begin_svc(self, label): self._l = label
             def end_svc(self, label): pass
             def lora_status(self): return []
             def attach_lora(self, *a, **k): return "tag"
             def detach_lora(self, *a, **k): pass
+            def offload_gpt_for_svc(self): return False
+            def restore_gpt_after_svc(self): pass
         class _Ctx:
             engine = _Eng()
 
@@ -377,11 +491,13 @@ class TestCoverPipeline:
             loaded = False
         class _Eng:
             stats = _Stats()
-            def load(self): _Stats.loaded = True
+            def load(self, bypass_lease=None): _Stats.loaded = True
             def unload(self, bypass_svc=False): _Stats.loaded = False
             def begin_svc(self, label): pass
             def end_svc(self, label): pass
             def lora_status(self): return []
+            def offload_gpt_for_svc(self): return False
+            def restore_gpt_after_svc(self): pass
         class _Ctx:
             engine = _Eng()
 

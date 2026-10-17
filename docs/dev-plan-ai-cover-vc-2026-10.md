@@ -292,6 +292,24 @@ BS-Roformer 与 UVR-DeEcho-DeReverb 已做加载冒烟（6.0s / 0.1s）。
 7. **失败路径不落 report.json**：`run_cover` 的早退（依赖缺失/分离失败/VC
    失败）直接 return，跳过报告写盘，用户无据可查。现统一改为 `_Fail`，
    经 finally 恢复引擎后仍写完整 report.json；UI 侧也补 warning 日志。
+8. **60s 分块在 8GB 卡上 OOM**（2026-10-17 第二次实锤）：第 1 块 81.8s
+   成功，第 2 块在 w2v-BERT 的 `relative_position_attn_weights` 申请 1.21GB
+   失败（PyTorch 报“已分配 13.79GB”，WDDM 已溢出到共享内存）。修复：
+   - 内容编码器按 **24s 窗 + 0.5s 重叠**提取后拼回 50Hz 网格——把
+     O(T²) 注意力与总时长解耦（60s 单窗单层就要 ~0.6GB）；
+   - 按卡容量限制块长：≤9.5GB → 30s、≤13GB → 45s（`cap_chunk_sec`）；
+   - 块间 `gc.collect()+empty_cache()`（缓存块不释放是第二块失败的直接原因）；
+   - OOM 自动把块长减半（30→15s，下限 10s）从头重试一次，报告标注
+     `retried_smaller_chunk` 与实际 `chunk_sec_used`；
+   - **VC 期间把 GPT 移到 CPU**（VC 绕过 GPT；8GB 约让出 1.5GB），
+     会话结束/异常在 finally 恢复；启用 accel/torch_compile 时跳过；
+   - 租约 **token 化**：`unload(bypass_lease=自己的token)` / `load(bypass_lease=...)`
+     只绕过自己，其他会话（实时变声、另一条翻唱）仍拦截——旧版
+     `bypass_svc=True` 会连别人的租约一起绕过；
+   - VC 会话期间 `engine.infer` / `mount_qwen` 直接拒绝（防止合成页
+     在 GPT 位于 CPU 时启动 TTS）。
+   - 顺带：分离推理阶段补“分离推理中”进度文案（此前 170s 一直显示
+     “加载分离模型”）；失败报告也带阶段耗时。
 
 **已知环境告警**：`onnxruntime-gpu 1.31`（CUDA 13 编译）与项目 torch
 `2.8+cu128`（CUDA 12.8）不匹配，启动时打印 cublasLt/cudart 加载失败。

@@ -49,6 +49,13 @@ VOC_PAD_FRAMES = 5
 DEFAULT_OVERLAP_MS = 40.0
 # 低能量切点搜索半径
 CUT_SEARCH_SEC = 5.0
+# 内容编码器分窗：w2v-BERT 的相对位置注意力是 O(T²)，60s 输入在 8GB 卡上
+# 单层就要 ~1.2GB（用户 2026-10-17 实锤 OOM）。按 24s 窗+0.5s 重叠提取，
+# 再把特征拼回 50Hz 网格——显存与总时长解耦。
+FEAT_WINDOW_SEC = 24.0
+FEAT_OVERLAP_SEC = 0.5
+# 8GB 卡的安全分块上限（30s 的注意力约为 60s 的 1/4）
+MIN_CHUNK_SEC = 10.0
 
 
 def mel_frames(n_samples_22k: int) -> int:
@@ -138,13 +145,48 @@ def build_reference(engine, ref_path: str, ref_seconds: float = 15.0,
 # ---------------------------------------------------------------------------
 
 def _extract_feats(engine, wav16k: torch.Tensor) -> torch.Tensor:
-    """16k 波形 [1,N] → 归一化连续特征 (1, T, 1024)。"""
+    """16k 波形 [1,N] → 归一化连续特征 (1, T, 1024)。
+
+    长输入按 FEAT_WINDOW_SEC 分窗（0.5s 重叠）提取后拼接：w2v-BERT 的
+    relative_position 注意力是 O(T²)，整段 60s 在 8GB 卡上会 OOM；分窗
+    后单窗显存有界，特征时间网格不变（50Hz）。
+    """
     tts = engine.tts
-    inputs = tts.extract_features(wav16k.cpu(), sampling_rate=FEAT_SR,
-                                  return_tensors="pt")
-    feats = inputs["input_features"].to(tts.device)
-    mask = inputs["attention_mask"].to(tts.device)
-    return tts.get_emb(feats, mask)
+    n = int(wav16k.shape[-1])
+    win = int(FEAT_WINDOW_SEC * FEAT_SR)
+    hop = max(1, win - int(FEAT_OVERLAP_SEC * FEAT_SR))
+    drop = max(0, int(FEAT_OVERLAP_SEC * 50))
+
+    def _one(seg: torch.Tensor) -> torch.Tensor:
+        inputs = tts.extract_features(seg.cpu(), sampling_rate=FEAT_SR,
+                                      return_tensors="pt")
+        feats = inputs["input_features"].to(tts.device)
+        mask = inputs["attention_mask"].to(tts.device)
+        return tts.get_emb(feats, mask)
+
+    if n <= win:
+        return _one(wav16k)
+
+    parts = []
+    start = 0
+    first = True
+    low = bool(getattr(tts, "low_vram", False))
+    while start < n:
+        seg = wav16k[..., start:min(start + win, n)]
+        f = _one(seg)
+        if not first and f.size(1) > drop + 2:
+            f = f[:, drop:, :]
+        parts.append(f)
+        first = False
+        if low:
+            try:
+                torch.cuda.empty_cache()
+            except Exception:
+                pass
+        if start + win >= n:
+            break
+        start += hop
+    return torch.cat(parts, dim=1)
 
 
 def _content_codes(engine, feats: torch.Tensor, variant: str) -> torch.Tensor:
@@ -317,14 +359,18 @@ class ConvertResult:
     chunks: int = 0
     timing: Dict[str, float] = field(default_factory=dict)
     chunk_times: List[float] = field(default_factory=list)
+    chunk_sec_used: float = 0.0
+    retried: bool = False
 
 
-def convert_file(engine, src_path: str, ref: ReferenceContext, *,
-                 variant: str = "A", steps: int = 25, cfg_rate: float = 0.7,
-                 chunk_sec: float = 60.0, overlap_ms: float = DEFAULT_OVERLAP_MS,
-                 progress: Optional[Callable] = None,
-                 should_stop: Optional[Callable[[], bool]] = None) -> ConvertResult:
-    """离线整曲转换：分块转换 → 输入重叠 + 波形域交叉淡化 → 保长输出。"""
+def _convert_file_once(engine, src_path: str, ref: ReferenceContext, *,
+                       variant: str = "A", steps: int = 25, cfg_rate: float = 0.7,
+                       chunk_sec: float = 30.0,
+                       overlap_ms: float = DEFAULT_OVERLAP_MS,
+                       progress: Optional[Callable] = None,
+                       should_stop: Optional[Callable[[], bool]] = None,
+                       ) -> ConvertResult:
+    """离线整曲转换（单次尝试）：分块 → 输入重叠 + 波形域交叉淡化 → 保长。"""
     import librosa
     t_all = time.perf_counter()
     y, sr = librosa.load(src_path, sr=None, mono=True)
@@ -364,6 +410,11 @@ def convert_file(engine, src_path: str, ref: ReferenceContext, *,
         else:
             wav = np.pad(wav, (0, want - len(wav)))
         chunk_times.append(time.perf_counter() - t0)
+        # 块间回收：CFM/编码器的注意力缓存不主动释放会在第二块碎片化 OOM
+        import gc
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
         total_out += len(wav) - (overlap if i > 0 else 0)
         merged = _crossfade_append(np.concatenate(out) if out else np.zeros(0, dtype=np.float32),
                                    wav, overlap if i > 0 else 0)
@@ -384,6 +435,72 @@ def convert_file(engine, src_path: str, ref: ReferenceContext, *,
               "per_chunk_avg": round(float(np.mean(chunk_times)), 2) if chunk_times else 0.0}
     return ConvertResult(True, wav=wav, sr=ENGINE_SR, chunks=len(chunks),
                          timing=timing, chunk_times=chunk_times)
+
+
+def _total_vram_gib() -> float:
+    try:
+        return torch.cuda.get_device_properties(0).total_memory / 1024**3
+    except Exception:
+        return 0.0
+
+
+def cap_chunk_sec(requested: float) -> float:
+    """按显卡总量把分块压到安全上限（8GB→30s，12GB→45s）。
+
+    60s 分块在 8GB 卡上让 w2v-BERT/CFM 的 O(T²) 注意力逼近上限，
+    第二块就 OOM（用户实锤）。30s 的注意力约为其 1/4。
+    """
+    total = _total_vram_gib()
+    if total <= 0:
+        return requested
+    if total <= 9.5:
+        return min(float(requested), 30.0)
+    if total <= 13.0:
+        return min(float(requested), 45.0)
+    return requested
+
+
+def convert_file(engine, src_path: str, ref: ReferenceContext, *,
+                 variant: str = "A", steps: int = 25, cfg_rate: float = 0.7,
+                 chunk_sec: float = 30.0, overlap_ms: float = DEFAULT_OVERLAP_MS,
+                 progress: Optional[Callable] = None,
+                 should_stop: Optional[Callable[[], bool]] = None,
+                 _oom_retry: bool = True) -> ConvertResult:
+    """离线整曲转换：分块 → 交叉淡化 → 保长；OOM 自动降档重试一次。
+
+    显存调度：按卡容量限制块长（cap_chunk_sec）+ 块间 gc/empty_cache；
+    仍 OOM 时把块长减半（不低于 MIN_CHUNK_SEC）从头重跑一次，避免整首失败。
+    """
+    eff = cap_chunk_sec(chunk_sec)
+    try:
+        res = _convert_file_once(engine, src_path, ref, variant=variant,
+                                 steps=steps, cfg_rate=cfg_rate,
+                                 chunk_sec=eff, overlap_ms=overlap_ms,
+                                 progress=progress, should_stop=should_stop)
+        res.chunk_sec_used = eff
+        return res
+    except Exception as exc:
+        if (not _oom_retry) or ("out of memory" not in str(exc).lower()):
+            raise
+        import gc
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        smaller = max(MIN_CHUNK_SEC, min(eff / 2.0, 24.0))
+        if smaller >= eff - 0.5:
+            raise
+        if progress is not None:
+            try:
+                progress(0.0, f"显存不足，自动降到 {smaller:.0f}s/块重试")
+            except Exception:
+                pass
+        res = _convert_file_once(engine, src_path, ref, variant=variant,
+                                 steps=steps, cfg_rate=cfg_rate,
+                                 chunk_sec=smaller, overlap_ms=overlap_ms,
+                                 progress=progress, should_stop=should_stop)
+        res.chunk_sec_used = smaller
+        res.retried = True
+        return res
 
 
 # ---------------------------------------------------------------------------

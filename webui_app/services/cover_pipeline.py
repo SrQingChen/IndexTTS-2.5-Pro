@@ -51,7 +51,7 @@ class CoverRequest:
     steps: int = 25
     cfg_rate: float = 0.7
     ref_seconds: float = 15.0
-    chunk_sec: float = 60.0
+    chunk_sec: float = 30.0
     # 分离/去混响
     separate_model: str = "标准（BS-Roformer ViperX，SDR 12.98）"
     enable_dereverb: bool = True
@@ -239,8 +239,9 @@ def run_cover(ctx, req: CoverRequest, progress: Optional[Callable] = None,
     was_loaded = bool(getattr(engine.stats, "loaded", False))
     mounted_by_us = False
     # 引擎租约：与实时变声/其他长会话互斥（并发共享引擎会显存叠加）。
-    # 注意：内部卸载（分离/SR 段）须传 bypass_svc=True，否则被自己的租约拦。
-    engine.begin_svc("AI翻唱")
+    # 内部卸载（分离/SR 段）用 bypass_lease=自己的 token，只绕自己的租约。
+    svc_lease = engine.begin_svc("AI翻唱")
+    gpt_offloaded = False
     try:
         # ---------- 1) 输入路由：分离 / 去混响 ----------
         t0 = time.perf_counter()
@@ -258,7 +259,7 @@ def run_cover(ctx, req: CoverRequest, progress: Optional[Callable] = None,
                             "『干净人声』绕过分离")
             _log("[分离] 卸载引擎 → 人声分离（不改时长，保对拍）")
             if was_loaded or bool(getattr(engine.stats, "loaded", False)):
-                engine.unload(bypass_svc=True)
+                engine.unload(bypass_lease=svc_lease)
             _p(0.02, "人声分离中（Roformer，首跑需下载权重）")
             sep_res = SEP.separate_vocals(req.src_path, out_dir, req.separate_model,
                                           progress=_p, should_stop=should_stop)
@@ -279,7 +280,7 @@ def run_cover(ctx, req: CoverRequest, progress: Optional[Callable] = None,
             from webui_app.services import separation as SEP
             if SEP.available():
                 if bool(getattr(engine.stats, "loaded", False)):
-                    engine.unload(bypass_svc=True)
+                    engine.unload(bypass_lease=svc_lease)
                 _p(0.10, "去混响中（DeEcho-DeReverb）")
                 dr = SEP.dereverb(vocal_path, out_dir, req.dereverb_model,
                                    progress=_p, should_stop=should_stop)
@@ -311,7 +312,9 @@ def run_cover(ctx, req: CoverRequest, progress: Optional[Callable] = None,
         # ---------- 3) 引擎 + LoRA + 参考 ----------
         t0 = time.perf_counter()
         _p(0.22, "加载推理引擎")
-        engine.load()
+        engine.load(bypass_lease=svc_lease)
+        # VC 绕过 GPT：低显存卡把它移到 CPU，让出 ~1.5GB 给分块推理
+        gpt_offloaded = engine.offload_gpt_for_svc()
         # LoRA 挂载（替换语义：已挂先卸——attach_lora 内建）。结束时卸掉
         # 我们挂的；进入前若有别的挂载，报告中提示需重挂。
         pre_mounted = any(it.get("target") == "cfm" and it.get("wrapped")
@@ -344,7 +347,10 @@ def run_cover(ctx, req: CoverRequest, progress: Optional[Callable] = None,
             raise _Fail(f"VC 转换失败: {conv.reason}")
         vc_path = os.path.join(out_dir, "03_converted_22k.wav")
         AL.save_audio(vc_path, conv.wav, ENGINE_SR)
-        report["vc"] = {"chunks": conv.chunks, **conv.timing}
+        report["vc"] = {"chunks": conv.chunks,
+                        "chunk_sec_used": getattr(conv, "chunk_sec_used", None),
+                        "retried_smaller_chunk": getattr(conv, "retried", False),
+                        **conv.timing}
         timings["vc_convert"] = round(conv.timing.get("elapsed", 0.0), 1)
         _log(f"[VC] {conv.chunks} 块 / {conv.timing.get('rtf', 0)}×实时")
         _check_stop(should_stop)
@@ -419,7 +425,7 @@ def run_cover(ctx, req: CoverRequest, progress: Optional[Callable] = None,
             else:
                 _log("[超分] 卸载引擎 → AudioSR（约 17.8× 实时耗时）")
                 if bool(getattr(engine.stats, "loaded", False)):
-                    engine.unload(bypass_svc=True)
+                    engine.unload(bypass_lease=svc_lease)
                 base = os.path.join(out_dir, "05_vocal_final_22k.wav")
                 AL.save_audio(base, vocal, ENGINE_SR)
                 r = SR.enhance_file(base, ddim_steps=int(req.sr_steps))
@@ -485,13 +491,21 @@ def run_cover(ctx, req: CoverRequest, progress: Optional[Callable] = None,
     except _Stop:
         report["error"] = "用户停止"
         report["stopped"] = True
+        report["timings"] = timings
     except _Fail as exc:
         report["error"] = str(exc)
+        report["timings"] = timings
     except Exception as exc:
         report["error"] = f"{type(exc).__name__}: {exc}"
+        report["timings"] = timings
         import traceback
         report["traceback"] = traceback.format_exc()
     finally:
+        if gpt_offloaded:
+            try:
+                engine.restore_gpt_after_svc()
+            except Exception:
+                pass
         # LoRA 卸载（我们挂的才卸；异常路径也不残留——验收建议#6）
         if mounted_by_us:
             try:
@@ -505,14 +519,14 @@ def run_cover(ctx, req: CoverRequest, progress: Optional[Callable] = None,
         try:
             if was_loaded:
                 if not bool(getattr(engine.stats, "loaded", False)):
-                    engine.load()
+                    engine.load(bypass_lease=svc_lease)
             else:
                 if bool(getattr(engine.stats, "loaded", False)):
-                    engine.unload(bypass_svc=True)
+                    engine.unload(bypass_lease=svc_lease)
         except Exception:
             pass
         finally:
-            engine.end_svc("AI翻唱")
+            engine.end_svc(svc_lease)
 
     with open(os.path.join(out_dir, "report.json"), "w", encoding="utf-8") as f:
         json.dump(report, f, ensure_ascii=False, indent=2, default=str)

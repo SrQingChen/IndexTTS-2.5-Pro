@@ -296,7 +296,8 @@ def render(ctx: AppContext) -> Dict[str, Any]:
                         engine.load()
                     except Exception as exc:
                         raise gr.Error(f"引擎加载失败: {exc}")
-                    engine.begin_svc("文件变声")
+                    file_lease = engine.begin_svc("文件变声")
+                    gpt_off = engine.offload_gpt_for_svc()
                     try:
                         if lora_run and lora_run != LORA_NONE:
                             from webui_app.training import merge as MG
@@ -305,7 +306,7 @@ def render(ctx: AppContext) -> Dict[str, Any]:
                             mounted = True
                         ref = svc_core.build_reference(engine, ref_path, 8.0)
                         res = svc_core.convert_file(engine, src, ref, steps=int(steps),
-                                                    cfg_rate=float(cfg_rate), chunk_sec=60.0)
+                                                    cfg_rate=float(cfg_rate), chunk_sec=30.0)
                         if not res.ok:
                             raise gr.Error(f"转换失败: {res.reason}")
                         vocal = res.wav
@@ -342,7 +343,12 @@ def render(ctx: AppContext) -> Dict[str, Any]:
                                 engine.detach_lora(target="cfm")
                             except Exception:
                                 pass
-                        engine.end_svc("文件变声")
+                        if gpt_off:
+                            try:
+                                engine.restore_gpt_after_svc()
+                            except Exception:
+                                pass
+                        engine.end_svc(file_lease)
 
                 f_start.click(_file_convert,
                               inputs=[f_src, f_ref_bank, f_ref_up, f_lora, f_steps,

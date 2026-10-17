@@ -84,10 +84,10 @@ prompt_condition 槽（参考音频同样直通）完全同构，理论上细节
     ))
     reg(P(
         key="cover_chunk_sec", group="cover_vc", label="分块长度",
-        kind="slider", minimum=20.0, maximum=90.0, step=5.0, default=60.0,
-        summary="长曲分块转换（CFM 全注意力算力约束），块间自动在气口找切点"
-                "并以 40ms 输入重叠+等功率淡化衔接。",
-        info="60s 安全块；块间切点优先选歌唱气口",
+        kind="slider", minimum=10.0, maximum=60.0, step=5.0, default=30.0,
+        summary="长曲分块转换（w2v-BERT/CFM 的 O(T²) 注意力约束）。"
+                "8GB 卡自动压到 ≤30s；OOM 时还会自动减半重试一次。",
+        info="30s 默认（8GB 安全）；块间优先在歌唱气口切、40ms 输入重叠",
     ))
 
 

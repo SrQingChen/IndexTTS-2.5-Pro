@@ -124,7 +124,7 @@ def render(ctx: AppContext) -> Dict[str, Any]:
             cfg_sl = make_component("cover_cfg", value=float(st.get("cfg", 0.7)))
         with gr.Row():
             ref_sec_sl = make_component("cover_ref_seconds", value=float(st.get("ref_seconds", 15.0)))
-            chunk_sl = make_component("cover_chunk_sec", value=float(st.get("chunk_sec", 60.0)))
+            chunk_sl = make_component("cover_chunk_sec", value=float(st.get("chunk_sec", 30.0)))
             f0_mode_dd = make_component("cover_f0_mode",
                                         value=_F0_TO_LABEL.get(st.get("f0_mode", "auto"),
                                                                "auto 自动（推荐）"))
@@ -346,7 +346,12 @@ def render(ctx: AppContext) -> Dict[str, Any]:
             lines = ["## ✅ 翻唱完成", ""]
             lines.append(f"- 产物目录：`{report.get('out_dir')}`")
             if vc:
-                lines.append(f"- VC：{vc.get('chunks')} 块 / {vc.get('rtf')}×实时")
+                extra = ""
+                if vc.get("retried_smaller_chunk"):
+                    extra = f"（显存不足已自动降到 {vc.get('chunk_sec_used')}s/块）"
+                lines.append(f"- VC：{vc.get('chunks')} 块 · "
+                             f"{vc.get('chunk_sec_used', '-')}s/块 · "
+                             f"{vc.get('rtf')}×实时{extra}")
             if f0:
                 lines.append(f"- F0：模式 {f0.get('mode_used', '-')}，轮廓相关 "
                              f"r={f0.get('f0_r', '-')}，八度错误 {f0.get('octave_err', '-')}，"
