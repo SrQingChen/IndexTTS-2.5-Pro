@@ -48,6 +48,8 @@ TAB_SPECS: List[Tuple[str, str, str, str]] = [
      "丢音频进来 · 切片识别调参训练择优 · 全自动"),
     ("data",   "🗂 数据集",     "webui_app.tabs.dataset_tab", "建集 · 导入 · 文本 · 划分 · 特征提取"),
     ("train",  "🎓 训练",       "webui_app.tabs.train_tab",  "GPT/CFM/DPO · 预检 · 保险库 · 记录"),
+    ("e1t",    "🎵 歌声训练",    "webui_app.tabs.e1t_tab",
+     "E1-T 分步向导 · GTSinger 导入 · capability · 角色歌声身份"),
     ("align",  "⚖️ 对齐",       "webui_app.tabs.align_tab",  "DPO 偏好对构造 · 浏览 · 划分"),
     ("deploy", "🏁 评测/部署",  "webui_app.tabs.deploy_tab", "A/B · 挂载强度 · 合并 · 泛化保护"),
     ("model",  "📥 模型",       "webui_app.tabs.models",     "审计 · 镜像下载 · 实时进度"),

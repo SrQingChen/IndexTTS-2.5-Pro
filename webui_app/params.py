@@ -143,6 +143,16 @@ def register_cover_params() -> None:
         pass
 
 
+def register_e1t_params() -> None:
+    """登记 E1-T 歌声训练向导参数（阶段 47b）。"""
+    try:
+        from webui_app.params_e1t import build
+        build(_reg, Param)
+    except ImportError:
+        pass
+
+
 register_inference_params()
 register_training_params()
 register_cover_params()
+register_e1t_params()

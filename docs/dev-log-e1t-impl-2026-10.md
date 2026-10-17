@@ -140,3 +140,33 @@ build_app 会把 Tab 渲染异常吞进 `ctx.shared["_render_failures"]`）。
   GTSinger 多数帧本就是 control，影响温和——分类器可用后可对参考跑一次补齐）。
 - BoN 奖励中 HNR 权重（×0.05）使 F0 项主导，与母规划「HNR 与其他并列」原意有偏差，
   真实候选择优出现偏差时回调权重。
+---
+
+## 7. 追加（47b，2026-10-17 晚）：🎵 歌声训练（E1-T）向导页
+
+应用户要求补齐训练链的 UI 接口——**独立标签页 + 分步引导 + 可复用数据的提示**：
+
+- **新页 `webui_app/tabs/e1t_tab.py`**（TAB_SPECS 挂在「🎓 训练」之后）：
+  - **七步状态总览**（`e1t_wizard.status_markdown()`，纯文件系统检测）：
+    前置文件 / ①引导复制 / ②歌声数据集 / ③歌声特征条数 / ④capability run /
+    ⑤合并成果 / ⑥身份 run，每步 ✅/⬜ + 「下一步做什么」+ **可复用性说明**
+    （数据一次准备全角色共享；新角色只跑⑥；说话数据集旧特征直接复用）；
+  - ②③④⑤⑥ 各为独立 Accordion 步骤卡片；GTSinger 许可边界
+    （CC BY-NC-SA：个人研究可用 / 免费共享需署名同协议 / 商用需授权）
+    常驻页首与②步骤内；
+  - 后台执行与一键三连**同一套 TrainRunner**（互斥/进度/停止/日志 Timer 轮询）：
+    训练与特征提取 `require_engine="unloaded"`（自建模型实例期间引擎不得加载），
+    导入/合并走 CPU；合并报告落 `merge_md`；
+  - ⑦ 静态使用指引（翻唱页选身份 run + 勾歌声模型 + e1t_baseline 对比口径）。
+- **服务层 `webui_app/services/e1t_wizard.py`**：状态检测、run 分类
+  （run.json 的 `singing.enabled` / `singing.cfg_path` → capability / 身份 /
+  普通 TTS 三类）、六步后台 fn 构造器；训练 fn 先 preflight 再 run，
+  capability=`singing=True`（条件透传+均衡采样），身份=`singing=False`
+  +歌声底座（conditioner 自动冻结）。
+- **GTSinger 导入服务化 `webui_app/services/gts_import.py`**：核心逻辑从
+  CLI 脚本搬出并函数化（progress/should_stop、technique.json 幂等合并、
+  增广副本入册）；`tools/gtsinger_import.py` 改为薄 CLI 壳，行为不变。
+- **参数注册 `webui_app/params_e1t.py`**（9 个旋钮：语言过滤/音高增广/
+  条数上限/复制开关/预设/帧数/epoch 等）+ `params.py` 聚合。
+- 测试：`tests/test_e1t_wizard.py` 9 项（run 分类三态、引导复制不覆盖防护、
+  状态面板七步、增广解析）+ 全 Tab 渲染冒烟自动覆盖新页；**全套 130 项绿**。
