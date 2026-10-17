@@ -170,3 +170,33 @@ build_app 会把 Tab 渲染异常吞进 `ctx.shared["_render_failures"]`）。
   条数上限/复制开关/预设/帧数/epoch 等）+ `params.py` 聚合。
 - 测试：`tests/test_e1t_wizard.py` 9 项（run 分类三态、引导复制不覆盖防护、
   状态面板七步、增广解析）+ 全 Tab 渲染冒烟自动覆盖新页；**全套 130 项绿**。
+---
+
+## 8. 追加（47c）：数据目录 + 镜像拉取 + 一键全链 + 成果自动接线
+
+应用户要求「数据在项目下拉取好、默认目录配置好、配置参数后一键完成所有
+训练和成果的自动接线」：
+
+- **数据目录约定**：`datasets/_sources/GTSinger`（gitignore 覆盖；
+  `list_datasets` 只认带 info 文件的目录，_sources 不会混进数据集下拉）。
+- **镜像拉取 `webui_app/services/gts_fetch.py`**（CLI 壳
+  `tools/fetch_gtsinger.py`）：hf-mirror 优先（`HF_ENDPOINT` 沿用项目
+  config 的 setdefault 默认，**不涉及 GitHub**）；逐文件 + 6 线程拉取
+  （GTSinger 是数万个小文件，逐文件才有真实进度且可中断——断点续传由
+  hf_hub 本地缓存承担，重复执行增量补齐）；**语言子集过滤**
+  `plan_files()`（纯函数，zh+en 子集约 15–20GB vs 全量 40GB 量级；
+  过滤结果为空时宁可回退全量，不给「假完成」）。
+- **向导页升级**：新增「🚀 一键全链」与「⓪ 镜像拉取」两张步骤卡；
+  ② 的源路径默认值 = 数据目录；七步状态总览增加 ⓪ 数据源行。
+- **一键全链 `pipeline_fn`**：拉取（数据缺失且允许时）→ ①引导 → ②导入
+  → ③特征 → ④capability → ⑤合并 → ⑥身份（可选）→ ⑦**接线翻唱页**。
+  每段失败即停、成果保留（状态总览天然增量，再点一次跳过已完成部分）；
+  进度按段映射到全链 0–100%。
+- **接线 = 写翻唱页参数记忆**（`wire_cover_state`：singing_enable=True +
+  身份 LoRA + preserve/auto/octave_fix 默认），下次进翻唱页直接可用；
+  只写 E1-T 键，不动用户其它翻唱参数。
+- **顺手修了一个真 bug**：`svc_state._COVER_KEYS` 白名单缺 E1-T 七键——
+  翻唱页保存的歌声开关重启后会被静默丢弃（阶段37「白名单静默丢键」同款
+  事故），已补齐并用回归测试钉住。
+- 测试：`tests/test_e1t_wizard.py` 扩到 17 项（语言过滤三态/端点默认/
+  全链顺序-失败即停-接线/白名单钉）；全套 **140 项绿**；WebUI 构建通过。

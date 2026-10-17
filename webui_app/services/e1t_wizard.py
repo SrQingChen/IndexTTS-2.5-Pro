@@ -22,8 +22,12 @@ import shutil
 from typing import Any, Callable, Dict, List, Optional
 
 from webui_app.config import PROJECT_ROOT
+from webui_app.services import gts_fetch as GF
+from webui_app.services import gts_import as GI
+from webui_app.services import svc_state
 from webui_app.training import dataset as DS
 from webui_app.training import features as FT
+from webui_app.training import merge as MG
 from webui_app.training import runs as RN
 
 CHECKPOINTS = os.path.join(PROJECT_ROOT, "checkpoints")
@@ -86,8 +90,9 @@ def singing_datasets() -> List[str]:
 
 
 def status() -> Dict[str, Any]:
-    """七步状态。纯文件系统读取，渲染线程可以直接调。"""
+    """七步状态 + 数据源状态。纯文件系统读取，渲染线程可以直接调。"""
     st: Dict[str, Any] = {}
+    st["source"] = GF.source_state()
     st["base_pth"] = os.path.isfile(BASE_PTH)
     st["singing_cfg"] = os.path.isfile(SINGING_CFG)
     st["singing_pth"] = os.path.isfile(SINGING_PTH)
@@ -119,6 +124,15 @@ def status_markdown() -> str:
     def _mark(ok):
         return "✅" if ok else "⬜"
 
+    src_st = st.get("source") or {}
+    if src_st.get("exists"):
+        _src_desc = (f"已就绪：{','.join(src_st['langs'])} · "
+                     f"{src_st['wavs']} 个 wav"
+                     if src_st.get("wavs") else "目录存在但还没有 wav（先拉取）")
+    else:
+        _src_desc = "未拉取（向导②可镜像下载，也可自行放置）"
+    steps.append((_mark(bool(src_st.get("wavs"))), "⓪ 歌声数据源",
+                  f"datasets/_sources/GTSinger —— {_src_desc}"))
     cfg_ok = st["singing_cfg"]
     steps.append((_mark(cfg_ok), "前置文件",
                   "checkpoints/config_singing.yaml（随项目分发，只读）"))
@@ -293,4 +307,157 @@ def merge_fn(run: str) -> Callable:
         progress(1.0, "完成" if rep.ok else "失败")
         return {"ok": bool(rep.ok), "report": rep.to_dict(),
                 "markdown": rep.markdown()}
+    return fn
+
+def fetch_fn(langs: List[str], dest: str = "") -> Callable:
+    """⓪/② 镜像拉取 GTSinger（CPU/网络型，后台执行）。"""
+    def fn(progress, should_stop):
+        return GF.fetch(dest or GF.DEFAULT_DEST, list(langs or []),
+                        progress=progress, should_stop=should_stop)
+    return fn
+
+
+def _seg(progress, lo: float, hi: float) -> Callable[[float, str], None]:
+    """把子阶段进度 [0,1] 映射进全链 [lo,hi]。"""
+    def cb(f, msg):
+        progress(lo + (hi - lo) * max(0.0, min(1.0, float(f))), msg)
+    return cb
+
+
+def wire_cover_state(identity_run: str) -> Dict[str, Any]:
+    """把成果「接线」到翻唱页：写参数记忆（singing 开 + 身份 LoRA）。
+
+    只写 E1-T 相关键，不动用户其它翻唱参数；不写 identity 时也开
+    singing（纯参考音色 + 歌声底座是合法用法）。svc_state 的白名单
+    已含这些键（阶段47b 修复过静默丢键——那类 bug 的教训）。
+    """
+    vals: Dict[str, Any] = {"singing_enable": True,
+                            "technique_mode": "preserve",
+                            "register_mode": "auto",
+                            "octave_fix": True,
+                            "bon_high": False,
+                            "lora_run": identity_run or "",
+                            "lora_ckpt": "best"}
+    svc_state.save_cover(vals)
+    return {"wired": True,
+            "lora_run": identity_run or "（纯参考音色）",
+            "note": "翻唱页下次进入即载入：歌声模型已开"
+                    + (f"，LoRA={identity_run}" if identity_run else "")}
+
+
+def pipeline_fn(src: str, dataset: str, langs: List[str], pitch_aug: str,
+                max_items: int, cap_run: str, cap_preset: str,
+                cap_frames: int, cap_epochs: int,
+                identity: bool, id_ds: str, id_run: str, id_preset: str,
+                id_epochs: int, auto_fetch: bool = True) -> Callable:
+    """🚀 一键全链：拉取(可选)→导入→特征→capability→合并→身份(可选)→接线。
+
+    每段失败立即返回（已完成段的成果保留在磁盘/run 里——状态总览
+    天然增量，修好问题再点一次会跳过已完成的部分继续走）。
+    """
+    def fn(progress, should_stop):
+        stages: List[str] = []
+
+        def _stop() -> bool:
+            return bool(should_stop and should_stop())
+
+        # ---- ⓪ 拉取（数据源缺且允许时）----
+        src_st = GF.source_state()
+        if not src_st.get("wavs"):
+            if not auto_fetch:
+                return {"ok": False, "stage": "fetch",
+                        "error": "数据源为空且未开启自动拉取；先在②下载"
+                                 "或填自备路径重跑导入"}
+            progress(0.01, "[⓪] 镜像拉取 GTSinger…")
+            r = GF.fetch(GF.DEFAULT_DEST, list(langs or []),
+                         progress=_seg(progress, 0.01, 0.12),
+                         should_stop=should_stop)
+            if not r.get("ok"):
+                return {"ok": False, "stage": "fetch", "error": r.get("error", "")}
+            stages.append("fetch")
+
+        # ---- ① 前置：底座文件 ----
+        if not os.path.isfile(SINGING_PTH):
+            progress(0.13, "[①] 引导复制歌声底座…")
+            if not os.path.isfile(BASE_PTH):
+                return {"ok": False, "stage": "bootstrap",
+                        "error": f"找不到 {BASE_PTH}"}
+            shutil.copy2(BASE_PTH, SINGING_PTH)
+            stages.append("bootstrap")
+
+        # ---- ② 导入 ----
+        if _stop():
+            return {"ok": False, "stage": "import", "error": "用户停止"}
+        use_src = (src or "").strip() or GF.DEFAULT_DEST
+        progress(0.15, f"[②] 导入 GTSinger → {dataset}（{use_src}）…")
+        r = GI.run_import(use_src, dataset,
+                          langs=[l for l in (langs or [])],
+                          pitch_aug=pitch_aug, max_items=int(max_items or 0),
+                          progress=_seg(progress, 0.15, 0.22),
+                          should_stop=should_stop)
+        if not r.get("ok"):
+            return {"ok": False, "stage": "import", "error": r.get("error", "")}
+        stages.append(f"import(+{r.get('imported', 0)}/+{r.get('augmented', 0)})")
+
+        # ---- ③ 特征 ----
+        if _stop():
+            return {"ok": False, "stage": "extract", "error": "用户停止"}
+        progress(0.23, f"[③] singing 特征提取 · {dataset}…")
+        r = FT.extract_dataset(dataset, singing=True,
+                               progress=_seg(progress, 0.23, 0.38),
+                               should_stop=should_stop)
+        if r.get("stopped") or not r.get("ok"):
+            errs = (r.get("errors") or [])[:3]
+            return {"ok": False, "stage": "extract",
+                    "error": f"特征提取失败 {r.get('failed', 0)} 条"
+                             + (f"：{errs}" if errs else "")}
+        stages.append(f"extract(+{r.get('extracted', 0)})")
+
+        # ---- ④ capability 训练 ----
+        if _stop():
+            return {"ok": False, "stage": "capability", "error": "用户停止"}
+        progress(0.39, f"[④] capability 训练 · {cap_run}…")
+        r = _train(dataset, cap_run, cap_preset, int(cap_frames),
+                   int(cap_epochs or 0), singing=True, cfg_path=SINGING_CFG,
+                   progress=_seg(progress, 0.39, 0.80), should_stop=should_stop)
+        if not r.get("ok"):
+            return {"ok": False, "stage": "capability",
+                    "error": r.get("error", ""),
+                    "preflight": r.get("preflight")}
+        stages.append(f"capability({r.get('run')})")
+
+        # ---- ⑤ 合并 ----
+        if _stop():
+            return {"ok": False, "stage": "merge", "error": "用户停止"}
+        progress(0.81, "[⑤] 合并到歌声底座（CPU）…")
+        rep = MG.merge_lora_to_checkpoint(MG.MergeOptions(
+            adapter_dir=RN.adapter_dir(r["run"]), arch="cfm_singing",
+            out_path=SINGING_PTH))
+        if not rep.ok:
+            return {"ok": False, "stage": "merge",
+                    "error": "；".join(rep.notes[:3])}
+        stages.append("merge")
+
+        # ---- ⑥ 身份（可选）----
+        id_result = None
+        if identity and (id_ds or "").strip():
+            if _stop():
+                return {"ok": False, "stage": "identity", "error": "用户停止"}
+            progress(0.83, f"[⑥] 身份训练 · {id_run}…")
+            id_result = _train(id_ds, id_run, id_preset, 0,
+                               int(id_epochs or 0), singing=False,
+                               cfg_path=SINGING_CFG,
+                               progress=_seg(progress, 0.83, 0.98),
+                               should_stop=should_stop)
+            if not id_result.get("ok"):
+                return {"ok": False, "stage": "identity",
+                        "error": id_result.get("error", "")}
+            stages.append(f"identity({id_result.get('run')})")
+
+        # ---- ⑦ 接线翻唱页 ----
+        progress(0.99, "[⑦] 接线翻唱页…")
+        wire = wire_cover_state(id_result["run"] if id_result else "")
+        progress(1.0, "全链完成")
+        return {"ok": True, "stages": stages, "wire": wire,
+                "capability_run": r["run"], "merged_to": SINGING_PTH}
     return fn

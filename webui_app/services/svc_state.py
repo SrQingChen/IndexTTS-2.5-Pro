@@ -32,6 +32,11 @@ _COVER_KEYS: Dict[str, str] = {
     "sr_steps": "int", "auto_mix": "bool", "vocal_gain": "float",
     "loudnorm": "bool", "lora_run": "str", "lora_ckpt": "str",
     "lora_scale": "float", "ref_voice": "str", "bgm_path": "str",
+    # E1-T 歌声模型（阶段 47）。教训同阶段37的「白名单静默丢键」：cover_tab
+    # 在保存这些键，白名单没有它们 = 重启后全部回到默认、用户以为没存上。
+    "singing_enable": "bool", "technique_mode": "str",
+    "technique_manual": "int", "bon_high": "bool", "hf_transplant": "bool",
+    "register_mode": "str", "octave_fix": "bool",
 }
 _VC_KEYS: Dict[str, str] = {
     "preset": "str", "agc": "bool", "silence_bypass": "bool", "record": "bool",

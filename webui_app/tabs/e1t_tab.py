@@ -22,7 +22,7 @@ import gradio as gr
 from webui_app import logging_setup as LOG
 from webui_app.context import AppContext
 from webui_app.services import e1t_wizard as WZ
-from webui_app.services import gts_import as GI
+from webui_app.services import gts_fetch as GF
 from webui_app.training.dataset import list_datasets
 from webui_app.training.runner import get_runner
 from webui_app.widgets import make_component
@@ -36,6 +36,9 @@ _PRESET_OF = {
     "🎭 表现力": "expressive",
     "🔴 激进": "aggressive",
 }
+
+# 语言 label（⓪ 拉取的 CheckboxGroup）↔ 语言码
+_LANG_OF = {GF.lang_label(c): c for c in GF.GTS_LANGS}
 
 _LICENSE_MD = (
     "> ⚖️ **GTSinger 数据许可（务必读一次）**：检索显示 CC BY-NC-SA 4.0 ——"
@@ -67,6 +70,9 @@ def render(ctx: AppContext) -> Dict[str, Any]:
 音色不崩的高音。默认 TTS 全程不受影响（独立权重 `s2mel_singing.pth`，
 原 `s2mel.pth` 字节级不动）。完整文档：`docs/dev-plan-e1t-2026-10.md`。
 
+歌声数据默认自动拉取到 `datasets/_sources/GTSinger`（hf-mirror 镜像、断点续传，
+不涉及 GitHub）；也可以把自备的 GTSinger 解压进同一目录跳过下载。
+
 {_LICENSE_MD}""")
 
     # ---------------- 流程总览（七步状态） ----------------
@@ -76,8 +82,44 @@ def render(ctx: AppContext) -> Dict[str, Any]:
 
     gr.Markdown("---")
 
+    # ---------------- 🚀 一键全链 ----------------
+    with gr.Accordion("🚀 一键全链（推荐：配置好参数，一个按钮跑到底）",
+                      open=True):
+        gr.Markdown(
+            "依次自动执行：**拉取数据（缺失时）→ ①引导 → ②导入 → ③特征 → "
+            "④capability → ⑤合并 → ⑥身份（可选）→ ⑦接线翻唱页**。"
+            "每段失败即停且成果保留——修好后**再点一次会跳过已完成的部分**。"
+            "参数就用下方各步骤卡片里的同一批控件（在哪儿改都生效）。")
+        with gr.Row():
+            oneclick_identity_ck = gr.Checkbox(
+                label="⑥ 顺带练角色身份 LoRA", value=False,
+                info="勾选后用⑥卡片的角色数据集在歌声底座上练身份")
+            oneclick_autofetch_ck = gr.Checkbox(
+                label="⓪ 数据源为空时自动镜像拉取", value=True,
+                info="语言用⓪卡片的选择；数据已就绪则跳过")
+            oneclick_btn = gr.Button("🚀 一键全链（后台）",
+                                     variant="primary")
+        gr.Markdown(
+            "完成后的「接线」= 写入翻唱页参数记忆（歌声模型开 + 身份 LoRA "
+            "选好），下次进 🎤 AI翻唱 直接开始用。")
+
+    # ---------------- ⓪ 镜像拉取 ----------------
+    with gr.Accordion("⓪ 获取歌声数据（hf-mirror 镜像下载，断点续传）",
+                      open=False):
+        gr.Markdown(
+            f"默认目录：`{GF.DEFAULT_DEST}`（项目内，已忽略 git 提交）。"
+            "全量约 40GB 量级；**zh+en 子集约 15–20GB**，8GB 显存的训练规模"
+            "建议从子集开始。GTSinger 是数万个小文件，下载需要耐心；"
+            "中断后再点一次即续传。自备数据：解压到同一目录可跳过本步。")
+        fetch_langs_cg = gr.CheckboxGroup(
+            choices=[GF.lang_label(c) for c in GF.GTS_LANGS],
+            value=[GF.lang_label("zh"), GF.lang_label("en")],
+            label="语言子集")
+        fetch_btn = gr.Button("⓪ 下载到默认目录（后台）",
+                              variant="primary", size="sm")
+
     # ---------------- ① 引导复制 ----------------
-    with gr.Accordion("① 引导复制（一次性，约 10 秒）", open=True):
+    with gr.Accordion("① 引导复制（一次性，约 10 秒）", open=False):
         gr.Markdown(
             "首次使用前，把原底座复制一份作为歌声曲线的起点："
             "`checkpoints/s2mel.pth → checkpoints/s2mel_singing.pth`。"
@@ -89,8 +131,9 @@ def render(ctx: AppContext) -> Dict[str, Any]:
         gr.Markdown(_REUSE_MD)
         with gr.Row():
             gts_src_tb = gr.Textbox(
-                label="GTSinger 根目录（自行下载后的路径）",
-                placeholder=r"D:\data\GTSinger",
+                label="GTSinger 根目录",
+                value=GF.DEFAULT_DEST,
+                info="默认=⓪ 的镜像下载目录；自备数据改成你的路径",
                 scale=2)
             gts_name_tb = gr.Textbox(label="目标数据集名", value="gtsinger_zh_en",
                                      scale=1)
@@ -257,11 +300,59 @@ def render(ctx: AppContext) -> Dict[str, Any]:
             raise gr.Error("先选择 capability run（没有就先做第④步）")
         return _submit("e1t_merge", f"E1-T ⑤ 合并 · {run}", WZ.merge_fn(run))
 
+    @LOG.ui_guard("e1t.fetch")
+    def on_fetch(lang_labels):
+        langs = [_LANG_OF.get(x, x) for x in (lang_labels or [])]
+        if not langs:
+            raise gr.Error("至少选一个语言；要全量请用 CLI："
+                           "python tools/fetch_gtsinger.py --all")
+        return _submit("e1t_fetch", f"E1-T ⓪ 拉取 · {','.join(langs)}",
+                       WZ.fetch_fn(langs))
+
+    @LOG.ui_guard("e1t.oneclick")
+    def on_oneclick(src, name, lang_labels, aug, max_items,
+                    cap_run, cap_preset_label, cap_frames, cap_epochs,
+                    identity, id_ds, id_run, id_preset_label, id_epochs,
+                    autofetch):
+        if not (name or "").strip():
+            raise gr.Error("先填②里的目标数据集名")
+        if not (cap_run or "").strip():
+            raise gr.Error("先填④里的 capability run 名")
+        if identity and not (id_ds or "").strip():
+            raise gr.Error("勾了「顺带练身份」：先在⑥选角色数据集")
+        langs = [_LANG_OF.get(x, x) for x in (lang_labels or [])]
+
+        def fn(progress, should_stop):
+            # 特征提取与训练都要显存：引擎若在加载态先卸掉（若有翻唱/变声
+            # 租约会在这里抛出——保护语义正确，原因会显示给用户）
+            if getattr(eng, "loaded", False):
+                eng.unload()
+            inner = WZ.pipeline_fn(
+                src, name.strip(), langs, aug, int(max_items or 0),
+                cap_run.strip(),
+                _PRESET_OF.get(cap_preset_label, "conservative"),
+                int(cap_frames or 1800), int(cap_epochs or 0),
+                bool(identity), id_ds or "", id_run or "",
+                _PRESET_OF.get(id_preset_label, "conservative"),
+                int(id_epochs or 0), bool(autofetch))
+            return inner(progress, should_stop)
+
+        return _submit("e1t_pipeline", f"E1-T 🚀 一键全链 · {name.strip()}",
+                       fn, require_engine="unloaded")
+
     @LOG.ui_guard("e1t.stop")
     def on_stop():
         r = runner.cancel()
         return WZ.status_markdown()
 
+    fetch_btn.click(on_fetch, inputs=[fetch_langs_cg], outputs=[status_md])
+    oneclick_btn.click(
+        on_oneclick,
+        inputs=[gts_src_tb, gts_name_tb, fetch_langs_cg, gts_aug_tb,
+                gts_max_n, cap_run_tb, cap_preset_dd, cap_frames_sl,
+                cap_epochs_sl, oneclick_identity_ck, id_ds_dd, id_run_tb,
+                id_preset_dd, id_epochs_sl, oneclick_autofetch_ck],
+        outputs=[status_md])
     boot_btn.click(on_bootstrap, outputs=[status_md])
     import_btn.click(on_import,
                      inputs=[gts_src_tb, gts_name_tb, gts_langs_tb, gts_aug_tb,
@@ -306,7 +397,25 @@ def render(ctx: AppContext) -> Dict[str, Any]:
 
         status = WZ.status_markdown() if done else gr.update()
         merge_out = gr.update()
-        if done and snap["kind"] == "e1t_merge":
+        if done and snap["kind"] == "e1t_pipeline":
+            res = snap.get("result") or {}
+            if res.get("wire"):
+                w = res["wire"]
+                lora_note = (f"，LoRA={w['lora_run']}" if w.get("lora_run")
+                             else "")
+                merge_out = gr.update(value=(
+                    "### 🎉 一键全链完成\n\n"
+                    "- 阶段：" + " → ".join(res.get("stages") or []) + "\n"
+                    f"- 合并产物：`{res.get('merged_to', 's2mel_singing.pth')}`\n"
+                    "- ✅ 已接线翻唱页：歌声模型开" + lora_note
+                    + "——到 🎤 AI翻唱 直接开始用。"))
+            elif not snap["ok"] and snap.get("error"):
+                stage = (snap.get("result") or {}).get("stage", "?")
+                merge_out = gr.update(
+                    value=(f"### 🔴 全链在第 **{stage}** 步停下\n\n"
+                           f"{snap['error']}\n\n> 修好后**再点一次一键**——"
+                           "已完成的部分会自动跳过。"))
+        elif done and snap["kind"] == "e1t_merge":
             res = snap.get("result") or {}
             md = res.get("markdown")
             if md and poll_cache["merge_md"] != md:
