@@ -126,13 +126,25 @@ def status_markdown() -> str:
         return "✅" if ok else "⬜"
 
     src_st = st.get("source") or {}
+    missing_json = int(src_st.get("missing_json") or 0)
     if src_st.get("exists"):
-        _src_desc = (f"已就绪：{','.join(src_st['langs'])} · "
-                     f"{src_st['wavs']} 个 wav"
-                     if src_st.get("wavs") else "目录存在但还没有 wav（先拉取）")
+        if src_st.get("wavs"):
+            _src_desc = (f"{','.join(src_st['langs'])} · {src_st['wavs']} wav / "
+                         f"{src_st.get('jsons', 0)} json")
+            if missing_json:
+                # 缺 json = 这些样本没文本/技巧标签，导入后训练用不上
+                # （2026-10-19 实锤：只报 wav 数把 1479 条缺标注藏住了）
+                _src_desc += f" · ⚠️ {missing_json} 个缺标注"
+            if src_st.get("partials"):
+                _src_desc += f" · {src_st['partials']} 个残留分片"
+            if src_st.get("incomplete"):
+                _src_desc += " · 上次未下完"
+        else:
+            _src_desc = "目录存在但还没有 wav（先拉取）"
     else:
-        _src_desc = "未拉取（向导②可镜像下载，也可自行放置）"
-    steps.append((_mark(bool(src_st.get("wavs"))), "⓪ 歌声数据源",
+        _src_desc = "未拉取（向导⓪可镜像下载，也可自行放置）"
+    src_ok = bool(src_st.get("wavs")) and missing_json == 0
+    steps.append((_mark(src_ok), "⓪ 歌声数据源",
                   f"datasets/_sources/GTSinger —— {_src_desc}"))
     cfg_ok = st["singing_cfg"]
     steps.append((_mark(cfg_ok), "前置文件",
@@ -160,7 +172,12 @@ def status_markdown() -> str:
 
     rows = "\n".join(f"| {ic} | **{t}** | {d} |" for ic, t, d in steps)
     nxt = "按顺序完成上面第一个 ⬜ 的步骤即可。"
-    if not st["singing_pth"]:
+    if not src_ok and src_st.get("wavs"):
+        # 有音频但缺标注/分片：下载再点一次只补缺失项（断点续传）
+        nxt = ("数据源不完整（缺标注/未下完）→ 到 **⓪ 再点一次下载**，"
+               "只会补缺失文件；也可直接导入（缺标注样本会进 no_text，"
+               "训练前可在数据集页补文本）。")
+    elif not st["singing_pth"]:
         nxt = "从 **① 引导复制** 开始（10 秒）。"
     elif n_gts == 0:
         nxt = "下一步：**② 导入 GTSinger**（下载好后填路径）。"

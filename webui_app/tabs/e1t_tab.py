@@ -418,7 +418,30 @@ def render(ctx: AppContext) -> Dict[str, Any]:
 
         status = WZ.status_markdown() if done else gr.update()
         merge_out = gr.update()
-        if done and snap["kind"] == "e1t_pipeline":
+        if done and snap["kind"] == "e1t_fetch":
+            res = snap.get("result") or {}
+            if snap["ok"]:
+                merge_out = gr.update(value=(
+                    "### ✅ 数据下载完成\n\n"
+                    f"- 文件：**{res.get('done', 0)}/{res.get('total', 0)}** "
+                    f"齐全（本次续传 {res.get('resumed', 0)} 个已存在）\n"
+                    f"- 目录：`{res.get('dest', '')}`\n\n"
+                    "> 下一步：②导入（数据源路径已默认指向该目录）。"))
+            elif res.get("partial"):
+                merge_out = gr.update(value=(
+                    "### 🟡 下载未完成（已完成 "
+                    f"{res.get('done', 0)}/{res.get('total', 0)}）\n\n"
+                    f"- 还缺 **{res.get('missing', 0)}** 个文件，名单已写入 "
+                    f"`{os.path.basename(res.get('incomplete_file', '_incomplete.txt'))}`\n"
+                    "- 再点一次 **⓪ 下载** 只补缺失项（已完成的会跳过）\n\n"
+                    "> 注意：缺 json 的样本没有文本/技巧标签，导入后会进 "
+                    "`no_text`，训练前需补齐或剔除。"))
+            elif res.get("stopped"):
+                merge_out = gr.update(value=(
+                    "### ⏹ 已停止下载\n\n"
+                    f"- 已完成 {res.get('done', 0)}/{res.get('total', 0)}，"
+                    "再点一次续传即可。"))
+        elif done and snap["kind"] == "e1t_pipeline":
             res = snap.get("result") or {}
             if res.get("wire"):
                 w = res["wire"]

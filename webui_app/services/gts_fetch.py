@@ -24,6 +24,7 @@ Datasets（GTSinger/GTSinger），本项目 `webui_app.config` 已把
 from __future__ import annotations
 
 import os
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Callable, Dict, List, Optional
 from urllib.parse import parse_qs, urlparse
@@ -106,9 +107,24 @@ def _tree_page(session, endpoint: str, path: Optional[str], cursor: str,
                               "expand": "false"}
     if cursor:
         params["cursor"] = cursor
-    r = session.get(url, params=params, timeout=60)
-    r.raise_for_status()
-    rows = r.json()
+
+    # 清单接口也要重试（2026-10-19 实锤：重试下载时 5.6s 就死在
+    # "Response ended prematurely"——镜像偶发断流，一次失败就整任务失败，
+    # 用户看到的是「文件已下完却报失败」）。指数退避 3 次。
+    last: Optional[Exception] = None
+    for attempt in range(3):
+        try:
+            r = session.get(url, params=params, timeout=60)
+            r.raise_for_status()
+            rows = r.json()
+            break
+        except Exception as e:      # noqa: BLE001 - 网络类异常统一重试
+            last = e
+            if attempt < 2:
+                time.sleep(1.5 * (2 ** attempt))
+    else:
+        raise RuntimeError(f"清单请求失败（已重试 3 次）：{type(last).__name__}: {last}")
+
     nxt = r.links.get("next", {}).get("url")
     next_cursor = ""
     if nxt:
@@ -183,38 +199,30 @@ def list_repo_files(langs: Optional[List[str]] = None) -> List[str]:
     return files
 
 
-def fetch(dest: str, langs: List[str],
-          progress: Optional[Callable[[float, str], None]] = None,
-          should_stop: Optional[Callable[[], bool]] = None,
-          workers: int = 6) -> Dict:
-    """拉取 GTSinger 到 dest（断点续传）。返回摘要 dict。
+INCOMPLETE_FILE = "_incomplete.txt"
 
-    已存在的文件由 hf_hub 本地缓存/本地目录校验跳过——重复调用是
-    增量续传，天然支持「下了一半断了再点一次」。
+
+def _missing_on_disk(dest: str, files: List[str]) -> List[str]:
+    """以**磁盘实况**为准判定缺失（不信下载过程的计数）。
+
+    2026-10-19 实锤的假失败：2.35 小时下完 14280 个文件里 12789 个，
+    但过程计数把 1491 个镜像抖动算成失败、又用「失败>5% 即整任务失败」
+    一刀切——用户看到「下载结束却失败」，而 wav 其实 7133/7139 已到位。
+    判定改成一句：文件在不在磁盘上。
     """
-    dest = dest or DEFAULT_DEST
-    os.makedirs(dest, exist_ok=True)
-    progress = progress or (lambda f, m: None)
+    return [f for f in files if not os.path.isfile(os.path.join(dest, f))]
 
-    langs = [l for l in (langs or []) if l]
-    progress(0.01, "获取仓库文件清单（hf-mirror，语言子树）…")
-    try:
-        files = list_repo_files(langs or None)
-    except Exception as e:
-        return {"ok": False, "error": f"文件清单获取失败：{e}\n"
-                "（镜像站偶发抖动可重试；确认网络可达 hf-mirror.com）"}
-    plan = plan_files(files, langs)
-    todo = [f for f in plan["files"]
-            # TextGrid/musicxml 是标注冗余（json 已含全部信息），不下载
-            if not f.lower().endswith((".textgrid", ".musicxml"))]
-    if not todo:
-        return {"ok": False, "error": "过滤后没有文件可下载"}
 
-    ensure_endpoint()
+def _run_pass(todo: List[str], dest: str, workers: int,
+              progress: Callable[[float, str], None],
+              should_stop: Optional[Callable[[], bool]],
+              base: float, span: float, label: str):
+    """跑一轮下载。返回 (ok_count, failed_files, stopped)。"""
     from huggingface_hub import hf_hub_download
 
-    done = skipped = 0
-    total = len(todo)
+    total = max(1, len(todo))
+    ok = 0
+    failed: List[str] = []
     stop = False
     counter = {"n": 0}
 
@@ -231,44 +239,141 @@ def fetch(dest: str, langs: List[str],
                 for x in futs:
                     x.cancel()
                 break
+            fname = futs[fut]
             try:
                 if fut.result():
-                    done += 1
+                    ok += 1
                 else:
-                    skipped += 1
+                    failed.append(fname)
             except Exception:
-                # 单文件失败不炸整链（镜像偶发 5xx）：最后汇总报数
-                skipped += 1
+                # 单文件失败不炸整链：进重试轮（镜像 429/断流很常见）
+                failed.append(fname)
             counter["n"] += 1
             if counter["n"] % 25 == 0 or counter["n"] == total:
-                progress(0.02 + 0.97 * counter["n"] / total,
-                         f"下载 {counter['n']}/{total}"
-                         f"（{plan['mode']}）")
+                progress(base + span * counter["n"] / total,
+                         f"{label} {counter['n']}/{total}")
+    return ok, failed, stop
+
+
+def fetch(dest: str, langs: List[str],
+          progress: Optional[Callable[[float, str], None]] = None,
+          should_stop: Optional[Callable[[], bool]] = None,
+          workers: int = 4) -> Dict:
+    """拉取 GTSinger 到 dest（断点续传 + 失败自动重试）。返回摘要 dict。
+
+    三轮：主跑（workers）→ 重试一（半并发）→ 重试二（单线程）。
+    完成判定看**磁盘实况**（文件齐=成功）；仍缺的写入
+    `_incomplete.txt` 并在返回里给精确数量——再点一次只补这些。
+    """
+    dest = dest or DEFAULT_DEST
+    os.makedirs(dest, exist_ok=True)
+    progress = progress or (lambda f, m: None)
+
+    langs = [l for l in (langs or []) if l]
+    progress(0.01, "获取仓库文件清单（hf-mirror，语言子树）…")
+    try:
+        files = list_repo_files(langs or None)
+    except Exception as e:
+        return {"ok": False, "error": f"文件清单获取失败：{e}\n"
+                "（镜像站偶发抖动，已自动重试 3 次仍失败；稍后再点一次即可）"}
+    plan = plan_files(files, langs)
+    todo = [f for f in plan["files"]
+            # TextGrid/musicxml 是标注冗余（json 已含全部信息），不下载
+            if not f.lower().endswith((".textgrid", ".musicxml"))]
+    if not todo:
+        return {"ok": False, "error": "过滤后没有文件可下载"}
+
+    ensure_endpoint()
+    total = len(todo)
+    already = [f for f in todo if os.path.isfile(os.path.join(dest, f))]
+    pending = [f for f in todo if f not in set(already)]
+    if already:
+        progress(0.02, f"本地已有 {len(already)}/{total} 个文件，续传剩余 "
+                       f"{len(pending)} 个")
+
+    stop = False
+    retried_fail: List[str] = []
+    # 三轮：主跑 / 半并发重试 / 单线程收尾（最后 1-2% 通常是一次性抖动）
+    plans = [(max(1, workers), 0.02, 0.92, "下载"),
+             (max(1, workers // 2), 0.92, 0.97, "重试"),
+             (1, 0.97, 0.995, "收尾重试")]
+    for workers_now, base, hi, label in plans:
+        if not pending:
+            break
+        ok_n, failed, stop = _run_pass(pending, dest, workers_now, progress,
+                                       should_stop, base, hi - base, label)
+        if stop:
+            break
+        if failed:
+            retried_fail = failed
+            progress(min(hi, 0.999),
+                     f"{label}完成：本轮成功 {ok_n}，待重试 {len(failed)}")
+            pending = failed
+        else:
+            retried_fail = []
+            pending = []
+
     if stop:
         return {"ok": False, "stopped": True, "dest": dest,
-                "done": done, "total": total,
-                "error": "用户停止（已完成的文件保留，续传即可）"}
-    if skipped > total * 0.05:
-        return {"ok": False, "dest": dest, "done": done, "skipped": skipped,
-                "total": total,
-                "error": f"{skipped}/{total} 个文件失败（镜像抖动），"
-                         "再点一次下载按钮续传"}
-    progress(1.0, f"完成：{done} 个文件 → {dest}")
-    return {"ok": True, "dest": dest, "done": done, "skipped": skipped,
-            "total": total, "note": plan["note"]}
+                "done": total - len(pending), "total": total,
+                "error": "用户停止（已完成的文件保留，再点一次续传即可）"}
+
+    # 以磁盘实况收口（进程计数只能参考）
+    missing = _missing_on_disk(dest, todo)
+    inc_path = os.path.join(dest, INCOMPLETE_FILE)
+    if missing:
+        with open(inc_path, "w", encoding="utf-8") as f:
+            f.write(f"# 缺失文件（{len(missing)}/{total}）"
+                    f" · {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+            f.write("\n".join(missing))
+        sample = "\n".join(missing[:5])
+        return {"ok": False, "partial": True, "dest": dest,
+                "done": total - len(missing), "missing": len(missing),
+                "total": total, "incomplete_file": inc_path,
+                "error": f"还有 {len(missing)}/{total} 个文件未完成"
+                         f"（已完成 {total - len(missing)}）。名单已写入 "
+                         f"{os.path.basename(inc_path)}；再点一次下载只会补"
+                         f"这些缺失项。示例：\n{sample}"}
+    if os.path.isfile(inc_path):
+        try:
+            os.remove(inc_path)       # 补齐了就把残缺名单清掉
+        except OSError:
+            pass
+    progress(1.0, f"完成：{total} 个文件齐全 → {dest}")
+    return {"ok": True, "dest": dest, "done": total, "missing": 0,
+            "total": total, "note": plan["note"],
+            "resumed": len(already)}
 
 
 def source_state(dest: Optional[str] = None) -> Dict[str, object]:
-    """本地数据源状态（向导总览用；纯文件系统读取，轻量）。"""
-    from webui_app.services.gts_fetch import DIR_LANG
+    """本地数据源状态（向导总览用；纯文件系统读取，轻量）。
+
+    2026-10-19 补：不只看 wav——逐目录核对**同名 json 兄弟文件**。
+    json 缺失的样本导入后没有文本/技巧标签，训练用不上，状态里必须
+    可见（此前只报 wav 数，1487 个缺标注被藏了起来）。
+    """
     d = dest or DEFAULT_DEST
     if not os.path.isdir(d):
-        return {"exists": False, "path": d, "langs": [], "wavs": 0}
+        return {"exists": False, "path": d, "langs": [], "wavs": 0,
+                "jsons": 0, "missing_json": 0, "partials": 0,
+                "incomplete": False}
     langs = [DIR_LANG.get(n, n.lower()) for n in sorted(os.listdir(d))
              if os.path.isdir(os.path.join(d, n)) and n in DIR_LANG]
-    wavs = 0
+    wavs = jsons = missing_json = partials = 0
     for root, _dirs, files in os.walk(d):
-        wavs += sum(1 for f in files if f.lower().endswith(".wav"))
+        names = {f.lower(): f for f in files}
+        wav_here = [f for f in files if f.lower().endswith(".wav")]
+        json_stems = {os.path.splitext(f)[0] for f in files
+                      if f.lower().endswith(".json")}
+        wavs += len(wav_here)
+        jsons += len(json_stems)
+        missing_json += sum(1 for f in wav_here
+                            if os.path.splitext(f)[0] not in json_stems)
+        partials += sum(1 for k in names
+                        if k.endswith(".part") or k.endswith(".incomplete"))
         if wavs > 200_000:            # 防御：超大目录提前停
             break
-    return {"exists": True, "path": d, "langs": langs, "wavs": wavs}
+    inc = os.path.join(d, INCOMPLETE_FILE)
+    return {"exists": True, "path": d, "langs": langs, "wavs": wavs,
+            "jsons": jsons, "missing_json": missing_json,
+            "partials": partials, "incomplete": os.path.isfile(inc)}

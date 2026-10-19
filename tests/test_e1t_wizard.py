@@ -498,3 +498,70 @@ class TestRealJsonSchema:
         text, segs = GI.load_transcription(str(jp))
         assert text == "hello world"
         assert segs == []                              # 无技巧 → control
+
+# ---------------------------------------------------------------------------
+# 47g：拉取假失败修复（磁盘实况判定 / 重试轮 / 状态显示）
+# ---------------------------------------------------------------------------
+
+class TestFetchVerdict:
+    """2026-10-19 事故回归钉：下载 90% 时报「失败」、且状态看不出缺标注。"""
+
+    def _fake_listing(self, monkeypatch, files):
+        monkeypatch.setattr(GF, "list_repo_files", lambda langs=None: list(files))
+        monkeypatch.setattr(GF, "ensure_endpoint", lambda: "https://hf-mirror.com")
+
+    def test_missing_on_disk_is_the_verdict(self, tmp_path):
+        (tmp_path / "a.wav").write_bytes(b"x")
+        (tmp_path / "b.json").write_bytes(b"{}")
+        missing = GF._missing_on_disk(str(tmp_path), ["a.wav", "b.json", "c.wav"])
+        assert missing == ["c.wav"]
+
+    def test_partial_result_writes_incomplete_list(self, tmp_path, monkeypatch):
+        files = ["Chinese/s/a.wav", "Chinese/s/a.json", "Chinese/s/b.wav"]
+        self._fake_listing(monkeypatch, files)
+        # 宿主机上已有 a.wav；下载器把 a.json 下成功，b.wav 始终失败
+        (tmp_path / "Chinese" / "s").mkdir(parents=True)
+        (tmp_path / "Chinese" / "s" / "a.wav").write_bytes(b"x")
+
+        import types
+        fake = types.ModuleType("huggingface_hub")
+
+        def _dl(repo, fname, repo_type=None, local_dir=None):
+            if fname.endswith("b.wav"):
+                raise ConnectionError("mirror 429")
+            p = os.path.join(local_dir, fname)
+            os.makedirs(os.path.dirname(p), exist_ok=True)
+            open(p, "wb").write(b"{}")
+            return p
+        fake.hf_hub_download = _dl
+        monkeypatch.setitem(sys.modules, "huggingface_hub", fake)
+
+        r = GF.fetch(str(tmp_path), ["zh"])
+        assert not r["ok"] and r.get("partial")
+        assert r["missing"] == 1 and r["done"] == 2
+        assert os.path.isfile(os.path.join(str(tmp_path), GF.INCOMPLETE_FILE))
+
+    def test_all_present_reports_success_and_clears_list(self, tmp_path, monkeypatch):
+        files = ["Chinese/s/a.wav", "Chinese/s/a.json"]
+        self._fake_listing(monkeypatch, files)
+        (tmp_path / "Chinese" / "s").mkdir(parents=True)
+        for f in files:
+            (tmp_path / f).write_bytes(b"x")
+        inc = tmp_path / GF.INCOMPLETE_FILE
+        inc.write_text("stale", encoding="utf-8")
+
+        r = GF.fetch(str(tmp_path), ["zh"])
+        assert r["ok"] and r["done"] == 2
+        assert not inc.exists(), "补齐后必须清掉残缺名单"
+
+    def test_source_state_counts_missing_json(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(GF, "DEFAULT_DEST", str(tmp_path))
+        d = tmp_path / "Chinese" / "s"
+        d.mkdir(parents=True)
+        (d / "a.wav").write_bytes(b"x")
+        (d / "a.json").write_text("[]", encoding="utf-8")
+        (d / "b.wav").write_bytes(b"x")          # 缺 json
+        (d / "c.wav.part").write_bytes(b"x")     # 残留分片
+        st = GF.source_state(str(tmp_path))
+        assert st["wavs"] == 2 and st["jsons"] == 1
+        assert st["missing_json"] == 1 and st["partials"] == 1
