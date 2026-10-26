@@ -749,7 +749,11 @@ def render(ctx: AppContext):
                 out_audio_sr = gr.Audio(
                     label="超分 48k 结果（仅勾选「自动超分」或手动超分后产出）",
                     type="filepath", show_download_button=True)
-                out_info = gr.HTML("")
+                # 完成/错误信息混排 markdown 表格与 HTML 提示块：必须用
+                # Markdown 组件渲染，否则表格语法在 HTML 组件里原样显示
+                # 成一串竖线（2026-10-26 用户反馈）。sanitize_html=False
+                # 让 <div class="ix-tip"> 这类块与表格共存（CSS 是全局的）。
+                out_info = gr.Markdown("", sanitize_html=False)
                 # 实时过程日志：on_generate 把进度行写进 ctx.shared 的
                 # 缓冲，这里用 Timer 每秒半拉一次 —— 与一键三连的日志
                 # 体验对齐，浏览器切走回来也能看到全过程。
@@ -1014,6 +1018,14 @@ def render(ctx: AppContext):
                 "audiosr 未安装（注意 --no-deps，不能让它替换 torch）：见 "
                 "webui_app/services/audio_sr.py 顶部注释的安装命令。")
         was_loaded = bool(eng.loaded)
+        # 卸载前记下**实际挂着 LoRA 的通道**：重载回来的是纯底模，
+        # 引擎的挂载记忆（_lora_attached）只在「真挂过」的通道上才有
+        # 有效记录；用它限定 remount 范围，不会恢复过期的旧记录。
+        _lora_before = set()
+        if was_loaded:
+            for _s in eng.lora_status():
+                if _s.get("wrapped"):
+                    _lora_before.add(str(_s.get("target") or ""))
         if was_loaded:
             gr.Info("超分：卸载推理引擎腾显存…")
             _slog("超分：卸载推理引擎，腾显存给 AudioSR…")
@@ -1037,6 +1049,7 @@ def render(ctx: AppContext):
             if was_loaded and not eng.loaded:
                 try:
                     eng.load()
+                    eng.remount_loras(targets=sorted(_lora_before))
                 except Exception:
                     pass
             raise
@@ -1052,6 +1065,16 @@ def render(ctx: AppContext):
             _slog("超分完成：重载推理引擎…")
             try:
                 eng.load()
+                _re = eng.remount_loras(targets=sorted(_lora_before))
+                if _re:
+                    _slog("🧬 LoRA 已随引擎重挂："
+                          + "、".join(_re.values()))
+                _missed = sorted(_lora_before - set(_re))
+                if _missed:
+                    _slog(f"⚠️ LoRA 重挂失败：{'、'.join(_missed)} 通道")
+                    rep = T.warn(
+                        f"超分后 {'、'.join(_missed)} 通道的 LoRA 未能重挂，"
+                        "引擎当前是底模——重新点一次「生成」会自动挂回。")
             except Exception as e:
                 rep = T.warn(f"引擎重载失败（可点「加载模型」手动恢复）：{e}")
         b0 = AL2.band_profile(str(path))
@@ -1333,13 +1356,18 @@ def render(ctx: AppContext):
             pol_report = gr.update(value=T.hint(
                 "未启用输出后处理 —— 输出与模型原始结果一致（最保真）。"))
 
+        # 块间必须空行分隔：markdown 里 HTML 块以空行结束，紧贴着的
+        # 表格行会被吞进 HTML 块当纯文本（又变回"一大段混乱"）。
         info = "\n".join([
-            '<div class="ix-tip">✅ <b>合成完成</b></div>',
+            '<div class="ix-tip">✅ <b>合成完成</b></div>', "",
             "| 项 | 值 |", "|---|---|",
-        ] + [f"| {a} | {b} |" for a, b in rows]) + lora_note + pol_note
+        ] + [f"| {a} | {b} |" for a, b in rows])
+        for _extra in (lora_note, pol_note):
+            if _extra:
+                info += "\n\n" + _extra
 
         if getattr(eng.tts, "low_vram", False) and len(req.text or "") > 40:
-            info += T.warn(
+            info += "\n\n" + T.warn(
                 "本次触发了<b>低显存自动分块</b>：文本被按标点粗切成 ≤40 字的块，"
                 "逐块独立合成后拼接。块与块之间韵律不接续是正常现象，不是 bug。"
                 "缓解办法见「参数手册 → 显存策略 → 低显存自动分块」。")
@@ -1408,10 +1436,10 @@ def render(ctx: AppContext):
                     sr_src, steps=int(sr_steps_now or 35))
                 if _sr_path:
                     sr_out_val = _sr_path
-                info += _sr_rep
+                info += "\n\n" + _sr_rep
             except Exception as e:
                 gr.Error(f"自动超分失败：{e}")
-                info += T.err(
+                info += "\n\n" + T.err(
                     f"<b>自动超分失败</b>（原始输出不受影响）："
                     f"{type(e).__name__}: {e}")
 
@@ -1449,21 +1477,26 @@ def render(ctx: AppContext):
 
     @LOG.ui_guard("synthesize.on_superres", slow_sec=5.0)
     def on_superres(path, steps):
+        # 第 5 个输出 = LoRA 面板：超分卸载重载引擎后挂载状态可能变化
+        # （重挂成功/失败都由 _do_superres 之后的 lora_status 反映），
+        # 面板不同步就会拿旧状态骗人。
         if not path or not os.path.isfile(str(path)):
             return gr.update(), T.err("先「生成」一次，对当前结果做超分。"), \
-                gr.update(), gr.update()
+                gr.update(), gr.update(), gr.update()
         try:
             sr_path, rep = _do_superres(str(path), steps=int(steps or 35))
         except Exception as e:
             return gr.update(), T.err(
                 f"超分失败：{type(e).__name__}: {e}"), ctx.status_html(), \
-                gr.update()
+                gr.update(), _lora_state_html(eng)
         gr.Info("超分完成")
         # 产出进第二个输出窗；第一个窗（原始 22k / polish）原样保留
-        return sr_path, T.tip(rep), ctx.status_html(), gr.update()
+        return sr_path, T.tip(rep), ctx.status_html(), gr.update(), \
+            _lora_state_html(eng)
 
     sr_btn.click(on_superres, inputs=[out_audio, sr_steps_sl],
-                 outputs=[out_audio_sr, sr_out, sb, out_audio])
+                 outputs=[out_audio_sr, sr_out, sb, out_audio,
+                          lora_state_html])
 
     # ---------- 导演模式：预演台本 / API 配置 / 角色名联动 ----------
 

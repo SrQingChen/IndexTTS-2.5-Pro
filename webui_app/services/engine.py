@@ -272,6 +272,11 @@ class TTSEngine:
         # 不是音质；搬动有秒级 PCIe 代价，只适合离线。
         self.stage_offload = False
         self._stage_moved = {"w2v": False, "gpt": False}
+        # LoRA 挂载记忆：target → {"dir": adapter 目录, "scale": 卸载前实测强度}。
+        # 与 stats.lora_adapters（真实状态标签，卸载即清）不同，这份记录
+        # **跨卸载保留**——超分/分离这类「临时卸载 → 重载」的场景靠它把
+        # LoRA 挂回去（remount_loras）。显式 detach 才会清掉对应通道。
+        self._lora_attached: Dict[str, Dict[str, Any]] = {}
 
     # -- 事件回调（供 UI 显示进度）-----------------------------------------
 
@@ -573,14 +578,43 @@ class TTSEngine:
     def _unload_locked(self):
         self.release_qwen_locked()
         if self._tts is not None:
+            self._capture_lora_scale_locked()
             del self._tts
             self._tts = None
         gc.collect()
         self._empty_cache()
         self.stats.loaded = False
+        # 注意：stats.lora_adapters（真实状态）清空，但 _lora_attached
+        # （挂载记忆）**保留** —— 重载后 remount_loras() 靠它恢复挂载。
         self.stats.lora_adapters = []
         self._gpt_offloaded = False
         self._refresh_vram()
+
+    def _capture_lora_scale_locked(self) -> None:
+        """卸载前把各通道 LoRA 的**实测强度**补进 _lora_attached。
+
+        目录在 attach_lora 时就已记录；强度是挂载后由调用方 set_scale
+        单独调的，引擎此前不知道——卸载前的模块是唯一权威来源。
+        读不到（guard 异常/模块没真挂）就置 None，重挂时按默认 1.0。
+        """
+        try:
+            from webui_app.training import guard as GD
+            for target in ("gpt", "cfm"):
+                rec = self._lora_attached.get(target)
+                if not rec or not rec.get("dir"):
+                    continue
+                try:
+                    mod = self._lora_module(target)
+                except Exception:
+                    continue
+                if not self._is_wrapped(mod):
+                    continue      # 记录在但没真挂（状态脱节）——不猜强度
+                sc = GD.get_adapter_scale(mod)
+                rec["scale"] = (round(float(sc["_mean"]), 4)
+                                if isinstance(sc, dict) and "_mean" in sc
+                                else None)
+        except Exception:
+            pass
 
     def _empty_cache(self):
         try:
@@ -913,6 +947,10 @@ class TTSEngine:
                     f"加载 adapter 失败：{adapter_dir}（详见 error.log）") from None
 
             self._lora_set_module(target, wrapped)
+            # 挂载记忆（供临时卸载后的 remount_loras 恢复；强度在卸载时
+            # 由 _capture_lora_scale_locked 补录）。替换语义下前面的
+            # detach_lora 已把旧记录清掉，这里写入的就是当前这份。
+            self._lora_attached[target] = {"dir": adapter_dir, "scale": None}
 
             name = os.path.basename(adapter_dir.rstrip("/\\"))
             tag = f"{target}:{name}"
@@ -942,7 +980,9 @@ class TTSEngine:
             if self._tts is None:
                 # 引擎已卸载（超分/分离段中途 unload）：旧实例连同 LoRA
                 # 一起释放了，标签却留在 stats 里——重载后 UI 会显示假挂载。
-                # 这里把标签清掉（验收 P2-6：幻影标签）。
+                # 这里把标签清掉（验收 P2-6：幻影标签）。挂载记忆也一并清：
+                # 显式 detach 就是「这通道不要 LoRA」，重载后不该被
+                # remount_loras 悄悄挂回来。
                 stale = [t for t in self.stats.lora_adapters
                          if t.startswith(target + ":")]
                 if stale:
@@ -951,6 +991,7 @@ class TTSEngine:
                         if not t.startswith(target + ":")]
                     log.warning("引擎已卸载，清除 %s 通道的失效 LoRA 标签: %s",
                                 target, stale)
+                self._lora_attached.pop(target, None)
                 return
             tts = self.tts
             mod = self._lora_module(target)
@@ -978,6 +1019,7 @@ class TTSEngine:
             self.stats.lora_adapters = [
                 t for t in self.stats.lora_adapters if not t.startswith(target + ":")
             ]
+            self._lora_attached.pop(target, None)
             self._empty_cache()
             log.info("卸载完成 %s · %.2fs · %s → %s · 标签 %s",
                      target, time.perf_counter() - t0, before,
@@ -1007,6 +1049,49 @@ class TTSEngine:
                 out.append({"target": target, "wrapped": wrapped, "tags": tags,
                             "module": type(mod).__name__,
                             "consistent": bool(wrapped) == bool(tags)})
+        return out
+
+    def remount_loras(self, targets: Optional[List[str]] = None) -> Dict[str, str]:
+        """引擎重载后，把卸载前挂着的 LoRA 挂回去。
+
+        场景：超分/分离这类「卸推理引擎 → 干活 → 重载推理引擎」的流程。
+        重载回来的是纯底模（IndexTTS2 重新构造），若不重挂，用户下一次
+        听到的就是底模音色——UI 下拉框还选着 LoRA，错觉是「LoRA 失效」。
+
+        返回 {target: tag}（只含挂成功的）。**失败不抛**——引擎以底模
+        继续可用，由调用方把「哪个通道没挂回来」提示给用户；静默换模型
+        出声才是大坑。挂不回去的记录（目录被删/结构变了）就地清掉，
+        不留下次 remount 又失败一遍的僵尸记录。
+
+        targets 限定要恢复的通道（None = 有记录的都试）。调用方应传
+        **卸载前实际挂着的**通道集合，而不是无脑传 None——记录只在
+        显式 detach 时清，可能已比用户当前意图旧。
+        """
+        log = LOG.get_logger("engine.lora")
+        out: Dict[str, str] = {}
+        if self._tts is None:
+            return out
+        with self._lock:
+            for target in ("gpt", "cfm"):
+                if targets is not None and target not in targets:
+                    continue
+                rec = self._lora_attached.get(target) or {}
+                d = str(rec.get("dir") or "")
+                if not d:
+                    continue
+                try:
+                    tag = self.attach_lora(d, target=target)
+                    scale = rec.get("scale")
+                    if scale is not None and abs(float(scale) - 1.0) > 1e-9:
+                        from webui_app.training import guard as GD
+                        GD.set_adapter_scale(self._lora_module(target),
+                                             float(scale))
+                    out[target] = tag
+                    log.info("重挂完成 %s（scale=%s）", tag, scale)
+                except Exception as e:
+                    self._lora_attached.pop(target, None)
+                    log.warning("重挂 %s 通道失败（%s）：%s —— 引擎当前是该"
+                                "通道底模", target, d, e)
         return out
 
     # -- 推理 --------------------------------------------------------------
