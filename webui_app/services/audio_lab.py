@@ -1753,7 +1753,11 @@ _PUNCT_RUN_MS = 20.0
 # 主要来自音节时长不均；实测（27 字块）估计误差 <0.05s。0.6→0.35 收紧
 # （2026-10-03）：过宽的窗口会让真逗号的**下一个词组间隙**（0.2~0.3s
 # 外）冒领保底位——真逗号闪缝太短没被收集时尤其如此。
-_PUNCT_MATCH_WIN_S = 0.35
+# 0.35→0.38（2026-10-26 16:54 真机）：慢速首短语把「伤没好彻底，」的
+# 逗号估计拉早 0.359s，真逗号（60ms）刚好在 0.35 窗外，保底位被 0.718s
+# 的 20ms 词间隙冒领。词间隙屏蔽先剔除诱饵，再让真逗号进入 0.38 窗；
+# 0.38 仍小于爱弥斯诱饵病例的 0.44s（阶段33 验收），不会扩权。
+_PUNCT_MATCH_WIN_S = 0.38
 
 
 def _punct_mark_times(text: str, quiet: np.ndarray,
@@ -1926,14 +1930,38 @@ def normalize_intra_pauses(y: np.ndarray, sr: int, text_chars: int,
         win = int(_PUNCT_MATCH_WIN_S * sr)
         p_floor = int(sr * float(punct_floor_ms) / 1000.0)
         p_cap = max(p_floor, int(sr * float(punct_cap_ms) / 1000.0))
+        # ---- 词间隙屏蔽（2026-10-26 16:54 真机实锤）----
+        # 慢速首短语把逗号的线性估计拉早（「伤没好彻底，」估计 0.838s，
+        # 真逗号 1.197s）：0.718s/20ms 的「好|彻」词间隙成了最近候选，
+        # 保底位把 112ms 插在「好」后 = 用户听到的异常停顿。判据：
+        # 紧邻的下一个收集段在 0.30s 内、且**明显更长**（>本段+5ms），
+        # 本段就是词间隙，标点应落在后一个（短语末）。
+        # 距标点估计 <60ms 的最近段受保护——那是真逗号闪缝（阶段33
+        # 的 30~40ms 先例），不能被后面的词间隙挤掉。
+        _word_like: set = set()
+        for _k in range(len(runs) - 1):
+            if _k not in interior or (_k + 1) not in interior:
+                continue
+            _a, _b = runs[_k]
+            _a2, _b2 = runs[_k + 1]
+            if _a2 - _b > int(0.30 * sr):
+                continue
+            if (_b2 - _a2) <= (_b - _a) + int(0.005 * sr):
+                continue
+            if any(abs(_a - _t * sr) < int(0.06 * sr)
+                   for _t in est_t):
+                continue
+            _word_like.add(_k)
         for t in est_t:
             best, best_d = -1, None
             for k in interior:
-                if k in used:
+                if k in used or k in _word_like:
                     continue
                 a, b = runs[k]
-                if abs((a + b) / 2 - t * sr) <= win:
-                    d = abs((a + b) / 2 - t * sr)
+                # 用**静音起点**对齐标点时刻（标点是停顿的开始，不是中点；
+                # 长停顿用中点会平白多出半个时长，真逗号被推出窗外）。
+                if abs(a - t * sr) <= win:
+                    d = abs(a - t * sr)
                     if best_d is None or d < best_d:
                         best, best_d = k, d
             if best >= 0:
