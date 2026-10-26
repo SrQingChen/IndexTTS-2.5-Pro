@@ -20,7 +20,7 @@ import json
 import os
 import shutil
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 import numpy as np
 import soundfile as sf
@@ -187,6 +187,49 @@ def _register_jump_penalty(path: str, prev_path: str,
     if not np.isfinite(st):
         return 0.0
     return float(min(max_pen, max(0.0, st - free_st) * 0.06))
+
+
+def _final_creak_score(path: str) -> float:
+    """候选末音节气泡音下压分（0~1，见 AL.final_creak_score）。
+
+    2026-10-26 句末「项目/从前」下压实锤：双 LoRA 交互会在原始候选里
+    产出 80~100Hz 的末音节（中位 230~300Hz 的 0.3~0.4 倍），reward 的
+    转写/音色项看不见它。只在并列组（奖励差 ≤0.10）里作为第一决胜键，
+    全组都为 0 时选择结果与旧版逐位一致——正常素材零影响。
+    """
+    try:
+        r = AL.final_creak_score(path)
+        return float(r.get("score") or 0.0)
+    except Exception:
+        return 0.0
+
+
+# 只让“严重下压”参与并列组决胜：0.5 约对应末音节 <0.45×中位且持续
+# 数十毫秒以上（深度×时长合成）。轻度句末气泡音（自然嗓音）不触发，
+# 避免把正常表演改掉——用户要求「对已有正常效果零影响」。
+_CREAK_TIE_MIN = 0.5
+
+
+def _choose_from_tied(tied: List[int], rewards: List[float],
+                      creak: Dict[int, float],
+                      continuity: Optional[Callable[[int], float]] = None
+                      ) -> int:
+    """并列组选择：气泡音下压 > 衔接连续性 > 奖励。
+
+    气泡音分数全为 0 时严格走旧逻辑（有 continuity 用连续性，否则用
+    奖励）——这是「正常素材零影响」的代码级保证。抽成模块级函数便于
+    探针直接测决胜规则，不必跑模型。
+    """
+    if len(tied) == 1:
+        return tied[0]
+    if max(creak.values()) > 0.0:
+        return min(tied, key=lambda k: (
+            creak[k],
+            (continuity(k) if continuity is not None else 0.0),
+            -rewards[k], k))
+    if continuity is not None:
+        return min(tied, key=continuity)
+    return max(tied, key=lambda k: rewards[k])
 
 
 def _read_mono_int16(path: str) -> np.ndarray:
@@ -757,6 +800,7 @@ def perform(
                 ok_idx = [k for k, r in enumerate(rewards) if r >= 0]
                 chosen_k = 0
                 _tied_n = 1
+                _creak_raw: Dict[int, float] = {}
                 if ok_idx:
                     best_r = max(rewards[k] for k in ok_idx)
                     # 并列组择优（2026-10-04 衔接连续性决胜局）：奖励差
@@ -765,18 +809,39 @@ def perform(
                     # 这里兜底（实测 0.93 vs 0.86 的差距下 0.30 罚不动）。
                     tied = [k for k in ok_idx if rewards[k] >= best_r - 0.10]
                     _tied_n = len(tied)
-                    if len(tied) > 1 and _prev_for_cont:
-                        # 联合连续度决胜：音区（半音）+ 音色（质心/400）
-                        chosen_k = min(
-                            tied, key=lambda k: _register_jump_st(
+                    # 末音节气泡音下压（2026-10-26）：双 LoRA 交互会在原始
+                    # 候选里产出 80~100Hz 的末字（「项、目」「从、前」），
+                    # reward 的转写/音色项看不见。只在并列组内当第一决胜键；
+                    # 全组分数为 0 时走旧路径（正常素材选择逐位不变）。
+                    if len(tied) > 1:
+                        for _k in tied:
+                            _creak_raw[_k] = _final_creak_score(
+                                cand_paths[_k])
+                        # 轻度气泡音不参与决胜（见 _CREAK_TIE_MIN）
+                        _creak = {
+                            _k: (v if v >= _CREAK_TIE_MIN else 0.0)
+                            for _k, v in _creak_raw.items()}
+                    if len(tied) > 1:
+                        _cont = None
+                        if _prev_for_cont:
+                            _cont = (lambda k: _register_jump_st(
                                 cand_paths[k], _prev_for_cont)
-                            + _centroid_jump(cand_paths[k], _prev_for_cont))
+                                + _centroid_jump(cand_paths[k],
+                                                 _prev_for_cont))
+                        chosen_k = _choose_from_tied(tied, rewards, _creak,
+                                                     _cont)
                     else:
                         chosen_k = max(ok_idx, key=lambda k: rewards[k])
                 bon_info = {"n": n_try, "chosen": chosen_k,
                             "rewards": rewards,
                             "tied_n": _tied_n,
                             "continuity": bool(_prev_for_cont)}
+                if _creak_raw:
+                    bon_info["creak_scores"] = {
+                        str(k): round(v, 3)
+                        for k, v in _creak_raw.items()}
+                    bon_info["chosen_creak"] = round(
+                        _creak_raw.get(chosen_k, 0.0), 3)
                 # bon_keep：把最优/最差落成持久文件 —— 对齐页的
                 # 「从 BoN 台本导入」用它们构造 DPO 偏好对（C2 桥接）。
                 if bon_keep and len(ok_idx) >= 2:

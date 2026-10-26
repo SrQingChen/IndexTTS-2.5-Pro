@@ -1649,6 +1649,92 @@ def f0_stats(y: np.ndarray, sr: int) -> Dict[str, Any]:
         return {}
 
 
+def final_creak_score(path_or_y, sr: Optional[int] = None,
+                      tail_s: float = 0.65,
+                      low_ratio: float = 0.62,
+                      min_low_ms: float = 30.0,
+                      abs_floor_db: float = -45.0,
+                      rel_floor_db: float = 24.0) -> Dict[str, Any]:
+    """末音节「气泡音下压」评分（BoN 并列组择优用，0~1，越高越可疑）。
+
+    背景（2026-10-26 祀/达妮娅实锤）：「项目」「从前」等句末词，GPT 与
+    CFM 双 LoRA 同时挂载时会偶发末音节掉到 80~100Hz（中位 230~300Hz 的
+    0.3~0.4 倍）——听感「前字延音下压、末字被压得很低」，而且原始候选
+    就已经如此（8 候选里 2~3 个），不是停顿治理的产物。现有 reward 只
+    看转写/音色/情绪，不看音高，这种候选可以靠音色分胜出。
+
+    判据只对**可闻帧**生效（重要：harvest 会在数字静音里追出 80Hz 的
+    “假气泡音”，真机 15:13 的候选末段 -89dB 就是这种——不设能量门会
+    把干净的输出误判成问题）：
+
+      · 能量门 = max(abs_floor_db, 该段 p60 - rel_floor_db)；
+      · 末 tail_s 秒内 F0 < low_ratio × 全段中位 的可闻帧 ≥ min_low_ms；
+      · 分数 = 深度项 × 时长项，不满足任一条件 → 0（零影响）。
+
+    只读最后 1.5s 做 harvest（长块也不慢）；pyworld 缺失/音频太短时
+    返回 score=0，调用方无需区分。
+    """
+    try:
+        import pyworld as pw
+        if isinstance(path_or_y, (str, os.PathLike)):
+            yf, sr = load_audio(str(path_or_y))
+        else:
+            yf = np.asarray(path_or_y, dtype=np.float32)
+            if sr is None:
+                return {"score": 0.0, "ok": False, "error": "缺少采样率"}
+        if np.issubdtype(yf.dtype, np.integer):
+            yf = yf.astype(np.float32) / 32768.0
+        yf = np.asarray(yf, dtype=np.float32)
+        if yf.ndim > 1:
+            yf = yf.mean(axis=1)
+        if len(yf) < int(0.45 * sr):
+            return {"score": 0.0, "ok": False, "error": "音频太短"}
+        db, _n = _frames_db(yf, sr, frame_ms=25.0, hop_ms=10.0)
+        seg = yf[-int(1.5 * sr):].astype(np.float64)
+        f0, _t = pw.harvest(seg, sr, f0_floor=60.0, f0_ceil=600.0,
+                            frame_period=10.0)
+        m = min(len(f0), len(db))
+        if m < 10:
+            return {"score": 0.0, "ok": False, "error": "帧数不足"}
+        # 两者都按“末端对齐”截断：f0 来自最后 1.5s，db 来自全段
+        f0, db = f0[-m:], db[-m:]
+        body = float(np.percentile(db, 60))
+        gate = max(float(abs_floor_db), body - float(rel_floor_db))
+        audible = (f0 > 0) & (db > gate)
+        if int(audible.sum()) < 5:
+            return {"score": 0.0, "ok": False, "error": "可闻浊音不足"}
+        med = float(np.median(f0[audible]))
+        if med <= 0:
+            return {"score": 0.0, "ok": False, "error": "中位音高无效"}
+        w = max(5, int(round(float(tail_s) / 0.01)))
+        tf = f0[-w:][audible[-w:]]
+        if len(tf) < 5:
+            return {"score": 0.0, "ok": False, "error": "末段可闻帧不足"}
+        min_hz = float(tf.min())
+        min_ratio = min_hz / med
+        low_ms = float(np.sum(tf < float(low_ratio) * med) * 10.0)
+        if low_ms < float(min_low_ms) or min_ratio >= float(low_ratio):
+            score = 0.0
+        else:
+            depth = float(np.clip((float(low_ratio) - min_ratio) / 0.32,
+                                  0.0, 1.0))
+            dur = float(np.clip(low_ms / 150.0, 0.0, 1.0))
+            score = round(depth * (0.5 + 0.5 * dur), 3)
+        return {
+            "score": score,
+            "ok": True,
+            "median_hz": round(med, 1),
+            "min_hz": round(min_hz, 1),
+            "min_ratio": round(min_ratio, 3),
+            "low_ms": int(low_ms),
+            "drop_st": round(float(12.0 * np.log2(med / max(min_hz, 1e-6))),
+                             1),
+            "gate_db": round(gate, 1),
+        }
+    except Exception as e:
+        return {"score": 0.0, "ok": False, "error": f"{type(e).__name__}: {e}"}
+
+
 # 逗号类标点（块内停顿「保底位」的触发记号）。句号/问号/叹号不在此列：
 # 块内强标点仍走既有配额治理（已被 21~27 轮真机验收的行为，不扩权）。
 _COMMA_MARKS = "，,、；;：:"
@@ -2255,7 +2341,7 @@ def repair_truncated_tail(y: np.ndarray, sr: int,
 
 
 def lengthen_abrupt_releases(y: np.ndarray, sr: int,
-                             min_run_ms: float = 100.0,
+                             min_run_ms: float = 150.0,
                              slope_max_ms: float = 80.0,
                              take_ms: float = 150.0,
                              factor: float = 2.0,
@@ -2271,7 +2357,9 @@ def lengthen_abrupt_releases(y: np.ndarray, sr: int,
     WORLD 时长拉伸（音高/谱不变），把陡坡拖成可感知的收音。
 
     触发条件（全部满足才动，保守）：
-      · 该停顿检出 ≥min_run_ms（词间隙级别的小缝不碰）；
+      · 该停顿检出 ≥min_run_ms（**150ms**，与块内停顿治理门槛同一把尺：
+        100~150ms 是词间隙/塞音闭合的物理域，拉长它会把「项目」这类
+        双字词拉成「项、目」——2026-10-26 真机回归）；
       · 峰相对坡长 <slope_max_ms（「语音主体线」帧峰-8dB 滑到停顿的
         时长；自然收音 100~300ms 的坡不触发。不能用绝对 dB 线——素材
         电平低时永不触发，真机实锤）；
